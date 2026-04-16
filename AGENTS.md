@@ -1,3 +1,14 @@
+## ⚠️ カスタムビルド注意事項
+
+このリポジトリは metyatech による anomalyco/opencode の fork です。
+Copilot プレミアムリクエスト過剰消費バグ修正（PR #8721 相当）を先行適用しています。
+メンテナンス手順・セットアップ方法・自動更新の挙動については `MAINTENANCE.md` を参照してください。
+
+作業ブランチ: `fix/copilot-synthetic-detection`
+修正ファイル: `packages/opencode/src/plugin/github-copilot/copilot.ts`
+
+---
+
 - To regenerate the JavaScript SDK, run `./packages/sdk/js/script/build.ts`.
 - ALWAYS USE PARALLEL TOOLS WHEN APPLICABLE.
 - The default branch in this repo is `dev`.
