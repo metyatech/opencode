@@ -44,6 +44,48 @@ function imgMsg(msg: any): boolean {
   )
 }
 
+// Patterns that identify synthetic (agent-generated) user messages
+// These appear as "user" role messages but are not real user prompts
+const SYNTHETIC_PATTERNS = [
+  /^Tool \w+ returned an attachment:/,
+  /^What did we do so far\?/,
+  /^The following tool was executed by the user$/,
+  /^Tool result:/i,
+  /^Tool output:/i,
+]
+
+function isSyntheticText(text: string): boolean {
+  if (!text || typeof text !== "string") return false
+  return SYNTHETIC_PATTERNS.some((p) => p.test(text.trim()))
+}
+
+function hasSyntheticContent(content: unknown): boolean {
+  if (typeof content === "string") return isSyntheticText(content)
+  if (!Array.isArray(content)) return false
+  return content.some((part: any) => isSyntheticText(part?.text || part?.content || ""))
+}
+
+// Determine if a request is agent-initiated by inspecting message history.
+// Rule 1: If any assistant/tool message exists, this is a continuation → agent
+// Rule 2: If the last user message is synthetic (tool result, compaction, subtask) → agent
+// Rule 3: Otherwise → user (real human prompt)
+function detectAgent(messages: any[]): boolean {
+  if (!Array.isArray(messages) || messages.length === 0) return false
+  if (messages.some((msg: any) => ["assistant", "tool"].includes(msg.role))) return true
+  const last = messages[messages.length - 1]
+  if (last?.role === "user" && (hasSyntheticContent(last.content) || imgMsg(last))) return true
+  return false
+}
+
+function detectVision(messages: any[]): boolean {
+  return (
+    messages?.some((msg: any) => {
+      if (!Array.isArray(msg.content)) return false
+      return msg.content.some((part: any) => part.type === "image_url" || part.type === "input_image" || part.type === "image")
+    }) ?? false
+  )
+}
+
 function fix(model: Model, url: string): Model {
   return {
     ...model,
@@ -94,58 +136,17 @@ export async function CopilotAuthPlugin(input: PluginInput): Promise<Hooks> {
             const info = await getAuth()
             if (info.type !== "oauth") return fetch(request, init)
 
-            const url = request instanceof URL ? request.href : typeof request === "string" ? request : request.url
             const { isVision, isAgent } = iife(() => {
               try {
                 const body = typeof init?.body === "string" ? JSON.parse(init.body) : init?.body
-
-                // Completions API
-                if (body?.messages && url.includes("completions")) {
-                  const last = body.messages[body.messages.length - 1]
-                  return {
-                    isVision: body.messages.some(
-                      (msg: any) =>
-                        Array.isArray(msg.content) && msg.content.some((part: any) => part.type === "image_url"),
-                    ),
-                    isAgent: last?.role !== "user" || imgMsg(last),
-                  }
+                const messages = body?.messages || body?.input || []
+                return {
+                  isVision: detectVision(messages),
+                  isAgent: detectAgent(messages),
                 }
-
-                // Responses API
-                if (body?.input) {
-                  const last = body.input[body.input.length - 1]
-                  return {
-                    isVision: body.input.some(
-                      (item: any) =>
-                        Array.isArray(item?.content) && item.content.some((part: any) => part.type === "input_image"),
-                    ),
-                    isAgent: last?.role !== "user" || imgMsg(last),
-                  }
-                }
-
-                // Messages API
-                if (body?.messages) {
-                  const last = body.messages[body.messages.length - 1]
-                  const hasNonToolCalls =
-                    Array.isArray(last?.content) && last.content.some((part: any) => part?.type !== "tool_result")
-                  return {
-                    isVision: body.messages.some(
-                      (item: any) =>
-                        Array.isArray(item?.content) &&
-                        item.content.some(
-                          (part: any) =>
-                            part?.type === "image" ||
-                            // images can be nested inside tool_result content
-                            (part?.type === "tool_result" &&
-                              Array.isArray(part?.content) &&
-                              part.content.some((nested: any) => nested?.type === "image")),
-                        ),
-                    ),
-                    isAgent: !(last?.role === "user" && hasNonToolCalls) || imgMsg(last),
-                  }
-                }
-              } catch {}
-              return { isVision: false, isAgent: false }
+              } catch {
+                return { isVision: false, isAgent: false }
+              }
             })
 
             const headers: Record<string, string> = {
