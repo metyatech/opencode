@@ -13,7 +13,7 @@ include = [ ".env", ".env.local", ".env.*.local" ]
 exclude = [ "node_modules/", ".venv/", ".next/", "dist/" ]
 
 [verify]
-command = "bun run lint; bun run typecheck; bun turbo test:ci"
+command = "bun run verify:mwt"
 
 [policy]
 allow_ignored_seed_changes = true
