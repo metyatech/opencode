@@ -210,6 +210,11 @@ function normalizePath(input?: string) {
   return input
 }
 
+export async function runAndAwaitSessionIdle(start: () => Promise<void>, waitForIdle: Promise<void>) {
+  await start()
+  await waitForIdle
+}
+
 export const RunCommand = cmd({
   command: "run [message..]",
   describe: "run opencode with a message",
@@ -631,21 +636,24 @@ export const RunCommand = cmd({
       }
       await share(sdk, sessionID)
 
-      loop().catch((e) => {
+      const loopPromise = loop().catch((e) => {
         console.error(e)
         process.exit(1)
       })
 
-      if (args.command) {
-        await sdk.session.command({
-          sessionID,
-          agent,
-          model: args.model,
-          command: args.command,
-          arguments: message,
-          variant: args.variant,
-        })
-      } else {
+      await runAndAwaitSessionIdle(async () => {
+        if (args.command) {
+          await sdk.session.command({
+            sessionID,
+            agent,
+            model: args.model,
+            command: args.command,
+            arguments: message,
+            variant: args.variant,
+          })
+          return
+        }
+
         const model = args.model ? Provider.parseModel(args.model) : undefined
         await sdk.session.prompt({
           sessionID,
@@ -654,7 +662,7 @@ export const RunCommand = cmd({
           variant: args.variant,
           parts: [...files, { type: "text", text: message }],
         })
-      }
+      }, loopPromise)
     }
 
     if (args.attach) {
