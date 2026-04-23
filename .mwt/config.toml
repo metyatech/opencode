@@ -1,0 +1,20 @@
+version = 1
+default_branch = "dev"
+default_remote = "origin"
+task_worktree_dir_template = "{{ seed_parent }}/{{ repo }}-wt-{{ slug }}-{{ shortid }}"
+task_branch_template = "wt/{{ slug }}/{{ shortid }}"
+
+[bootstrap]
+enabled = true
+default_profile = "local"
+
+[bootstrap.profiles.local]
+include = [ ".env", ".env.local", ".env.*.local" ]
+exclude = [ "node_modules/", ".venv/", ".next/", "dist/" ]
+
+[verify]
+command = "bun run lint; bun run typecheck; bun turbo test:ci"
+
+[policy]
+allow_ignored_seed_changes = true
+allow_tracked_seed_changes = false
