@@ -3,6 +3,8 @@ import { Effect } from "effect"
 import z from "zod"
 import { Instance } from "../../src/project/instance"
 import { Project } from "../../src/project"
+import { Database, eq } from "../../src/storage"
+import { ProjectTable } from "../../src/project/project.sql"
 import { Session as SessionNs } from "../../src/session"
 import { Log } from "../../src/util"
 import { tmpdir } from "../fixture/fixture"
@@ -101,5 +103,31 @@ describe("session.listGlobal", () => {
 
     expect(ids).toContain(first.id)
     expect(ids).not.toContain(second.id)
+  })
+
+  test("shows fallback project info for orphaned sessions", async () => {
+    await using tmp = await tmpdir({ git: true })
+
+    const session = await Instance.provide({
+      directory: tmp.path,
+      fn: async () => svc.create({ title: "orphan-session" }),
+    })
+
+    Database.use((db) => {
+      db.run("PRAGMA foreign_keys = OFF")
+      try {
+        db.delete(ProjectTable).where(eq(ProjectTable.id, session.projectID)).run()
+      } finally {
+        db.run("PRAGMA foreign_keys = ON")
+      }
+    })
+
+    const items = [...svc.listGlobal({ limit: 200 })]
+    const item = items.find((s) => s.id === session.id)
+
+    expect(item).toBeDefined()
+    expect(item?.project).toBeDefined()
+    expect(item?.project?.id).toBe(session.projectID)
+    expect(item?.project?.worktree).toBe(tmp.path)
   })
 })

@@ -2,6 +2,9 @@ import { describe, expect, test } from "bun:test"
 import { Effect, Layer, Stream } from "effect"
 import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process"
+import fs from "fs"
+import os from "os"
+import path from "path"
 import { Installation } from "../../src/installation"
 
 const encoder = new TextEncoder()
@@ -50,6 +53,39 @@ function testLayer(
 
 describe("installation", () => {
   describe("latest", () => {
+    test("checks the configured local metyatech fork instead of official releases", async () => {
+      const previous = process.env.OPENCODE_LOCAL_FORK_REPO
+      process.env.OPENCODE_LOCAL_FORK_REPO = path.resolve("../..")
+      const calls: string[] = []
+      const layer = testLayer(
+        (request) => {
+          calls.push(request.url)
+          return jsonResponse({ tag_name: "v9.9.9" })
+        },
+        (cmd, args) => {
+          calls.push([cmd, ...args].join(" "))
+          if (cmd === "git" && args.join(" ") === "remote get-url origin")
+            return "https://github.com/metyatech/opencode.git\n"
+          if (cmd === "git" && args.join(" ") === "branch --show-current") return "dev\n"
+          if (cmd === "git" && args.join(" ") === "rev-parse HEAD") return "1111111111111111111111111111111111111111\n"
+          if (cmd === "git" && args.join(" ") === "rev-parse origin/dev")
+            return "2222222222222222222222222222222222222222\n"
+          return ""
+        },
+      )
+
+      try {
+        const result = await Effect.runPromise(
+          Installation.Service.use((svc) => svc.latest("local-fork")).pipe(Effect.provide(layer)),
+        )
+        expect(result).toBe("0.0.0-fork.222222222222")
+        expect(calls.some((call) => call.includes("api.github.com/repos/anomalyco/opencode"))).toBe(false)
+      } finally {
+        if (previous === undefined) delete process.env.OPENCODE_LOCAL_FORK_REPO
+        else process.env.OPENCODE_LOCAL_FORK_REPO = previous
+      }
+    })
+
     test("reads release version from GitHub releases", async () => {
       const layer = testLayer(() => jsonResponse({ tag_name: "v1.2.3" }))
 
@@ -147,6 +183,70 @@ describe("installation", () => {
         Installation.Service.use((svc) => svc.latest("brew")).pipe(Effect.provide(layer)),
       )
       expect(result).toBe("2.1.0")
+    })
+  })
+
+  describe("upgrade", () => {
+    test("pulls, builds, and points the launcher at the local metyatech fork", async () => {
+      const previousRepo = process.env.OPENCODE_LOCAL_FORK_REPO
+      const previousPointer = process.env.OPENCODE_LOCAL_FORK_POINTER
+      const repo = await fs.promises.mkdtemp(path.join(os.tmpdir(), "opencode-local-fork-"))
+      const target = "0.0.0-fork.222222222222"
+      const outputName = `opencode-${process.platform === "win32" ? "windows" : process.platform}-${process.arch}`
+      const binaryName = process.platform === "win32" ? "opencode.exe" : "opencode"
+      const built = path.join(
+        repo,
+        "packages",
+        "opencode",
+        "dist-local-fork",
+        `${target}-${process.pid}`,
+        outputName,
+        "bin",
+        binaryName,
+      )
+      const pointer = path.join(repo, "pointer")
+      const calls: string[] = []
+
+      await fs.promises.mkdir(path.join(repo, "packages", "opencode", "script"), { recursive: true })
+      await fs.promises.mkdir(path.dirname(built), { recursive: true })
+      await fs.promises.writeFile(path.join(repo, ".git"), "gitdir: .git/worktrees/local-fork-test\n")
+      await fs.promises.writeFile(path.join(repo, "packages", "opencode", "package.json"), "{}")
+      await fs.promises.writeFile(path.join(repo, "packages", "opencode", "script", "build.ts"), "")
+      await fs.promises.writeFile(built, "")
+      process.env.OPENCODE_LOCAL_FORK_REPO = repo
+      process.env.OPENCODE_LOCAL_FORK_POINTER = pointer
+
+      const layer = testLayer(
+        () => jsonResponse({ tag_name: "v9.9.9" }),
+        (cmd, args) => {
+          calls.push([cmd, ...args].join(" "))
+          if (cmd === "git" && args.join(" ") === "remote get-url origin")
+            return "https://github.com/metyatech/opencode.git\n"
+          if (cmd === "git" && args.join(" ") === "branch --show-current") return "dev\n"
+          return ""
+        },
+      )
+
+      try {
+        await Effect.runPromise(
+          Installation.Service.use((svc) => svc.upgrade("local-fork", target)).pipe(Effect.provide(layer)),
+        )
+        expect(await fs.promises.readFile(pointer, "utf8")).toBe(built)
+        expect(calls).toContain("git pull --ff-only origin dev")
+        expect(calls).toContain("bun install")
+        expect(calls).toContain(
+          ["bun", "run", "--cwd", "packages/opencode", "build", "--single", "--skip-install", "--dist-dir"]
+            .concat(path.join("dist-local-fork", `${target}-${process.pid}`))
+            .join(" "),
+        )
+        expect(calls.some((call) => call.includes("install -g opencode-ai"))).toBe(false)
+      } finally {
+        if (previousRepo === undefined) delete process.env.OPENCODE_LOCAL_FORK_REPO
+        else process.env.OPENCODE_LOCAL_FORK_REPO = previousRepo
+        if (previousPointer === undefined) delete process.env.OPENCODE_LOCAL_FORK_POINTER
+        else process.env.OPENCODE_LOCAL_FORK_POINTER = previousPointer
+        await fs.promises.rm(repo, { recursive: true, force: true })
+      }
     })
   })
 })

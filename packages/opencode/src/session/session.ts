@@ -808,7 +808,7 @@ export function* listGlobal(input?: {
   }
 
   for (const row of rows) {
-    const project = projects.get(row.project_id) ?? null
+    const project = projects.get(row.project_id) ?? { id: row.project_id, worktree: row.directory }
     yield { ...fromRow(row), project }
   }
 }

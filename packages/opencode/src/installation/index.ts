@@ -3,6 +3,7 @@ import { FetchHttpClient, HttpClient, HttpClientRequest, HttpClientResponse } fr
 import * as CrossSpawnSpawner from "@/effect/cross-spawn-spawner"
 import { withTransientReadRetry } from "@/util/effect-http-client"
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process"
+import fs from "fs"
 import path from "path"
 import z from "zod"
 import { BusEvent } from "@/bus/bus-event"
@@ -14,7 +15,7 @@ import { InstallationChannel, InstallationVersion } from "./version"
 
 const log = Log.create({ service: "installation" })
 
-export type Method = "curl" | "npm" | "yarn" | "pnpm" | "bun" | "brew" | "scoop" | "choco" | "unknown"
+export type Method = "curl" | "npm" | "yarn" | "pnpm" | "bun" | "brew" | "scoop" | "choco" | "local-fork" | "unknown"
 
 export type ReleaseType = "patch" | "minor" | "major"
 
@@ -67,6 +68,35 @@ export function isLocal() {
 export class UpgradeFailedError extends Schema.TaggedErrorClass<UpgradeFailedError>()("UpgradeFailedError", {
   stderr: Schema.String,
 }) {}
+
+function findLocalForkRepo() {
+  const configured = process.env.OPENCODE_LOCAL_FORK_REPO
+  if (configured && isLocalForkRepo(configured)) return path.resolve(configured)
+
+  let current = path.dirname(process.execPath)
+  for (;;) {
+    if (isLocalForkRepo(current)) return current
+    const parent = path.dirname(current)
+    if (parent === current) return
+    current = parent
+  }
+}
+
+function isLocalForkRepo(dir: string) {
+  return (
+    fs.existsSync(path.join(dir, ".git")) &&
+    fs.existsSync(path.join(dir, "packages", "opencode", "package.json")) &&
+    fs.existsSync(path.join(dir, "packages", "opencode", "script", "build.ts"))
+  )
+}
+
+function localForkPointerPath(repo: string) {
+  return process.env.OPENCODE_LOCAL_FORK_POINTER ?? path.join(repo, "packages", "opencode", ".local-fork-current")
+}
+
+function localForkVersion(sha: string) {
+  return `0.0.0-fork.${sha.slice(0, 12)}`
+}
 
 // Response schemas for external version APIs
 const GitHubRelease = Schema.Struct({ tag_name: Schema.String })
@@ -140,6 +170,18 @@ export const layer: Layer.Layer<Service, never, HttpClient.HttpClient | ChildPro
         return "opencode"
       })
 
+      const localForkRepo = Effect.fnUntraced(function* () {
+        const repo = findLocalForkRepo()
+        if (!repo) return
+        const origin = (yield* text(["git", "remote", "get-url", "origin"], { cwd: repo })).trim()
+        if (!origin.includes("metyatech/opencode") && !origin.includes("metyatech\\opencode")) return
+        return repo
+      })
+
+      const localForkBranch = Effect.fnUntraced(function* (repo: string) {
+        return (yield* text(["git", "branch", "--show-current"], { cwd: repo })).trim() || "dev"
+      })
+
       const upgradeCurl = Effect.fnUntraced(
         function* (target: string) {
           const response = yield* httpOk.execute(HttpClientRequest.get("https://opencode.ai/install"))
@@ -163,6 +205,7 @@ export const layer: Layer.Layer<Service, never, HttpClient.HttpClient | ChildPro
       )
 
       const methodImpl = Effect.fn("Installation.method")(function* () {
+        if (yield* localForkRepo()) return "local-fork" as Method
         if (process.execPath.includes(path.join(".opencode", "bin"))) return "curl" as Method
         if (process.execPath.includes(path.join(".local", "bin"))) return "curl" as Method
         const exec = process.execPath.toLowerCase()
@@ -199,6 +242,18 @@ export const layer: Layer.Layer<Service, never, HttpClient.HttpClient | ChildPro
 
       const latestImpl = Effect.fn("Installation.latest")(function* (installMethod?: Method) {
         const detectedMethod = installMethod || (yield* methodImpl())
+
+        if (detectedMethod === "local-fork") {
+          const repo = yield* localForkRepo()
+          if (!repo) return InstallationVersion
+          const branch = yield* localForkBranch(repo)
+          const fetch = yield* run(["git", "fetch", "origin", branch], { cwd: repo })
+          if (fetch.code !== 0) return InstallationVersion
+          const local = (yield* text(["git", "rev-parse", "HEAD"], { cwd: repo })).trim()
+          const remote = (yield* text(["git", "rev-parse", `origin/${branch}`], { cwd: repo })).trim()
+          if (!remote || remote === local) return InstallationVersion
+          return localForkVersion(remote)
+        }
 
         if (detectedMethod === "brew") {
           const formula = yield* getBrewFormula()
@@ -260,6 +315,58 @@ export const layer: Layer.Layer<Service, never, HttpClient.HttpClient | ChildPro
       const upgradeImpl = Effect.fn("Installation.upgrade")(function* (m: Method, target: string) {
         let result: { code: ChildProcessSpawner.ExitCode; stdout: string; stderr: string } | undefined
         switch (m) {
+          case "local-fork": {
+            const repo = yield* localForkRepo()
+            if (!repo) return yield* new UpgradeFailedError({ stderr: "Local metyatech/opencode checkout not found" })
+            const status = (yield* text(["git", "status", "--porcelain"], { cwd: repo })).trim()
+            if (status) {
+              return yield* new UpgradeFailedError({
+                stderr:
+                  "Local metyatech/opencode checkout has uncommitted changes; commit or stash them before updating",
+              })
+            }
+            const branch = yield* localForkBranch(repo)
+            result = yield* run(["git", "pull", "--ff-only", "origin", branch], { cwd: repo })
+            if (result.code !== 0) break
+            result = yield* run(["bun", "install"], { cwd: repo })
+            if (result.code !== 0) break
+            const distDir = path.join("dist-local-fork", `${target}-${process.pid}`)
+            result = yield* run(
+              [
+                "bun",
+                "run",
+                "--cwd",
+                "packages/opencode",
+                "build",
+                "--single",
+                "--skip-install",
+                "--dist-dir",
+                distDir,
+              ],
+              { cwd: repo },
+            )
+            if (result.code !== 0) break
+            const binary = process.platform === "win32" ? "opencode.exe" : "opencode"
+            const built = path.join(
+              repo,
+              "packages",
+              "opencode",
+              distDir,
+              `opencode-${process.platform === "win32" ? "windows" : process.platform}-${process.arch}`,
+              "bin",
+              binary,
+            )
+            if (!fs.existsSync(built)) {
+              result = {
+                code: ChildProcessSpawner.ExitCode(1),
+                stdout: result.stdout,
+                stderr: `Built local fork binary not found: ${built}`,
+              }
+              break
+            }
+            yield* Effect.promise(() => fs.promises.writeFile(localForkPointerPath(repo), built, "utf8"))
+            break
+          }
           case "curl":
             result = yield* upgradeCurl(target)
             break
