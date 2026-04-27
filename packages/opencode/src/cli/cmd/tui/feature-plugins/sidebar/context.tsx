@@ -1,6 +1,9 @@
 import type { AssistantMessage } from "@opencode-ai/sdk/v2"
 import type { TuiPlugin, TuiPluginApi, TuiPluginModule } from "@opencode-ai/plugin/tui"
 import { createMemo } from "solid-js"
+import type { Config } from "@/config"
+import type { Provider } from "@/provider"
+import { usage as contextUsage } from "@/session/overflow"
 
 const id = "internal:sidebar-context"
 
@@ -23,12 +26,19 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
       }
     }
 
-    const tokens =
-      last.tokens.input + last.tokens.output + last.tokens.reasoning + last.tokens.cache.read + last.tokens.cache.write
     const model = props.api.state.provider.find((item) => item.id === last.providerID)?.models[last.modelID]
+    if (!model) return {
+      tokens: 0,
+      percent: null,
+    }
+    const { total, percent } = contextUsage({
+      cfg: props.api.state.config as Config.Info,
+      tokens: last.tokens,
+      model: model as Provider.Model,
+    })
     return {
-      tokens,
-      percent: model?.limit.context ? Math.round((tokens / model.limit.context) * 100) : null,
+      tokens: total,
+      percent: percent ?? null,
     }
   })
 

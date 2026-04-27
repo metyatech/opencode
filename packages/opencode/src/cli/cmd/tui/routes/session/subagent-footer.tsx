@@ -8,6 +8,9 @@ import { useCommandDialog } from "@tui/component/dialog-command"
 import { useKeybind } from "../../context/keybind"
 import { Locale } from "@/util"
 import { useTerminalDimensions } from "@opentui/solid"
+import { usage as contextUsage } from "@/session/overflow"
+import type { Config } from "@/config"
+import type { Provider } from "@/provider"
 
 export function SubagentFooter() {
   const route = useRouteData("session")
@@ -36,12 +39,17 @@ export function SubagentFooter() {
     const last = msg.findLast((item): item is AssistantMessage => item.role === "assistant" && item.tokens.output > 0)
     if (!last) return
 
-    const tokens =
-      last.tokens.input + last.tokens.output + last.tokens.reasoning + last.tokens.cache.read + last.tokens.cache.write
+    const model = sync.data.provider.find((item) => item.id === last.providerID)?.models[last.modelID]
+    if (!model) return
+    const { total, percent } = contextUsage({
+      cfg: sync.data.config as Config.Info,
+      tokens: last.tokens,
+      model: model as Provider.Model,
+    })
+    const tokens = total
     if (tokens <= 0) return
 
-    const model = sync.data.provider.find((item) => item.id === last.providerID)?.models[last.modelID]
-    const pct = model?.limit.context ? `${Math.round((tokens / model.limit.context) * 100)}%` : undefined
+    const pct = percent !== undefined ? `${percent}%` : undefined
     const cost = msg.reduce((sum, item) => sum + (item.role === "assistant" ? item.cost : 0), 0)
 
     const money = new Intl.NumberFormat("en-US", {
