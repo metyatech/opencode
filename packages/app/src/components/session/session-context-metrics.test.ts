@@ -51,7 +51,7 @@ describe("getSessionContextMetrics", () => {
         models: {
           "gpt-4.1": {
             name: "GPT-4.1",
-            limit: { context: 1000 },
+            limit: { context: 1000, output: 100 },
           },
         },
       },
@@ -62,9 +62,29 @@ describe("getSessionContextMetrics", () => {
     expect(metrics.totalCost).toBe(1.75)
     expect(metrics.context?.message.id).toBe("a2")
     expect(metrics.context?.total).toBe(500)
-    expect(metrics.context?.usage).toBe(50)
+    expect(metrics.context?.limit).toBe(900)
+    expect(metrics.context?.usage).toBe(56)
     expect(metrics.context?.providerLabel).toBe("OpenAI")
     expect(metrics.context?.modelLabel).toBe("GPT-4.1")
+  })
+
+  test("uses input budget when the model has a dedicated prompt limit", () => {
+    const messages = [assistant("a1", { input: 160, output: 10, reasoning: 0, read: 0, write: 0 }, 0.1)]
+    const providers = [
+      {
+        id: "openai",
+        models: {
+          "gpt-4.1": {
+            limit: { context: 1000, input: 200, output: 100 },
+          },
+        },
+      },
+    ]
+
+    const metrics = getSessionContextMetrics(messages, providers)
+
+    expect(metrics.context?.limit).toBe(100)
+    expect(metrics.context?.usage).toBe(170)
   })
 
   test("preserves fallback labels and null usage when model metadata is missing", () => {

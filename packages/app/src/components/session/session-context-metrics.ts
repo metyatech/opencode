@@ -10,6 +10,8 @@ type Model = {
   name?: string
   limit: {
     context: number
+    input?: number
+    output?: number
   }
 }
 
@@ -38,6 +40,17 @@ const tokenTotal = (msg: AssistantMessage) => {
   return msg.tokens.input + msg.tokens.output + msg.tokens.reasoning + msg.tokens.cache.read + msg.tokens.cache.write
 }
 
+const OUTPUT_TOKEN_MAX = 32_000
+const COMPACTION_BUFFER = 20_000
+
+const effectiveLimit = (model?: Model) => {
+  const context = model?.limit.context
+  if (!context) return
+  const output = Math.min(model?.limit.output ?? 0, OUTPUT_TOKEN_MAX) || OUTPUT_TOKEN_MAX
+  const reserved = Math.min(COMPACTION_BUFFER, output)
+  return model?.limit.input ? Math.max(0, model.limit.input - reserved) : Math.max(0, context - output)
+}
+
 const lastAssistantWithTokens = (messages: Message[]) => {
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i]
@@ -54,7 +67,7 @@ const build = (messages: Message[] = [], providers: Provider[] = []): Metrics =>
 
   const provider = providers.find((item) => item.id === message.providerID)
   const model = provider?.models[message.modelID]
-  const limit = model?.limit.context
+  const limit = effectiveLimit(model)
   const total = tokenTotal(message)
 
   return {
