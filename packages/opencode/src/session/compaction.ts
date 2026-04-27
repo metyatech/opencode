@@ -118,6 +118,16 @@ function completedCompactions(messages: MessageV2.WithParts[]) {
   })
 }
 
+export function hasPendingCompaction(messages: MessageV2.WithParts[]) {
+  const completed = new Set(completedCompactions(messages).map((item) => messages[item.userIndex]?.info.id).filter(Boolean))
+  return messages.some(
+    (msg) =>
+      msg.info.role === "user" &&
+      msg.parts.some((part) => part.type === "compaction") &&
+      !completed.has(msg.info.id),
+  )
+}
+
 function buildPrompt(input: { previousSummary?: string; context: string[] }) {
   const anchor = input.previousSummary
     ? [
@@ -567,6 +577,7 @@ export const layer: Layer.Layer<
       auto: boolean
       overflow?: boolean
     }) {
+      if (hasPendingCompaction(yield* session.messages({ sessionID: input.sessionID }))) return
       const msg = yield* session.updateMessage({
         id: MessageID.ascending(),
         role: "user",

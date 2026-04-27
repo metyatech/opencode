@@ -598,6 +598,35 @@ describe("session.compaction.create", () => {
       }),
     ),
   )
+
+  it.live(
+    "does not create a duplicate compaction marker while one is already pending",
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const compact = yield* SessionCompaction.Service
+        const ssn = yield* SessionNs.Service
+
+        const info = yield* ssn.create({})
+
+        yield* compact.create({
+          sessionID: info.id,
+          agent: "build",
+          model: ref,
+          auto: true,
+        })
+
+        yield* compact.create({
+          sessionID: info.id,
+          agent: "build",
+          model: ref,
+          auto: true,
+        })
+
+        const msgs = yield* ssn.messages({ sessionID: info.id })
+        expect(msgs).toHaveLength(1)
+      }),
+    ),
+  )
 })
 
 describe("session.compaction.prune", () => {
