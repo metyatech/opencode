@@ -627,6 +627,39 @@ describe("session.compaction.create", () => {
       }),
     ),
   )
+
+  it.live(
+    "updates the pending compaction marker when create is retried with a new model",
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const compact = yield* SessionCompaction.Service
+        const ssn = yield* SessionNs.Service
+
+        const info = yield* ssn.create({})
+        const fallback = {
+          providerID: ProviderID.make("fallback"),
+          modelID: ModelID.make("fallback-model"),
+        }
+
+        yield* compact.create({
+          sessionID: info.id,
+          agent: "build",
+          model: ref,
+          auto: true,
+        })
+        yield* compact.create({
+          sessionID: info.id,
+          agent: "build",
+          model: fallback,
+          auto: true,
+        })
+
+        const msgs = yield* ssn.messages({ sessionID: info.id })
+        expect(msgs).toHaveLength(1)
+        expect(msgs[0].info).toMatchObject({ model: fallback })
+      }),
+    ),
+  )
 })
 
 describe("session.compaction.prune", () => {

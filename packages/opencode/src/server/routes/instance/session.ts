@@ -587,17 +587,15 @@ export const SessionRoutes = lazy(() =>
             }
           }
 
-          if (!SessionCompaction.hasPendingCompaction(msgs)) {
-            yield* compact.create({
-              sessionID,
-              agent: currentAgent,
-              model: {
-                providerID: body.providerID,
-                modelID: body.modelID,
-              },
-              auto: body.auto,
-            })
-          }
+          yield* compact.create({
+            sessionID,
+            agent: currentAgent,
+            model: {
+              providerID: body.providerID,
+              modelID: body.modelID,
+            },
+            auto: body.auto,
+          })
           yield* prompt.loop({ sessionID })
           return true
         }),

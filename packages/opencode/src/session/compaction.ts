@@ -119,12 +119,14 @@ function completedCompactions(messages: MessageV2.WithParts[]) {
 }
 
 export function hasPendingCompaction(messages: MessageV2.WithParts[]) {
+  return pendingCompaction(messages) !== undefined
+}
+
+function pendingCompaction(messages: MessageV2.WithParts[]) {
   const completed = new Set(completedCompactions(messages).map((item) => messages[item.userIndex]?.info.id).filter(Boolean))
-  return messages.some(
-    (msg) =>
-      msg.info.role === "user" &&
-      msg.parts.some((part) => part.type === "compaction") &&
-      !completed.has(msg.info.id),
+  return messages.findLast(
+    (msg): msg is MessageV2.WithParts & { info: MessageV2.User } =>
+      msg.info.role === "user" && msg.parts.some((part) => part.type === "compaction") && !completed.has(msg.info.id),
   )
 }
 
@@ -577,7 +579,25 @@ export const layer: Layer.Layer<
       auto: boolean
       overflow?: boolean
     }) {
-      if (hasPendingCompaction(yield* session.messages({ sessionID: input.sessionID }))) return
+      const pending = pendingCompaction(yield* session.messages({ sessionID: input.sessionID }))
+      if (pending) {
+        yield* session.updateMessage({
+          ...pending.info,
+          agent: input.agent,
+          model: input.model,
+        })
+        yield* Effect.forEach(
+          pending.parts.filter((part): part is MessageV2.CompactionPart => part.type === "compaction"),
+          (part) =>
+            session.updatePart({
+              ...part,
+              auto: input.auto,
+              overflow: input.overflow,
+            }),
+          { concurrency: 1 },
+        )
+        return
+      }
       const msg = yield* session.updateMessage({
         id: MessageID.ascending(),
         role: "user",
