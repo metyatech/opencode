@@ -6,3 +6,4 @@
 {"id":"qsuLlKxl","description":"Fix subscription-backed provider fallback and objective model routing in local opencode fork","stage":"committed","createdAt":"2026-04-23T10:06:31.001Z","updatedAt":"2026-04-23T10:31:42.227Z","committedEventId":"2dQvzO-1RZTdz0B8"}
 {"id":"wEZJ8UAC","description":"Fix context usage display and duplicate compaction guards","stage":"committed","createdAt":"2026-04-27T12:05:01.443Z","updatedAt":"2026-04-27T12:32:19.458Z","committedEventId":"oOVCAHXJzQFoJPy0"}
 {"id":"jFGC-6Hx","description":"Update pending compaction model on summarize retry","stage":"committed","createdAt":"2026-04-29T07:41:05.491Z","updatedAt":"2026-04-29T08:20:19.825Z","committedEventId":"LtQbcJ70F0AdwxWX"}
+{"id":"6pv8-6XU","description":"Fix custom elements declaration typecheck","stage":"committed","createdAt":"2026-04-29T08:34:23.523Z","updatedAt":"2026-04-29T08:34:23.523Z"}
