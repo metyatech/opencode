@@ -51,17 +51,49 @@ export function delay(attempt: number, error?: MessageV2.APIError) {
   return cap(Math.min(RETRY_INITIAL_DELAY * Math.pow(RETRY_BACKOFF_FACTOR, attempt - 1), RETRY_MAX_DELAY_NO_HEADERS))
 }
 
+// Quota / usage-limit exhaustion patterns that MUST stop retry so callers
+// (e.g. runtime-fallback hooks, the TUI, or sub-agent dispatch) can react and
+// switch to a different provider. Without this gate, status >= 500 below would
+// reclassify quota errors (which the local Claude Code proxy and similar
+// gateways frequently report as 5xx) as transient and retry the same model
+// forever, blocking provider failover.
+const QUOTA_EXHAUSTION_PATTERNS: ReadonlyArray<RegExp> = [
+  /you'?ve\s+hit\s+your\s+limit/i,
+  /hit\s+your\s+limit\s*[\u00b7\u2022\-\|:]/i,
+  /quota\s+will\s+reset\s+after/i,
+  /quota\s+exceeded/i,
+  /usage\s+limit\s+(?:has\s+been\s+reached|reached|exceeded|for)/i,
+  /(?:billing\s+(?:hard\s+)?limit|monthly\s+limit|weekly\s+limit|plan\s+limit|subscription\s+(?:quota|limit))/i,
+  /(?:out\s+of|insufficient)\s+credits?/i,
+  /credits?\s+exhausted/i,
+  /insufficient\s+balance/i,
+  /payment\s+required/i,
+]
+
+function isQuotaExhausted(message: unknown): boolean {
+  if (typeof message !== "string" || message.length === 0) return false
+  return QUOTA_EXHAUSTION_PATTERNS.some((p) => p.test(message))
+}
+
 export function retryable(error: Err) {
   // context overflow errors should not be retried
   if (MessageV2.ContextOverflowError.isInstance(error)) return undefined
   if (MessageV2.APIError.isInstance(error)) {
     const status = error.data.statusCode
+    // Hard quota / usage-limit errors must surface as terminal so external
+    // fallback layers can switch providers. Check before the 5xx path because
+    // local proxies (e.g. Claude Code) report these as 500.
+    if (isQuotaExhausted(error.data.message) || isQuotaExhausted(error.data.responseBody)) {
+      return undefined
+    }
     // 5xx errors are transient server failures and should always be retried,
     // even when the provider SDK doesn't explicitly mark them as retryable.
     if (!error.data.isRetryable && !(status !== undefined && status >= 500)) return undefined
     if (error.data.responseBody?.includes("FreeUsageLimitError")) return GO_UPSELL_MESSAGE
     return error.data.message.includes("Overloaded") ? "Provider is overloaded" : error.data.message
   }
+  // Plain (non-APIError) errors: stop retry on quota exhaustion as well.
+  if (isQuotaExhausted(error.data?.message)) return undefined
 
   // Check for rate limit patterns in plain text error messages
   const msg = error.data?.message
