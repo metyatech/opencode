@@ -7,5 +7,5 @@
 {"id":"wEZJ8UAC","description":"Fix context usage display and duplicate compaction guards","stage":"committed","createdAt":"2026-04-27T12:05:01.443Z","updatedAt":"2026-04-27T12:32:19.458Z","committedEventId":"oOVCAHXJzQFoJPy0"}
 {"id":"jFGC-6Hx","description":"Update pending compaction model on summarize retry","stage":"committed","createdAt":"2026-04-29T07:41:05.491Z","updatedAt":"2026-04-29T08:20:19.825Z","committedEventId":"LtQbcJ70F0AdwxWX"}
 {"id":"6pv8-6XU","description":"Fix custom elements declaration typecheck","stage":"committed","createdAt":"2026-04-29T08:34:23.523Z","updatedAt":"2026-04-29T08:34:23.523Z"}
-{"id":"ij5A984w","description":"Stop retrying Claude Code quota exhaustion errors so runtime-fallback can switch providers","stage":"committed","createdAt":"2026-05-01T00:36:18.105Z","updatedAt":"2026-05-01T09:48:46.938Z","committedEventId":"3722Q74rSBwTfDfy"}
+{"id":"ij5A984w","description":"Stop retrying Claude Code quota exhaustion errors so runtime-fallback can switch providers","stage":"done","createdAt":"2026-05-01T00:36:18.105Z","updatedAt":"2026-05-01T09:51:21.477Z","committedEventId":"3722Q74rSBwTfDfy"}
 {"id":"V3B1IS4h","description":"Update metyatech/opencode fork to latest upstream dev","stage":"committed","createdAt":"2026-05-07T03:44:18.484Z","updatedAt":"2026-05-07T09:48:44.869Z","committedEventId":"mOcHa1NtbfoPdSt5"}
