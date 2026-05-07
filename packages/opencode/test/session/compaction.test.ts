@@ -4,28 +4,31 @@ import { Cause, Effect, Exit, Layer, ManagedRuntime } from "effect"
 import * as Stream from "effect/Stream"
 import z from "zod"
 import { Bus } from "../../src/bus"
-import { Config } from "../../src/config"
+import { Config } from "@/config/config"
 import { Agent } from "../../src/agent/agent"
 import { LLM } from "../../src/session/llm"
 import { SessionCompaction } from "../../src/session/compaction"
-import { Token } from "../../src/util"
+import { Token } from "@/util/token"
 import { Instance } from "../../src/project/instance"
-import { Log } from "../../src/util"
+import { WithInstance } from "../../src/project/with-instance"
+import * as Log from "@opencode-ai/core/util/log"
 import { Permission } from "../../src/permission"
 import { Plugin } from "../../src/plugin"
 import { provideTmpdirInstance, tmpdir } from "../fixture/fixture"
-import { Session as SessionNs } from "../../src/session"
+import { Session as SessionNs } from "@/session/session"
 import { MessageV2 } from "../../src/session/message-v2"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
 import { SessionStatus } from "../../src/session/status"
 import { SessionSummary } from "../../src/session/summary"
+import { SessionV2 } from "../../src/v2/session"
 import { ModelID, ProviderID } from "../../src/provider/schema"
-import type { Provider } from "../../src/provider"
+import type { Provider } from "@/provider/provider"
 import * as SessionProcessorModule from "../../src/session/processor"
 import { Snapshot } from "../../src/snapshot"
 import { ProviderTest } from "../fake/provider"
 import { testEffect } from "../lib/effect"
-import * as CrossSpawnSpawner from "../../src/effect/cross-spawn-spawner"
+import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+import { TestConfig } from "../fixture/config"
 
 void Log.init({ print: false })
 
@@ -38,7 +41,7 @@ const svc = {
   create(input?: SessionNs.CreateInput) {
     return run(SessionNs.Service.use((svc) => svc.create(input)))
   },
-  messages(input: z.output<typeof SessionNs.MessagesInput>) {
+  messages(input: z.output<typeof SessionNs.MessagesInput.zod>) {
     return run(SessionNs.Service.use((svc) => svc.messages(input)))
   },
   updateMessage<T extends MessageV2.Info>(msg: T) {
@@ -208,7 +211,7 @@ function layer(result: "continue" | "compact") {
 
 function cfg(compaction?: Config.Info["compaction"]) {
   const base = Config.Info.zod.parse({})
-  return Layer.mock(Config.Service)({
+  return TestConfig.layer({
     get: () => Effect.succeed({ ...base, compaction }),
   })
 }
@@ -595,6 +598,15 @@ describe("session.compaction.create", () => {
           auto: true,
           overflow: true,
         })
+
+        const v2 = yield* SessionV2.Service.use((svc) => svc.messages({ sessionID: info.id })).pipe(
+          Effect.provide(SessionV2.defaultLayer),
+        )
+        expect(v2.at(-1)).toMatchObject({
+          type: "compaction",
+          reason: "auto",
+          summary: "",
+        })
       }),
     ),
   )
@@ -853,7 +865,7 @@ describe("session.compaction.prune", () => {
 describe("session.compaction.process", () => {
   test("throws when parent is not a user message", async () => {
     await using tmp = await tmpdir()
-    await Instance.provide({
+    await WithInstance.provide({
       directory: tmp.path,
       fn: async () => {
         const session = await svc.create({})
@@ -883,7 +895,7 @@ describe("session.compaction.process", () => {
 
   test("publishes compacted event on continue", async () => {
     await using tmp = await tmpdir()
-    await Instance.provide({
+    await WithInstance.provide({
       directory: tmp.path,
       fn: async () => {
         const session = await svc.create({})
@@ -933,7 +945,7 @@ describe("session.compaction.process", () => {
 
   test("marks summary message as errored on compact result", async () => {
     await using tmp = await tmpdir()
-    await Instance.provide({
+    await WithInstance.provide({
       directory: tmp.path,
       fn: async () => {
         const session = await svc.create({})
@@ -971,7 +983,7 @@ describe("session.compaction.process", () => {
 
   test("adds synthetic continue prompt when auto is enabled", async () => {
     await using tmp = await tmpdir()
-    await Instance.provide({
+    await WithInstance.provide({
       directory: tmp.path,
       fn: async () => {
         const session = await svc.create({})
@@ -1012,7 +1024,7 @@ describe("session.compaction.process", () => {
 
   test("persists tail_start_id for retained recent turns", async () => {
     await using tmp = await tmpdir()
-    await Instance.provide({
+    await WithInstance.provide({
       directory: tmp.path,
       fn: async () => {
         const session = await svc.create({})
@@ -1059,7 +1071,7 @@ describe("session.compaction.process", () => {
 
   test("shrinks retained tail to fit preserve token budget", async () => {
     await using tmp = await tmpdir()
-    await Instance.provide({
+    await WithInstance.provide({
       directory: tmp.path,
       fn: async () => {
         const session = await svc.create({})
@@ -1108,7 +1120,7 @@ describe("session.compaction.process", () => {
         captured = JSON.stringify(input.messages)
       }),
     )
-    await Instance.provide({
+    await WithInstance.provide({
       directory: tmp.path,
       fn: async () => {
         const session = await svc.create({})
@@ -1157,7 +1169,7 @@ describe("session.compaction.process", () => {
         captured = JSON.stringify(input.messages)
       }),
     )
-    await Instance.provide({
+    await WithInstance.provide({
       directory: tmp.path,
       fn: async () => {
         const session = await svc.create({})
@@ -1216,7 +1228,7 @@ describe("session.compaction.process", () => {
         captured = JSON.stringify(input.messages)
       }),
     )
-    await Instance.provide({
+    await WithInstance.provide({
       directory: tmp.path,
       fn: async () => {
         const session = await svc.create({})
@@ -1268,7 +1280,9 @@ describe("session.compaction.process", () => {
           expect(captured).not.toContain("keep tail")
 
           const filtered = MessageV2.filterCompacted(MessageV2.stream(session.id))
-          expect(filtered[0]?.info.id).toBe(keep.id)
+          expect(filtered.map((msg) => msg.info.id).slice(0, 3)).toEqual([parent!, expect.any(String), keep.id])
+          expect(filtered[1]?.info.role).toBe("assistant")
+          expect(filtered[1]?.info.role === "assistant" ? filtered[1].info.summary : false).toBe(true)
           expect(filtered.map((msg) => msg.info.id)).not.toContain(large.id)
         } finally {
           await rt.dispose()
@@ -1279,7 +1293,7 @@ describe("session.compaction.process", () => {
 
   test("allows plugins to disable synthetic continue prompt", async () => {
     await using tmp = await tmpdir()
-    await Instance.provide({
+    await WithInstance.provide({
       directory: tmp.path,
       fn: async () => {
         const session = await svc.create({})
@@ -1322,7 +1336,7 @@ describe("session.compaction.process", () => {
 
   test("replays the prior user turn on overflow when earlier context exists", async () => {
     await using tmp = await tmpdir()
-    await Instance.provide({
+    await WithInstance.provide({
       directory: tmp.path,
       fn: async () => {
         const session = await svc.create({})
@@ -1370,7 +1384,7 @@ describe("session.compaction.process", () => {
 
   test("falls back to overflow guidance when no replayable turn exists", async () => {
     await using tmp = await tmpdir()
-    await Instance.provide({
+    await WithInstance.provide({
       directory: tmp.path,
       fn: async () => {
         const session = await svc.create({})
@@ -1430,7 +1444,7 @@ describe("session.compaction.process", () => {
     )
 
     await using tmp = await tmpdir({ git: true })
-    await Instance.provide({
+    await WithInstance.provide({
       directory: tmp.path,
       fn: async () => {
         const session = await svc.create({})
@@ -1504,7 +1518,7 @@ describe("session.compaction.process", () => {
     const ready = defer()
 
     await using tmp = await tmpdir({ git: true })
-    await Instance.provide({
+    await WithInstance.provide({
       directory: tmp.path,
       fn: async () => {
         const session = await svc.create({})
@@ -1606,7 +1620,7 @@ describe("session.compaction.process", () => {
     )
 
     await using tmp = await tmpdir({ git: true })
-    await Instance.provide({
+    await WithInstance.provide({
       directory: tmp.path,
       fn: async () => {
         const session = await svc.create({})
@@ -1648,7 +1662,7 @@ describe("session.compaction.process", () => {
     )
 
     await using tmp = await tmpdir({ git: true })
-    await Instance.provide({
+    await WithInstance.provide({
       directory: tmp.path,
       fn: async () => {
         const session = await svc.create({})
@@ -1700,7 +1714,7 @@ describe("session.compaction.process", () => {
     )
 
     await using tmp = await tmpdir({ git: true })
-    await Instance.provide({
+    await WithInstance.provide({
       directory: tmp.path,
       fn: async () => {
         const session = await svc.create({})
@@ -1768,7 +1782,7 @@ describe("session.compaction.process", () => {
     stub.push(reply("summary one"))
     stub.push(reply("summary two"))
     await using tmp = await tmpdir()
-    await Instance.provide({
+    await WithInstance.provide({
       directory: tmp.path,
       fn: async () => {
         const session = await svc.create({})
@@ -1840,7 +1854,7 @@ describe("session.compaction.process", () => {
 
   test("ignores previous summaries when sizing the retained tail", async () => {
     await using tmp = await tmpdir()
-    await Instance.provide({
+    await WithInstance.provide({
       directory: tmp.path,
       fn: async () => {
         const session = await svc.create({})

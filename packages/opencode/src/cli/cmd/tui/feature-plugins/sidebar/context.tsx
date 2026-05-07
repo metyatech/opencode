@@ -1,8 +1,8 @@
 import type { AssistantMessage } from "@opencode-ai/sdk/v2"
 import type { TuiPlugin, TuiPluginApi, TuiPluginModule } from "@opencode-ai/plugin/tui"
 import { createMemo } from "solid-js"
-import type { Config } from "@/config"
-import type { Provider } from "@/provider"
+import type { Config } from "@/config/config"
+import type { Provider } from "@/provider/provider"
 import { usage as contextUsage } from "@/session/overflow"
 
 const id = "internal:sidebar-context"

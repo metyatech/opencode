@@ -1,17 +1,18 @@
 import { Effect, Layer, Schema, Context, Stream } from "effect"
 import { FetchHttpClient, HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
-import * as CrossSpawnSpawner from "@/effect/cross-spawn-spawner"
+import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { withTransientReadRetry } from "@/util/effect-http-client"
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process"
 import fs from "fs"
 import path from "path"
 import z from "zod"
 import { BusEvent } from "@/bus/bus-event"
-import { Flag } from "../flag/flag"
-import { Log } from "../util"
-
+import { Flag } from "@opencode-ai/core/flag/flag"
+import * as Log from "@opencode-ai/core/util/log"
+import { makeRuntime } from "@opencode-ai/core/effect/runtime"
 import semver from "semver"
-import { InstallationChannel, InstallationVersion } from "./version"
+import { InstallationChannel, InstallationVersion } from "@opencode-ai/core/installation/version"
+import { NpmConfig } from "@opencode-ai/core/npm-config"
 
 const log = Log.create({ service: "installation" })
 
@@ -22,14 +23,14 @@ export type ReleaseType = "patch" | "minor" | "major"
 export const Event = {
   Updated: BusEvent.define(
     "installation.updated",
-    z.object({
-      version: z.string(),
+    Schema.Struct({
+      version: Schema.String,
     }),
   ),
   UpdateAvailable: BusEvent.define(
     "installation.update-available",
-    z.object({
-      version: z.string(),
+    Schema.Struct({
+      version: Schema.String,
     }),
   ),
 }
@@ -272,12 +273,10 @@ export const layer: Layer.Layer<Service, never, HttpClient.HttpClient | ChildPro
         }
 
         if (detectedMethod === "npm" || detectedMethod === "bun" || detectedMethod === "pnpm") {
-          const r = (yield* text(["npm", "config", "get", "registry"])).trim()
-          const reg = r || "https://registry.npmjs.org"
-          const registry = reg.endsWith("/") ? reg.slice(0, -1) : reg
-          const channel = InstallationChannel
           const response = yield* httpOk.execute(
-            HttpClientRequest.get(`${registry}/opencode-ai/${channel}`).pipe(HttpClientRequest.acceptJson),
+            HttpClientRequest.get(
+              `${yield* NpmConfig.registry(process.cwd())}/opencode-ai/${InstallationChannel}`,
+            ).pipe(HttpClientRequest.acceptJson),
           )
           const data = yield* HttpClientResponse.schemaBodyJson(NpmPackage)(response)
           return data.version
@@ -441,5 +440,11 @@ export const defaultLayer = layer.pipe(
   Layer.provide(FetchHttpClient.layer),
   Layer.provide(CrossSpawnSpawner.defaultLayer),
 )
+
+const { runPromise } = makeRuntime(Service, defaultLayer)
+
+export const latest = (...args: Parameters<Interface["latest"]>) => runPromise((s) => s.latest(...args))
+export const method = () => runPromise((s) => s.method())
+export const upgrade = (...args: Parameters<Interface["upgrade"]>) => runPromise((s) => s.upgrade(...args))
 
 export * as Installation from "."

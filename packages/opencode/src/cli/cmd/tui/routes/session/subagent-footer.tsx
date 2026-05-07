@@ -6,11 +6,11 @@ import { SplitBorder } from "@tui/component/border"
 import type { AssistantMessage } from "@opencode-ai/sdk/v2"
 import { useCommandDialog } from "@tui/component/dialog-command"
 import { useKeybind } from "../../context/keybind"
-import { Locale } from "@/util"
+import { Locale } from "@/util/locale"
 import { useTerminalDimensions } from "@opentui/solid"
 import { usage as contextUsage } from "@/session/overflow"
-import type { Config } from "@/config"
-import type { Provider } from "@/provider"
+import type { Config } from "@/config/config"
+import type { Provider } from "@/provider/provider"
 
 export function SubagentFooter() {
   const route = useRouteData("session")
