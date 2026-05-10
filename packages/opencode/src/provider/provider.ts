@@ -984,6 +984,88 @@ function cost(c: ModelsDev.Model["cost"]): Model["cost"] {
   return result
 }
 
+function normalizeOver200KCost(
+  current: Partial<Model["cost"]>["experimentalOver200K"],
+  fallback?: Model["cost"]["experimentalOver200K"],
+): Model["cost"]["experimentalOver200K"] | undefined {
+  const source = current ?? fallback
+  if (!source) return undefined
+  return {
+    input: source.input ?? fallback?.input ?? 0,
+    output: source.output ?? fallback?.output ?? 0,
+    cache: {
+      read: source.cache?.read ?? fallback?.cache?.read ?? 0,
+      write: source.cache?.write ?? fallback?.cache?.write ?? 0,
+    },
+  }
+}
+
+function normalizeModel(input: {
+  providerID: ProviderID
+  modelID: string
+  model: Partial<Model>
+  fallback?: Model
+}): Model {
+  const { providerID, modelID, model, fallback } = input
+  return {
+    id: ModelID.make(modelID),
+    providerID,
+    api: {
+      id: model.api?.id ?? fallback?.api?.id ?? model.id ?? modelID,
+      url: model.api?.url ?? fallback?.api?.url ?? "",
+      npm: model.api?.npm ?? fallback?.api?.npm ?? "@ai-sdk/openai-compatible",
+    },
+    name: model.name ?? fallback?.name ?? modelID,
+    family: model.family ?? fallback?.family ?? "",
+    capabilities: {
+      temperature: model.capabilities?.temperature ?? fallback?.capabilities?.temperature ?? false,
+      reasoning: model.capabilities?.reasoning ?? fallback?.capabilities?.reasoning ?? false,
+      attachment: model.capabilities?.attachment ?? fallback?.capabilities?.attachment ?? false,
+      toolcall: model.capabilities?.toolcall ?? fallback?.capabilities?.toolcall ?? true,
+      input: {
+        text: model.capabilities?.input?.text ?? fallback?.capabilities?.input?.text ?? false,
+        audio: model.capabilities?.input?.audio ?? fallback?.capabilities?.input?.audio ?? false,
+        image: model.capabilities?.input?.image ?? fallback?.capabilities?.input?.image ?? false,
+        video: model.capabilities?.input?.video ?? fallback?.capabilities?.input?.video ?? false,
+        pdf: model.capabilities?.input?.pdf ?? fallback?.capabilities?.input?.pdf ?? false,
+      },
+      output: {
+        text: model.capabilities?.output?.text ?? fallback?.capabilities?.output?.text ?? false,
+        audio: model.capabilities?.output?.audio ?? fallback?.capabilities?.output?.audio ?? false,
+        image: model.capabilities?.output?.image ?? fallback?.capabilities?.output?.image ?? false,
+        video: model.capabilities?.output?.video ?? fallback?.capabilities?.output?.video ?? false,
+        pdf: model.capabilities?.output?.pdf ?? fallback?.capabilities?.output?.pdf ?? false,
+      },
+      interleaved: model.capabilities?.interleaved ?? fallback?.capabilities?.interleaved ?? false,
+    },
+    cost: {
+      input: model.cost?.input ?? fallback?.cost?.input ?? 0,
+      output: model.cost?.output ?? fallback?.cost?.output ?? 0,
+      cache: {
+        read: model.cost?.cache?.read ?? fallback?.cost?.cache?.read ?? 0,
+        write: model.cost?.cache?.write ?? fallback?.cost?.cache?.write ?? 0,
+      },
+      experimentalOver200K: normalizeOver200KCost(
+        model.cost?.experimentalOver200K,
+        fallback?.cost?.experimentalOver200K,
+      ),
+    },
+    limit: {
+      context: model.limit?.context ?? fallback?.limit?.context ?? 0,
+      input: model.limit?.input ?? fallback?.limit?.input,
+      output: model.limit?.output ?? fallback?.limit?.output ?? 0,
+    },
+    status: model.status ?? fallback?.status ?? "active",
+    options: mergeDeep(fallback?.options ?? {}, model.options ?? {}),
+    headers: {
+      ...(fallback?.headers ?? {}),
+      ...(model.headers ?? {}),
+    },
+    release_date: model.release_date ?? fallback?.release_date ?? "",
+    variants: model.variants ?? fallback?.variants,
+  }
+}
+
 function fromModelsDevModel(provider: ModelsDev.Provider, model: ModelsDev.Model): Model {
   const base: Model = {
     id: ModelID.make(model.id),
@@ -1362,28 +1444,36 @@ const layer: Layer.Layer<
           const configProvider = cfg.provider?.[providerID]
 
           for (const [modelID, model] of Object.entries(provider.models)) {
-            model.api.id = model.api.id ?? model.id ?? modelID
+            provider.models[modelID] = normalizeModel({
+              providerID,
+              modelID,
+              model,
+              fallback: database[providerID]?.models[modelID],
+            })
+            const normalized = provider.models[modelID]
+
+            normalized.api.id = normalized.api.id ?? normalized.id ?? modelID
             if (
               modelID === "gpt-5-chat-latest" ||
               (providerID === ProviderID.openrouter && modelID === "openai/gpt-5-chat")
             )
               delete provider.models[modelID]
-            if (model.status === "alpha" && !Flag.OPENCODE_ENABLE_EXPERIMENTAL_MODELS) delete provider.models[modelID]
-            if (model.status === "deprecated") delete provider.models[modelID]
+            if (normalized.status === "alpha" && !Flag.OPENCODE_ENABLE_EXPERIMENTAL_MODELS) delete provider.models[modelID]
+            if (normalized.status === "deprecated") delete provider.models[modelID]
             if (
               (configProvider?.blacklist && configProvider.blacklist.includes(modelID)) ||
               (configProvider?.whitelist && !configProvider.whitelist.includes(modelID))
             )
               delete provider.models[modelID]
 
-            if (!model.variants || Object.keys(model.variants).length === 0) {
-              model.variants = mapValues(ProviderTransform.variants(model), (v) => v)
+            if (!normalized.variants || Object.keys(normalized.variants).length === 0) {
+              normalized.variants = mapValues(ProviderTransform.variants(normalized), (v) => v)
             }
 
             const configVariants = configProvider?.models?.[modelID]?.variants
-            if (configVariants && model.variants) {
-              const merged = mergeDeep(model.variants, configVariants)
-              model.variants = mapValues(
+            if (configVariants && normalized.variants) {
+              const merged = mergeDeep(normalized.variants, configVariants)
+              normalized.variants = mapValues(
                 pickBy(merged, (v) => !v.disabled),
                 (v) => omit(v, ["disabled"]),
               )
