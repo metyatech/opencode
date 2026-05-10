@@ -28,6 +28,8 @@ import { ShellID } from "../../tool/shell/id"
 import { TodoWriteTool } from "../../tool/todo"
 import { Locale } from "@/util/locale"
 
+const ERROR_IDLE_GRACE_MS = 2_000
+
 type ToolProps<T> = {
   input: Tool.InferParameters<T>
   metadata: Tool.InferMetadata<T>
@@ -206,6 +208,10 @@ function normalizePath(input?: string) {
 export async function runAndAwaitSessionIdle(start: () => Promise<void>, waitForIdle: Promise<void>) {
   await start()
   await waitForIdle
+}
+
+export function shouldDeferIdleExitAfterError(state: { error: string | undefined; emittedTextAfterError: boolean }) {
+  return state.error !== undefined && !state.emittedTextAfterError
 }
 
 export const RunCommand = effectCmd({
@@ -448,125 +454,161 @@ export const RunCommand = effectCmd({
 
         async function loop() {
           const toggles = new Map<string, boolean>()
+          const iterator = events.stream[Symbol.asyncIterator]()
+          let emittedTextAfterError = false
+          let idleGraceTimer: ReturnType<typeof setTimeout> | undefined
+          let idleGrace: Promise<{ type: "idle-grace" }> | undefined
 
-          for await (const event of events.stream) {
-            if (
-              event.type === "message.updated" &&
-              event.properties.info.role === "assistant" &&
-              args.format !== "json" &&
-              toggles.get("start") !== true
-            ) {
-              UI.empty()
-              UI.println(`> ${event.properties.info.agent} · ${event.properties.info.modelID}`)
-              UI.empty()
-              toggles.set("start", true)
-            }
+          function clearIdleGrace() {
+            if (idleGraceTimer) clearTimeout(idleGraceTimer)
+            idleGraceTimer = undefined
+            idleGrace = undefined
+          }
 
-            if (event.type === "message.part.updated") {
-              const part = event.properties.part
-              if (part.sessionID !== sessionID) continue
+          function deferIdleExit() {
+            clearIdleGrace()
+            idleGrace = new Promise((resolve) => {
+              idleGraceTimer = setTimeout(() => resolve({ type: "idle-grace" }), ERROR_IDLE_GRACE_MS)
+            })
+          }
 
-              if (part.type === "tool" && (part.state.status === "completed" || part.state.status === "error")) {
-                if (emit("tool_use", { part })) continue
-                if (part.state.status === "completed") {
-                  tool(part)
-                  continue
+          try {
+            while (true) {
+              const nextEvent = iterator.next().then((result) => ({ type: "event" as const, result }))
+              const next = idleGrace ? await Promise.race([nextEvent, idleGrace]) : await nextEvent
+
+              if (next.type === "idle-grace") break
+              clearIdleGrace()
+
+              if (next.result.done) break
+              const event = next.result.value
+              if (
+                event.type === "message.updated" &&
+                event.properties.info.role === "assistant" &&
+                args.format !== "json" &&
+                toggles.get("start") !== true
+              ) {
+                UI.empty()
+                UI.println(`> ${event.properties.info.agent} · ${event.properties.info.modelID}`)
+                UI.empty()
+                toggles.set("start", true)
+              }
+
+              if (event.type === "message.part.updated") {
+                const part = event.properties.part
+                if (part.sessionID !== sessionID) continue
+
+                if (part.type === "tool" && (part.state.status === "completed" || part.state.status === "error")) {
+                  if (emit("tool_use", { part })) continue
+                  if (part.state.status === "completed") {
+                    tool(part)
+                    continue
+                  }
+                  inline({
+                    icon: "✗",
+                    title: `${part.tool} failed`,
+                  })
+                  UI.error(part.state.error)
                 }
-                inline({
-                  icon: "✗",
-                  title: `${part.tool} failed`,
-                })
-                UI.error(part.state.error)
+
+                if (
+                  part.type === "tool" &&
+                  part.tool === "task" &&
+                  part.state.status === "running" &&
+                  args.format !== "json"
+                ) {
+                  if (toggles.get(part.id) === true) continue
+                  task(props<typeof TaskTool>(part))
+                  toggles.set(part.id, true)
+                }
+
+                if (part.type === "step-start") {
+                  if (emit("step_start", { part })) continue
+                }
+
+                if (part.type === "step-finish") {
+                  if (emit("step_finish", { part })) continue
+                }
+
+                if (part.type === "text" && part.time?.end) {
+                  emittedTextAfterError = true
+                  if (emit("text", { part })) continue
+                  const text = part.text.trim()
+                  if (!text) continue
+                  if (!process.stdout.isTTY) {
+                    process.stdout.write(text + EOL)
+                    continue
+                  }
+                  UI.empty()
+                  UI.println(text)
+                  UI.empty()
+                }
+
+                if (part.type === "reasoning" && part.time?.end && args.thinking) {
+                  if (emit("reasoning", { part })) continue
+                  const text = part.text.trim()
+                  if (!text) continue
+                  const line = `Thinking: ${text}`
+                  if (process.stdout.isTTY) {
+                    UI.empty()
+                    UI.println(`${UI.Style.TEXT_DIM}\u001b[3m${line}\u001b[0m${UI.Style.TEXT_NORMAL}`)
+                    UI.empty()
+                    continue
+                  }
+                  process.stdout.write(line + EOL)
+                }
+              }
+
+              if (event.type === "session.error") {
+                const props = event.properties
+                if (props.sessionID !== sessionID || !props.error) continue
+                let err = String(props.error.name)
+                if ("data" in props.error && props.error.data && "message" in props.error.data) {
+                  err = String(props.error.data.message)
+                }
+                error = error ? error + EOL + err : err
+                emittedTextAfterError = false
+                if (emit("error", { error: props.error })) continue
+                UI.error(err)
               }
 
               if (
-                part.type === "tool" &&
-                part.tool === "task" &&
-                part.state.status === "running" &&
-                args.format !== "json"
+                event.type === "session.status" &&
+                event.properties.sessionID === sessionID &&
+                event.properties.status.type === "idle"
               ) {
-                if (toggles.get(part.id) === true) continue
-                task(props<typeof TaskTool>(part))
-                toggles.set(part.id, true)
-              }
-
-              if (part.type === "step-start") {
-                if (emit("step_start", { part })) continue
-              }
-
-              if (part.type === "step-finish") {
-                if (emit("step_finish", { part })) continue
-              }
-
-              if (part.type === "text" && part.time?.end) {
-                if (emit("text", { part })) continue
-                const text = part.text.trim()
-                if (!text) continue
-                if (!process.stdout.isTTY) {
-                  process.stdout.write(text + EOL)
+                if (shouldDeferIdleExitAfterError({ error, emittedTextAfterError })) {
+                  deferIdleExit()
                   continue
                 }
-                UI.empty()
-                UI.println(text)
-                UI.empty()
+                break
               }
 
-              if (part.type === "reasoning" && part.time?.end && args.thinking) {
-                if (emit("reasoning", { part })) continue
-                const text = part.text.trim()
-                if (!text) continue
-                const line = `Thinking: ${text}`
-                if (process.stdout.isTTY) {
-                  UI.empty()
-                  UI.println(`${UI.Style.TEXT_DIM}\u001b[3m${line}\u001b[0m${UI.Style.TEXT_NORMAL}`)
-                  UI.empty()
-                  continue
+              if (event.type === "permission.asked") {
+                const permission = event.properties
+                if (permission.sessionID !== sessionID) continue
+
+                if (args["dangerously-skip-permissions"]) {
+                  await sdk.permission.reply({
+                    requestID: permission.id,
+                    reply: "once",
+                  })
+                } else {
+                  UI.println(
+                    UI.Style.TEXT_WARNING_BOLD + "!",
+                    UI.Style.TEXT_NORMAL +
+                      `permission requested: ${permission.permission} (${permission.patterns.join(", ")}); auto-rejecting`,
+                  )
+                  await sdk.permission.reply({
+                    requestID: permission.id,
+                    reply: "reject",
+                  })
                 }
-                process.stdout.write(line + EOL)
               }
             }
-
-            if (event.type === "session.error") {
-              const props = event.properties
-              if (props.sessionID !== sessionID || !props.error) continue
-              let err = String(props.error.name)
-              if ("data" in props.error && props.error.data && "message" in props.error.data) {
-                err = String(props.error.data.message)
-              }
-              error = error ? error + EOL + err : err
-              if (emit("error", { error: props.error })) continue
-              UI.error(err)
-            }
-
-            if (
-              event.type === "session.status" &&
-              event.properties.sessionID === sessionID &&
-              event.properties.status.type === "idle"
-            ) {
-              break
-            }
-
-            if (event.type === "permission.asked") {
-              const permission = event.properties
-              if (permission.sessionID !== sessionID) continue
-
-              if (args["dangerously-skip-permissions"]) {
-                await sdk.permission.reply({
-                  requestID: permission.id,
-                  reply: "once",
-                })
-              } else {
-                UI.println(
-                  UI.Style.TEXT_WARNING_BOLD + "!",
-                  UI.Style.TEXT_NORMAL +
-                    `permission requested: ${permission.permission} (${permission.patterns.join(", ")}); auto-rejecting`,
-                )
-                await sdk.permission.reply({
-                  requestID: permission.id,
-                  reply: "reject",
-                })
-              }
-            }
+          } finally {
+            clearIdleGrace()
+            await iterator.return?.(undefined)
           }
         }
 
