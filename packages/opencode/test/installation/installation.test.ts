@@ -71,6 +71,7 @@ describe("installation", () => {
           if (cmd === "git" && args.join(" ") === "rev-parse HEAD") return "1111111111111111111111111111111111111111\n"
           if (cmd === "git" && args.join(" ") === "rev-parse origin/dev")
             return "2222222222222222222222222222222222222222\n"
+          if (cmd === "git" && args.join(" ") === "rev-list --count origin/dev") return "42\n"
           return ""
         },
       )
@@ -79,7 +80,7 @@ describe("installation", () => {
         const result = await Effect.runPromise(
           Installation.Service.use((svc) => svc.latest("local-fork")).pipe(Effect.provide(layer)),
         )
-        expect(result).toBe("0.0.0-fork.222222222222")
+        expect(result).toBe("1.14.40-dev.42+sha.2222222")
         expect(calls.some((call) => call.includes("api.github.com/repos/anomalyco/opencode"))).toBe(false)
       } finally {
         if (previous === undefined) delete process.env.OPENCODE_LOCAL_FORK_REPO
@@ -207,7 +208,7 @@ describe("installation", () => {
       const previousRepo = process.env.OPENCODE_LOCAL_FORK_REPO
       const previousPointer = process.env.OPENCODE_LOCAL_FORK_POINTER
       const repo = await fs.promises.mkdtemp(path.join(os.tmpdir(), "opencode-local-fork-"))
-      const target = "0.0.0-fork.222222222222"
+      const target = "1.14.40-dev.42+sha.2222222"
       const outputName = `opencode-${process.platform === "win32" ? "windows" : process.platform}-${process.arch}`
       const binaryName = process.platform === "win32" ? "opencode.exe" : "opencode"
       const built = path.join(

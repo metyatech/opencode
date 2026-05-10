@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { parsePluginSpecifier } from "../../src/plugin/shared"
+import { checkPluginCompatibility, parsePluginSpecifier } from "../../src/plugin/shared"
 
 describe("parsePluginSpecifier", () => {
   test("parses standard npm package without version", () => {
@@ -84,5 +84,21 @@ describe("parsePluginSpecifier", () => {
       pkg: "@opencode/acme",
       version: "latest",
     })
+  })
+})
+
+describe("checkPluginCompatibility", () => {
+  test("accepts preview builds against stable plugin ranges", async () => {
+    await expect(
+      checkPluginCompatibility("ignored", "1.14.40-dev.182+sha.cdb3461", {
+        dir: "ignored",
+        pkg: "example-plugin",
+        json: {
+          name: "example-plugin",
+          version: "1.0.0",
+          engines: { opencode: "^1.14.0" },
+        },
+      }),
+    ).resolves.toBeUndefined()
   })
 })

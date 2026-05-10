@@ -11,7 +11,7 @@ import { Flag } from "@opencode-ai/core/flag/flag"
 import * as Log from "@opencode-ai/core/util/log"
 import { makeRuntime } from "@opencode-ai/core/effect/runtime"
 import semver from "semver"
-import { InstallationChannel, InstallationVersion } from "@opencode-ai/core/installation/version"
+import { InstallationBaseVersion, InstallationChannel, InstallationVersion, formatPreviewVersion } from "@opencode-ai/core/installation/version"
 import { NpmConfig } from "@opencode-ai/core/npm-config"
 
 const log = Log.create({ service: "installation" })
@@ -95,8 +95,24 @@ function localForkPointerPath(repo: string) {
   return process.env.OPENCODE_LOCAL_FORK_POINTER ?? path.join(repo, "packages", "opencode", ".local-fork-current")
 }
 
-function localForkVersion(sha: string) {
-  return `0.0.0-fork.${sha.slice(0, 12)}`
+function readLocalForkBaseVersion(repo: string) {
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(repo, "packages", "opencode", "package.json"), "utf8")) as {
+      version?: unknown
+    }
+    if (typeof pkg.version === "string" && pkg.version.trim()) return pkg.version
+  } catch {}
+  return InstallationBaseVersion
+}
+
+function localForkVersion(repo: string, branch: string, revision: number, sha: string) {
+  return formatPreviewVersion({
+    baseVersion: readLocalForkBaseVersion(repo),
+    channel: branch,
+    revision,
+    commit: sha,
+    dirty: false,
+  })
 }
 
 // Response schemas for external version APIs
@@ -253,7 +269,8 @@ export const layer: Layer.Layer<Service, never, HttpClient.HttpClient | ChildPro
           const local = (yield* text(["git", "rev-parse", "HEAD"], { cwd: repo })).trim()
           const remote = (yield* text(["git", "rev-parse", `origin/${branch}`], { cwd: repo })).trim()
           if (!remote || remote === local) return InstallationVersion
-          return localForkVersion(remote)
+          const revision = Number.parseInt((yield* text(["git", "rev-list", "--count", `origin/${branch}`], { cwd: repo })).trim(), 10)
+          return localForkVersion(repo, branch, Number.isFinite(revision) ? revision : 0, remote)
         }
 
         if (detectedMethod === "brew") {

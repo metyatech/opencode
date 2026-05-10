@@ -3,6 +3,7 @@ import { TuiThreadCommand } from "./cli/cmd/tui/thread"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { hideBin } from "yargs/helpers"
 import { Log } from "./node"
+import { VersionCommand } from "./cli/cmd/version"
 
 Log.init({
   print: false,
@@ -30,4 +31,5 @@ const cli = yargs(hideBin(process.argv))
     type: "boolean",
   })
   .command(TuiThreadCommand)
+  .command(VersionCommand)
   .parse()

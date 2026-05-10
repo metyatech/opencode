@@ -39,6 +39,7 @@ import { PluginCommand } from "./cli/cmd/plug"
 import { Heap } from "./cli/heap"
 import { drizzle } from "drizzle-orm/bun-sqlite"
 import { ensureProcessMetadata } from "@opencode-ai/core/util/opencode-process"
+import { VersionCommand } from "./cli/cmd/version"
 
 const processMetadata = ensureProcessMetadata("main")
 
@@ -55,6 +56,10 @@ process.on("uncaughtException", (e) => {
 })
 
 const args = hideBin(process.argv)
+
+function isLightweightCommand(argv: string[]) {
+  return argv[0] === "version" || argv.includes("--version") || argv.includes("-v")
+}
 
 function show(out: string) {
   const text = out.trimStart()
@@ -88,6 +93,8 @@ const cli = yargs(args)
     type: "boolean",
   })
   .middleware(async (opts) => {
+    if (isLightweightCommand(args)) return
+
     if (opts.pure) {
       process.env.OPENCODE_PURE = "1"
     }
@@ -158,6 +165,7 @@ const cli = yargs(args)
   .command(McpCommand)
   .command(TuiThreadCommand)
   .command(AttachCommand)
+  .command(VersionCommand)
   .command(RunCommand)
   .command(GenerateCommand)
   .command(DebugCommand)
