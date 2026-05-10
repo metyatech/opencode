@@ -210,8 +210,8 @@ export async function runAndAwaitSessionIdle(start: () => Promise<void>, waitFor
   await waitForIdle
 }
 
-export function shouldDeferIdleExitAfterError(state: { error: string | undefined; emittedTextAfterError: boolean }) {
-  return state.error !== undefined && !state.emittedTextAfterError
+export function shouldDeferIdleExit(state: { emittedOutput: boolean }) {
+  return !state.emittedOutput
 }
 
 export const RunCommand = effectCmd({
@@ -450,12 +450,10 @@ export const RunCommand = effectCmd({
         }
 
         const events = await sdk.event.subscribe()
-        let error: string | undefined
-
         async function loop() {
           const toggles = new Map<string, boolean>()
           const iterator = events.stream[Symbol.asyncIterator]()
-          let emittedTextAfterError = false
+          let emittedOutput = false
           let idleGraceTimer: ReturnType<typeof setTimeout> | undefined
           let idleGrace: Promise<{ type: "idle-grace" }> | undefined
 
@@ -491,6 +489,7 @@ export const RunCommand = effectCmd({
                 UI.empty()
                 UI.println(`> ${event.properties.info.agent} · ${event.properties.info.modelID}`)
                 UI.empty()
+                emittedOutput = true
                 toggles.set("start", true)
               }
 
@@ -499,9 +498,13 @@ export const RunCommand = effectCmd({
                 if (part.sessionID !== sessionID) continue
 
                 if (part.type === "tool" && (part.state.status === "completed" || part.state.status === "error")) {
-                  if (emit("tool_use", { part })) continue
+                  if (emit("tool_use", { part })) {
+                    emittedOutput = true
+                    continue
+                  }
                   if (part.state.status === "completed") {
                     tool(part)
+                    emittedOutput = true
                     continue
                   }
                   inline({
@@ -509,6 +512,7 @@ export const RunCommand = effectCmd({
                     title: `${part.tool} failed`,
                   })
                   UI.error(part.state.error)
+                  emittedOutput = true
                 }
 
                 if (
@@ -519,33 +523,47 @@ export const RunCommand = effectCmd({
                 ) {
                   if (toggles.get(part.id) === true) continue
                   task(props<typeof TaskTool>(part))
+                  emittedOutput = true
                   toggles.set(part.id, true)
                 }
 
                 if (part.type === "step-start") {
-                  if (emit("step_start", { part })) continue
+                  if (emit("step_start", { part })) {
+                    emittedOutput = true
+                    continue
+                  }
                 }
 
                 if (part.type === "step-finish") {
-                  if (emit("step_finish", { part })) continue
+                  if (emit("step_finish", { part })) {
+                    emittedOutput = true
+                    continue
+                  }
                 }
 
                 if (part.type === "text" && part.time?.end) {
-                  emittedTextAfterError = true
-                  if (emit("text", { part })) continue
+                  if (emit("text", { part })) {
+                    emittedOutput = true
+                    continue
+                  }
                   const text = part.text.trim()
                   if (!text) continue
                   if (!process.stdout.isTTY) {
                     process.stdout.write(text + EOL)
+                    emittedOutput = true
                     continue
                   }
                   UI.empty()
                   UI.println(text)
                   UI.empty()
+                  emittedOutput = true
                 }
 
                 if (part.type === "reasoning" && part.time?.end && args.thinking) {
-                  if (emit("reasoning", { part })) continue
+                  if (emit("reasoning", { part })) {
+                    emittedOutput = true
+                    continue
+                  }
                   const text = part.text.trim()
                   if (!text) continue
                   const line = `Thinking: ${text}`
@@ -553,9 +571,11 @@ export const RunCommand = effectCmd({
                     UI.empty()
                     UI.println(`${UI.Style.TEXT_DIM}\u001b[3m${line}\u001b[0m${UI.Style.TEXT_NORMAL}`)
                     UI.empty()
+                    emittedOutput = true
                     continue
                   }
                   process.stdout.write(line + EOL)
+                  emittedOutput = true
                 }
               }
 
@@ -566,10 +586,12 @@ export const RunCommand = effectCmd({
                 if ("data" in props.error && props.error.data && "message" in props.error.data) {
                   err = String(props.error.data.message)
                 }
-                error = error ? error + EOL + err : err
-                emittedTextAfterError = false
-                if (emit("error", { error: props.error })) continue
+                if (emit("error", { error: props.error })) {
+                  emittedOutput = true
+                  continue
+                }
                 UI.error(err)
+                emittedOutput = true
               }
 
               if (
@@ -577,7 +599,7 @@ export const RunCommand = effectCmd({
                 event.properties.sessionID === sessionID &&
                 event.properties.status.type === "idle"
               ) {
-                if (shouldDeferIdleExitAfterError({ error, emittedTextAfterError })) {
+                if (shouldDeferIdleExit({ emittedOutput })) {
                   deferIdleExit()
                   continue
                 }
@@ -599,6 +621,7 @@ export const RunCommand = effectCmd({
                     UI.Style.TEXT_NORMAL +
                       `permission requested: ${permission.permission} (${permission.patterns.join(", ")}); auto-rejecting`,
                   )
+                  emittedOutput = true
                   await sdk.permission.reply({
                     requestID: permission.id,
                     reply: "reject",
