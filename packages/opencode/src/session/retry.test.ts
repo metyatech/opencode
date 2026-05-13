@@ -24,6 +24,16 @@ const apiError = (data: {
   }) as Parameters<typeof SessionRetry.retryable>[0]
 
 describe("SessionRetry.retryable", () => {
+  test("Claude Code 'Claude Code returned an error result' is terminal", () => {
+    const err = apiError({
+      message: "Claude Code returned an error result: You've hit your limit \u00b7 resets May 15, 3am (Asia/Tokyo)",
+      statusCode: 500,
+      isRetryable: true,
+    })
+
+    expect(SessionRetry.retryable(err)).toBeUndefined()
+  })
+
   test("Claude Code 'You've hit your limit' is terminal even when proxy returns 500", () => {
     const err = apiError({
       message: "Claude Code returned an error result: You've hit your limit \u00b7 resets May 1, 3am",

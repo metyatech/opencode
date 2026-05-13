@@ -63,6 +63,7 @@ const QUOTA_EXHAUSTION_PATTERNS: ReadonlyArray<RegExp> = [
   /quota\s+will\s+reset\s+after/i,
   /quota\s+exceeded/i,
   /usage\s+limit\s+(?:has\s+been\s+reached|reached|exceeded|for)/i,
+  /Claude\s+Code\s+returned\s+an\s+error\s+result/i,
   /(?:billing\s+(?:hard\s+)?limit|monthly\s+limit|weekly\s+limit|plan\s+limit|subscription\s+(?:quota|limit))/i,
   /(?:out\s+of|insufficient)\s+credits?/i,
   /credits?\s+exhausted/i,
