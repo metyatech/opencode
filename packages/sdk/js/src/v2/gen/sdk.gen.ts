@@ -146,6 +146,10 @@ import type {
   SessionPromptAsyncResponses,
   SessionPromptErrors,
   SessionPromptResponses,
+  SessionRetryAsyncErrors,
+  SessionRetryAsyncResponses,
+  SessionRetryErrors,
+  SessionRetryResponses,
   SessionRevertErrors,
   SessionRevertResponses,
   SessionShareErrors,
@@ -3565,6 +3569,102 @@ export class Session2 extends HeyApiClient {
     )
     return (options?.client ?? this.client).post<SessionPromptAsyncResponses, SessionPromptAsyncErrors, ThrowOnError>({
       url: "/session/{sessionID}/prompt_async",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Retry message
+   *
+   * Retry the latest user message with a different model or agent, reusing the existing prompt parts instead of creating a new user turn.
+   */
+  public retry<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      messageID: string
+      directory?: string
+      workspace?: string
+      model?: {
+        providerID: string
+        modelID: string
+      }
+      agent?: string
+      variant?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "path", key: "messageID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "body", key: "model" },
+            { in: "body", key: "agent" },
+            { in: "body", key: "variant" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<SessionRetryResponses, SessionRetryErrors, ThrowOnError>({
+      url: "/session/{sessionID}/message/{messageID}/retry",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Retry message asynchronously
+   *
+   * Retry the latest user message asynchronously with a different model or agent, reusing the existing prompt parts instead of creating a new user turn.
+   */
+  public retryAsync<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      messageID: string
+      directory?: string
+      workspace?: string
+      model?: {
+        providerID: string
+        modelID: string
+      }
+      agent?: string
+      variant?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "path", key: "messageID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "body", key: "model" },
+            { in: "body", key: "agent" },
+            { in: "body", key: "variant" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<SessionRetryAsyncResponses, SessionRetryAsyncErrors, ThrowOnError>({
+      url: "/session/{sessionID}/message/{messageID}/retry_async",
       ...options,
       ...params,
       headers: {

@@ -1200,12 +1200,12 @@ const layer: Layer.Layer<
         function mergeProvider(providerID: ProviderID, provider: Partial<Info>) {
           const existing = providers[providerID]
           if (existing) {
-            providers[providerID] = mergeDeep(existing, provider)
+            providers[providerID] = mergeDeep(existing, provider) as Info
             return
           }
           const match = database[providerID]
           if (!match) return
-          providers[providerID] = mergeDeep(match, provider)
+          providers[providerID] = mergeDeep(match, provider) as Info
         }
 
         // load plugins first so config() hook runs before reading cfg.provider
@@ -1459,7 +1459,8 @@ const layer: Layer.Layer<
               (providerID === ProviderID.openrouter && modelID === "openai/gpt-5-chat")
             )
               delete provider.models[modelID]
-            if (normalized.status === "alpha" && !Flag.OPENCODE_ENABLE_EXPERIMENTAL_MODELS) delete provider.models[modelID]
+            if (normalized.status === "alpha" && !Flag.OPENCODE_ENABLE_EXPERIMENTAL_MODELS)
+              delete provider.models[modelID]
             if (normalized.status === "deprecated") delete provider.models[modelID]
             if (
               (configProvider?.blacklist && configProvider.blacklist.includes(modelID)) ||

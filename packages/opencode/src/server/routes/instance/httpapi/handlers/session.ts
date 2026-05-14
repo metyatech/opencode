@@ -30,6 +30,7 @@ import {
   MessagesQuery,
   PermissionResponsePayload,
   PromptPayload,
+  RetryPayload,
   RevertPayload,
   ShellPayload,
   SummarizePayload,
@@ -271,6 +272,41 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       return HttpApiSchema.NoContent.make()
     })
 
+    const retry = Effect.fn("SessionHttpApi.retry")(function* (ctx: {
+      params: { sessionID: SessionID; messageID: MessageID }
+      payload: typeof RetryPayload.Type
+    }) {
+      const instance = yield* InstanceState.context
+      const workspace = yield* InstanceState.workspaceID
+      return HttpServerResponse.stream(
+        Stream.fromEffect(
+          promptSvc
+            .retry({
+              ...ctx.payload,
+              sessionID: ctx.params.sessionID,
+              messageID: ctx.params.messageID,
+            })
+            .pipe(Effect.provideService(InstanceRef, instance), Effect.provideService(WorkspaceRef, workspace)),
+        ).pipe(
+          Stream.map((message) => JSON.stringify(message)),
+          Stream.encodeText,
+        ),
+        { contentType: "application/json" },
+      )
+    })
+
+    const retryAsync = Effect.fn("SessionHttpApi.retryAsync")(function* (ctx: {
+      params: { sessionID: SessionID; messageID: MessageID }
+      payload: typeof RetryPayload.Type
+    }) {
+      yield* promptSvc.retryAsync({
+        ...ctx.payload,
+        sessionID: ctx.params.sessionID,
+        messageID: ctx.params.messageID,
+      })
+      return HttpApiSchema.NoContent.make()
+    })
+
     const command = Effect.fn("SessionHttpApi.command")(function* (ctx: {
       params: { sessionID: SessionID }
       payload: typeof CommandPayload.Type
@@ -356,6 +392,8 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       .handle("summarize", summarize)
       .handle("prompt", prompt)
       .handle("promptAsync", promptAsync)
+      .handle("retry", retry)
+      .handle("retryAsync", retryAsync)
       .handle("command", command)
       .handle("shell", shell)
       .handle("revert", revert)

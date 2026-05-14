@@ -2726,6 +2726,103 @@ export type SessionPromptAsyncResponses = {
 
 export type SessionPromptAsyncResponse = SessionPromptAsyncResponses[keyof SessionPromptAsyncResponses]
 
+export type SessionRetryData = {
+  body?: {
+    model: {
+      providerID: string
+      modelID: string
+    }
+    agent?: string
+    variant?: string
+  }
+  path: {
+    /**
+     * Session ID
+     */
+    id: string
+    /**
+     * Message ID
+     */
+    messageID: string
+  }
+  query?: {
+    directory?: string
+  }
+  url: "/session/{id}/message/{messageID}/retry"
+}
+
+export type SessionRetryErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+  /**
+   * Not found
+   */
+  404: NotFoundError
+}
+
+export type SessionRetryError = SessionRetryErrors[keyof SessionRetryErrors]
+
+export type SessionRetryResponses = {
+  /**
+   * Created assistant message
+   */
+  200: {
+    info: AssistantMessage
+    parts: Array<Part>
+  }
+}
+
+export type SessionRetryResponse = SessionRetryResponses[keyof SessionRetryResponses]
+
+export type SessionRetryAsyncData = {
+  body?: {
+    model: {
+      providerID: string
+      modelID: string
+    }
+    agent?: string
+    variant?: string
+  }
+  path: {
+    /**
+     * Session ID
+     */
+    id: string
+    /**
+     * Message ID
+     */
+    messageID: string
+  }
+  query?: {
+    directory?: string
+  }
+  url: "/session/{id}/message/{messageID}/retry_async"
+}
+
+export type SessionRetryAsyncErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+  /**
+   * Not found
+   */
+  404: NotFoundError
+}
+
+export type SessionRetryAsyncError = SessionRetryAsyncErrors[keyof SessionRetryAsyncErrors]
+
+export type SessionRetryAsyncResponses = {
+  /**
+   * Retry accepted
+   */
+  204: void
+}
+
+export type SessionRetryAsyncResponse = SessionRetryAsyncResponses[keyof SessionRetryAsyncResponses]
+
 export type SessionCommandData = {
   body?: {
     messageID?: string

@@ -647,6 +647,60 @@ describe("HttpApi SDK", () => {
     ),
   )
 
+  parity("matches generated SDK retry async route across backends", (backend) =>
+    withFakeLlm(backend, ({ sdk, llm }) =>
+      Effect.gen(function* () {
+        yield* llm.fail(new Error("boom"))
+        const session = yield* capture(() =>
+          sdk.session.create({
+            title: "retry llm",
+            permission: [{ permission: "*", pattern: "*", action: "allow" }],
+          }),
+        )
+        const sessionID = String(record(session.data).id)
+        const prompt = yield* capture(() =>
+          sdk.session.prompt({
+            sessionID,
+            agent: "build",
+            model: { providerID: "test", modelID: "test-model" },
+            parts: [{ type: "text", text: "retry this prompt" }],
+          }),
+        )
+        const beforeRetry = yield* capture(() => sdk.session.messages({ sessionID }))
+        const user = array(beforeRetry.data).find((item) => record(record(item).info).role === "user")
+        const messageID = String(record(record(user).info).id)
+
+        yield* llm.text("retry world")
+        const retry = yield* capture(() =>
+          sdk.session.retryAsync({
+            sessionID,
+            messageID,
+            model: { providerID: "test", modelID: "test-model" },
+          }),
+        )
+
+        const messages = yield* call(async () => {
+          const end = Date.now() + 5000
+          while (Date.now() < end) {
+            const result = await sdk.session.messages({ sessionID })
+            if (JSON.stringify(result.data).includes("retry world")) return result
+            await new Promise((done) => setTimeout(done, 20))
+          }
+          throw new Error("timed out waiting for retry async message")
+        })
+
+        const all = array(messages.data)
+        return {
+          statuses: statuses({ session, prompt, beforeRetry, retry, messages: { status: messages.response.status } }),
+          userCount: all.filter((item) => record(record(item).info).role === "user").length,
+          assistantCount: all.filter((item) => record(record(item).info).role === "assistant").length,
+          retryText: JSON.stringify(messages.data).includes("retry world"),
+          promptOccurrences: (JSON.stringify(messages.data).match(/retry this prompt/g) ?? []).length,
+        }
+      }),
+    ),
+  )
+
   parity("matches generated SDK TUI validation and command routes across backends", (backend) =>
     withStandardProject(backend, ({ sdk }) =>
       Effect.gen(function* () {

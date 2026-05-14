@@ -97,6 +97,12 @@ import type {
   SessionPromptAsyncData,
   SessionPromptAsyncResponses,
   SessionPromptAsyncErrors,
+  SessionRetryData,
+  SessionRetryResponses,
+  SessionRetryErrors,
+  SessionRetryAsyncData,
+  SessionRetryAsyncResponses,
+  SessionRetryAsyncErrors,
   SessionCommandData,
   SessionCommandResponses,
   SessionCommandErrors,
@@ -639,6 +645,34 @@ class Session extends _HeyApiClient {
   public promptAsync<ThrowOnError extends boolean = false>(options: Options<SessionPromptAsyncData, ThrowOnError>) {
     return (options.client ?? this._client).post<SessionPromptAsyncResponses, SessionPromptAsyncErrors, ThrowOnError>({
       url: "/session/{id}/prompt_async",
+      ...options,
+      headers: {
+        "Content-Type": "application/json",
+        ...options.headers,
+      },
+    })
+  }
+
+  /**
+   * Retry a message
+   */
+  public retry<ThrowOnError extends boolean = false>(options: Options<SessionRetryData, ThrowOnError>) {
+    return (options.client ?? this._client).post<SessionRetryResponses, SessionRetryErrors, ThrowOnError>({
+      url: "/session/{id}/message/{messageID}/retry",
+      ...options,
+      headers: {
+        "Content-Type": "application/json",
+        ...options.headers,
+      },
+    })
+  }
+
+  /**
+   * Retry a message asynchronously
+   */
+  public retryAsync<ThrowOnError extends boolean = false>(options: Options<SessionRetryAsyncData, ThrowOnError>) {
+    return (options.client ?? this._client).post<SessionRetryAsyncResponses, SessionRetryAsyncErrors, ThrowOnError>({
+      url: "/session/{id}/message/{messageID}/retry_async",
       ...options,
       headers: {
         "Content-Type": "application/json",

@@ -82,6 +82,8 @@ export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
   readonly prompt: (input: PromptInput) => Effect.Effect<MessageV2.WithParts>
   readonly promptAsync: (input: PromptInput) => Effect.Effect<MessageV2.WithParts>
+  readonly retry: (input: RetryInput) => Effect.Effect<MessageV2.WithParts>
+  readonly retryAsync: (input: RetryInput) => Effect.Effect<MessageV2.WithParts>
   readonly loop: (input: LoopInput) => Effect.Effect<MessageV2.WithParts>
   readonly shell: (input: ShellInput) => Effect.Effect<MessageV2.WithParts>
   readonly command: (input: CommandInput) => Effect.Effect<MessageV2.WithParts>
@@ -1369,26 +1371,102 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       return { info, parts }
     }, Effect.scoped)
 
-    const preparePromptMessage = Effect.fn("SessionPrompt.preparePromptMessage")(
-      function* (input: PromptInput) {
-        const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
-        yield* revert.cleanup(session)
-        const message = yield* createUserMessage(input)
-        yield* sessions.touch(input.sessionID)
+    const preparePromptMessage = Effect.fn("SessionPrompt.preparePromptMessage")(function* (input: PromptInput) {
+      const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
+      yield* revert.cleanup(session)
+      const message = yield* createUserMessage(input)
+      yield* sessions.touch(input.sessionID)
 
-        const permissions: Permission.Ruleset = []
-        for (const [t, enabled] of Object.entries(input.tools ?? {})) {
-          permissions.push({ permission: t, action: enabled ? "allow" : "deny", pattern: "*" })
-        }
-        if (permissions.length > 0) {
-          session.permission = permissions
-          yield* sessions.setPermission({ sessionID: session.id, permission: permissions })
-        }
+      const permissions: Permission.Ruleset = []
+      for (const [t, enabled] of Object.entries(input.tools ?? {})) {
+        permissions.push({ permission: t, action: enabled ? "allow" : "deny", pattern: "*" })
+      }
+      if (permissions.length > 0) {
+        session.permission = permissions
+        yield* sessions.setPermission({ sessionID: session.id, permission: permissions })
+      }
 
-        if (input.noReply === true) return message
-        return message
-      },
-    )
+      if (input.noReply === true) return message
+      return message
+    })
+
+    const latestUserMessage = Effect.fnUntraced(function* (sessionID: SessionID) {
+      const messages = yield* MessageV2.filterCompactedEffect(sessionID)
+      return messages.findLast((msg) => msg.info.role === "user")
+    })
+
+    const prepareRetryMessage = Effect.fn("SessionPrompt.prepareRetryMessage")(function* (input: RetryInput) {
+      const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
+      yield* revert.cleanup(session)
+
+      const retryMessage = yield* Effect.sync(() =>
+        MessageV2.get({ sessionID: input.sessionID, messageID: input.messageID }),
+      )
+      if (retryMessage.info.role !== "user") {
+        throw new NamedError.Unknown({ message: `Message is not a user prompt: ${input.messageID}` })
+      }
+      const lastUser = yield* latestUserMessage(input.sessionID)
+      if (!lastUser || lastUser.info.id !== input.messageID) {
+        throw new NamedError.Unknown({ message: `Can only retry the latest user prompt: ${input.messageID}` })
+      }
+
+      const agentName = input.agent ?? retryMessage.info.agent ?? (yield* agents.defaultAgent())
+      const ag = yield* agents.get(agentName)
+      if (!ag) {
+        const available = (yield* agents.list()).filter((a) => !a.hidden).map((a) => a.name)
+        const hint = available.length ? ` Available agents: ${available.join(", ")}` : ""
+        const error = new NamedError.Unknown({ message: `Agent not found: "${agentName}".${hint}` })
+        yield* bus.publish(Session.Event.Error, { sessionID: input.sessionID, error: error.toObject() })
+        throw error
+      }
+
+      const now = Date.now()
+      const info: MessageV2.User = {
+        ...retryMessage.info,
+        time: { created: now },
+        agent: ag.name,
+        model: {
+          providerID: input.model.providerID,
+          modelID: input.model.modelID,
+          variant: input.variant,
+        },
+      }
+
+      yield* sessions.updateMessage(info)
+      yield* sessions.touch(input.sessionID)
+
+      const storedSession = Database.use((db) =>
+        db
+          .select({ agent: SessionTable.agent, model: SessionTable.model })
+          .from(SessionTable)
+          .where(eq(SessionTable.id, input.sessionID))
+          .get(),
+      )
+      if (
+        storedSession?.model?.providerID !== info.model.providerID ||
+        storedSession.model.id !== info.model.modelID ||
+        storedSession.model.variant !== info.model.variant
+      ) {
+        EventV2.run(SessionEvent.ModelSwitched.Sync, {
+          sessionID: input.sessionID,
+          timestamp: DateTime.makeUnsafe(now),
+          model: {
+            id: Modelv2.ID.make(info.model.modelID),
+            providerID: Modelv2.ProviderID.make(info.model.providerID),
+            variant: Modelv2.VariantID.make(info.model.variant ?? "default"),
+          },
+        })
+      }
+      if (storedSession?.agent !== info.agent) {
+        EventV2.run(SessionEvent.AgentSwitched.Sync, {
+          sessionID: input.sessionID,
+          timestamp: DateTime.makeUnsafe(now),
+          agent: info.agent,
+        })
+      }
+
+      return { ...retryMessage, info }
+    })
 
     const isPromptCovered = Effect.fnUntraced(function* (message: MessageV2.WithParts) {
       const messages = yield* sessions.messages({ sessionID: message.info.sessionID })
@@ -1436,6 +1514,35 @@ NOTE: At any point in time through this workflow you should feel free to ask the
 
       return message
     })
+
+    const retry: (input: RetryInput) => Effect.Effect<MessageV2.WithParts> = Effect.fn("SessionPrompt.retry")(
+      function* (input: RetryInput) {
+        const message = yield* prepareRetryMessage(input)
+        return yield* materializePrompt(message)
+      },
+    )
+
+    const retryAsync: (input: RetryInput) => Effect.Effect<MessageV2.WithParts> = Effect.fn("SessionPrompt.retryAsync")(
+      function* (input: RetryInput) {
+        const message = yield* prepareRetryMessage(input)
+
+        yield* materializePrompt(message).pipe(
+          Effect.catchCause((cause) =>
+            Effect.gen(function* () {
+              const message = Cause.pretty(cause)
+              yield* elog.error("retry_async failed", { sessionID: input.sessionID, error: message })
+              yield* bus.publish(Session.Event.Error, {
+                sessionID: input.sessionID,
+                error: new NamedError.Unknown({ message }).toObject(),
+              })
+            }),
+          ),
+          Effect.forkIn(scope, { startImmediately: true }),
+        )
+
+        return message
+      },
+    )
 
     const lastAssistant = Effect.fnUntraced(function* (sessionID: SessionID) {
       const match = yield* sessions.findMessage(sessionID, (m) => m.info.role !== "user")
@@ -1810,6 +1917,8 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       cancel,
       prompt,
       promptAsync,
+      retry,
+      retryAsync,
       loop,
       shell,
       command,
@@ -1877,6 +1986,15 @@ export const PromptInput = Schema.Struct({
   ),
 }).pipe(withStatics((s) => ({ zod: zod(s) })))
 export type PromptInput = Schema.Schema.Type<typeof PromptInput>
+
+export const RetryInput = Schema.Struct({
+  sessionID: SessionID,
+  messageID: MessageID,
+  model: ModelRef,
+  agent: Schema.optional(Schema.String),
+  variant: Schema.optional(Schema.String),
+}).pipe(withStatics((s) => ({ zod: zod(s) })))
+export type RetryInput = Schema.Schema.Type<typeof RetryInput>
 
 export class LoopInput extends Schema.Class<LoopInput>("SessionPrompt.LoopInput")({
   sessionID: SessionID,

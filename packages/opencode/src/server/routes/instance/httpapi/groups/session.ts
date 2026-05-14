@@ -61,6 +61,7 @@ export const SummarizePayload = Schema.Struct({
   auto: Schema.optional(Schema.Boolean),
 })
 export const PromptPayload = Schema.Struct(Struct.omit(SessionPrompt.PromptInput.fields, ["sessionID"]))
+export const RetryPayload = Schema.Struct(Struct.omit(SessionPrompt.RetryInput.fields, ["sessionID", "messageID"]))
 export const CommandPayload = Schema.Struct(Struct.omit(SessionPrompt.CommandInput.fields, ["sessionID"]))
 export const ShellPayload = Schema.Struct(Struct.omit(SessionPrompt.ShellInput.fields, ["sessionID"]))
 export const RevertPayload = Schema.Struct(Struct.omit(SessionRevert.RevertInput.fields, ["sessionID"]))
@@ -87,6 +88,8 @@ export const SessionPaths = {
   summarize: `${root}/:sessionID/summarize`,
   prompt: `${root}/:sessionID/message`,
   promptAsync: `${root}/:sessionID/prompt_async`,
+  retry: `${root}/:sessionID/message/:messageID/retry`,
+  retryAsync: `${root}/:sessionID/message/:messageID/retry_async`,
   command: `${root}/:sessionID/command`,
   shell: `${root}/:sessionID/shell`,
   revert: `${root}/:sessionID/revert`,
@@ -315,6 +318,32 @@ export const SessionApi = HttpApi.make("session")
             summary: "Send async message",
             description:
               "Create and send a new message to a session asynchronously, starting the session if needed and returning immediately.",
+          }),
+        ),
+        HttpApiEndpoint.post("retry", SessionPaths.retry, {
+          params: { sessionID: SessionID, messageID: MessageID },
+          payload: RetryPayload,
+          success: described(MessageV2.WithParts, "Created assistant message"),
+          error: [HttpApiError.BadRequest, HttpApiError.NotFound],
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "session.retry",
+            summary: "Retry message",
+            description:
+              "Retry the latest user message with a different model or agent, reusing the existing prompt parts instead of creating a new user turn.",
+          }),
+        ),
+        HttpApiEndpoint.post("retryAsync", SessionPaths.retryAsync, {
+          params: { sessionID: SessionID, messageID: MessageID },
+          payload: RetryPayload,
+          success: described(HttpApiSchema.NoContent, "Retry accepted"),
+          error: [HttpApiError.BadRequest, HttpApiError.NotFound],
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "session.retry_async",
+            summary: "Retry message asynchronously",
+            description:
+              "Retry the latest user message asynchronously with a different model or agent, reusing the existing prompt parts instead of creating a new user turn.",
           }),
         ),
         HttpApiEndpoint.post("command", SessionPaths.command, {

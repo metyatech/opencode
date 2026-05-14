@@ -1140,6 +1140,78 @@ it.live(
   3_000,
 )
 
+it.live(
+  "retryAsync reuses the latest user message without creating a duplicate prompt",
+  () =>
+    provideTmpdirServer(
+      Effect.fnUntraced(function* ({ llm }) {
+        const prompt = yield* SessionPrompt.Service
+        const sessions = yield* Session.Service
+        const chat = yield* sessions.create({ title: "Retry reuse" })
+
+        yield* llm.push(reply().streamError(new Error("boom")))
+        const first = yield* prompt.prompt({
+          sessionID: chat.id,
+          agent: "build",
+          model: ref,
+          parts: [{ type: "text", text: "retry me once" }],
+        })
+        expect(first.info.role).toBe("assistant")
+
+        const beforeRetry = yield* sessions.messages({ sessionID: chat.id })
+        const userMessage = beforeRetry.find(
+          (msg): msg is MessageV2.WithParts & { info: MessageV2.User } => msg.info.role === "user",
+        )
+        expect(userMessage?.parts.some((part) => part.type === "text" && part.text === "retry me once")).toBe(true)
+
+        yield* llm.text("fallback reply")
+        const accepted = yield* prompt.retryAsync({
+          sessionID: chat.id,
+          messageID: userMessage!.info.id,
+          agent: "build",
+          model: ref,
+        })
+
+        expect(accepted.info.role).toBe("user")
+        expect(accepted.info.id).toBe(userMessage!.info.id)
+
+        yield* llm.wait(2)
+
+        yield* Effect.promise(async () => {
+          const end = Date.now() + 5000
+          while (Date.now() < end) {
+            const msgs = await Effect.runPromise(sessions.messages({ sessionID: chat.id }))
+            const match = msgs.find(
+              (msg) =>
+                msg.info.role === "assistant" &&
+                msg.info.parentID === userMessage!.info.id &&
+                msg.parts.some((part) => part.type === "text" && part.text === "fallback reply"),
+            )
+            if (match) return
+            await new Promise((done) => setTimeout(done, 20))
+          }
+          throw new Error("timed out waiting for retry assistant")
+        })
+
+        const messages = yield* sessions.messages({ sessionID: chat.id })
+        const users = messages.filter((msg) => msg.info.role === "user")
+        const assistants = messages.filter(
+          (msg): msg is MessageV2.WithParts & { info: MessageV2.Assistant } => msg.info.role === "assistant",
+        )
+        expect(users).toHaveLength(1)
+        expect(assistants).toHaveLength(2)
+        expect(assistants.at(-1)?.info.parentID).toBe(userMessage!.info.id)
+
+        const inputs = yield* llm.inputs
+        expect(inputs).toHaveLength(2)
+        const lastInput = JSON.stringify(inputs.at(-1)?.messages)
+        expect((lastInput.match(/retry me once/g) ?? []).length).toBe(1)
+      }),
+      { git: true, config: providerCfg },
+    ),
+  10_000,
+)
+
 it.live("assertNotBusy succeeds when idle", () =>
   provideTmpdirInstance(
     (_dir) =>

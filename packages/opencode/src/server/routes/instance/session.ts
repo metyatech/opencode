@@ -939,6 +939,91 @@ export const SessionRoutes = lazy(() =>
       },
     )
     .post(
+      "/:sessionID/message/:messageID/retry",
+      describeRoute({
+        summary: "Retry message",
+        description:
+          "Retry the latest user message with a different model or agent, reusing the existing prompt parts instead of creating a new user turn.",
+        operationId: "session.retry",
+        responses: {
+          200: {
+            description: "Created assistant message",
+            content: {
+              "application/json": {
+                schema: resolver(
+                  z.object({
+                    info: MessageV2.Assistant.zod,
+                    parts: MessageV2.Part.zod.array(),
+                  }),
+                ),
+              },
+            },
+          },
+          ...errors(400, 404),
+        },
+      }),
+      validator(
+        "param",
+        z.object({
+          sessionID: SessionID.zod,
+          messageID: MessageID.zod,
+        }),
+      ),
+      validator("json", zodObject(SessionPrompt.RetryInput).omit({ sessionID: true, messageID: true })),
+      async (c) => {
+        c.status(200)
+        c.header("Content-Type", "application/json")
+        return stream(c, async (stream) => {
+          const { sessionID, messageID } = c.req.valid("param")
+          const body = c.req.valid("json")
+          const msg = await runRequest(
+            "SessionRoutes.retry",
+            c,
+            SessionPrompt.Service.use((svc) =>
+              svc.retry({ ...body, sessionID, messageID } as unknown as SessionPrompt.RetryInput),
+            ),
+          )
+          void stream.write(JSON.stringify(msg))
+        })
+      },
+    )
+    .post(
+      "/:sessionID/message/:messageID/retry_async",
+      describeRoute({
+        summary: "Retry message asynchronously",
+        description:
+          "Retry the latest user message asynchronously with a different model or agent, reusing the existing prompt parts instead of creating a new user turn.",
+        operationId: "session.retry_async",
+        responses: {
+          204: {
+            description: "Retry accepted",
+          },
+          ...errors(400, 404),
+        },
+      }),
+      validator(
+        "param",
+        z.object({
+          sessionID: SessionID.zod,
+          messageID: MessageID.zod,
+        }),
+      ),
+      validator("json", zodObject(SessionPrompt.RetryInput).omit({ sessionID: true, messageID: true })),
+      async (c) => {
+        const { sessionID, messageID } = c.req.valid("param")
+        const body = c.req.valid("json")
+        await runRequest(
+          "SessionRoutes.retry_async",
+          c,
+          SessionPrompt.Service.use((svc) =>
+            svc.retryAsync({ ...body, sessionID, messageID } as unknown as SessionPrompt.RetryInput),
+          ),
+        )
+
+        return c.body(null, 204)
+      },
+    )
+    .post(
       "/:sessionID/command",
       describeRoute({
         summary: "Send command",
