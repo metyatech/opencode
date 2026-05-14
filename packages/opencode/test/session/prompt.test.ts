@@ -1034,7 +1034,80 @@ it.live(
       }),
       { git: true, config: providerCfg },
     ),
-  3_000,
+  10_000,
+)
+
+it.live(
+  "async prompt submitted during an active run is processed after the active run fails",
+  () =>
+    provideTmpdirServer(
+      Effect.fnUntraced(function* ({ llm }) {
+        const gate = defer<void>()
+        const prompt = yield* SessionPrompt.Service
+        const sessions = yield* Session.Service
+        const chat = yield* sessions.create({ title: "Pinned" })
+
+        yield* llm.push(reply().wait(gate.promise).streamError(new Error("boom")))
+        yield* llm.text("second")
+
+        const first = yield* prompt
+          .prompt({
+            sessionID: chat.id,
+            agent: "build",
+            model: ref,
+            parts: [{ type: "text", text: "first" }],
+          })
+          .pipe(Effect.forkChild)
+
+        yield* llm.wait(1)
+
+        const id = MessageID.ascending()
+        const accepted = yield* prompt.promptAsync({
+          sessionID: chat.id,
+          messageID: id,
+          agent: "build",
+          model: ref,
+          parts: [{ type: "text", text: "second" }],
+        })
+
+        expect(accepted.info.role).toBe("user")
+        expect(accepted.info.id).toBe(id)
+        expect(yield* llm.calls).toBe(1)
+
+        gate.resolve()
+
+        const firstExit = yield* Fiber.await(first)
+        expect(Exit.isSuccess(firstExit)).toBe(true)
+
+        yield* Effect.promise(async () => {
+          const end = Date.now() + 5000
+          while (Date.now() < end) {
+            const msgs = await Effect.runPromise(sessions.messages({ sessionID: chat.id }))
+            const match = msgs.find(
+              (msg) =>
+                msg.info.role === "assistant" &&
+                msg.info.parentID === id &&
+                msg.parts.some((part) => part.type === "text" && part.text === "second"),
+            )
+            if (match) return
+            await new Promise((done) => setTimeout(done, 20))
+          }
+          throw new Error("timed out waiting for queued async prompt assistant")
+        })
+
+        expect(yield* llm.calls).toBe(2)
+
+        const msgs = yield* sessions.messages({ sessionID: chat.id })
+        const assistants = msgs.filter(
+          (msg): msg is MessageV2.WithParts & { info: MessageV2.Assistant } => msg.info.role === "assistant",
+        )
+        expect(assistants).toHaveLength(2)
+        expect(assistants[0]?.info.parentID).not.toBe(id)
+        expect(assistants[1]?.info.parentID).toBe(id)
+      }),
+      { git: true, config: providerCfg },
+    ),
+  10_000,
 )
 
 it.live(

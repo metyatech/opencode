@@ -17,7 +17,7 @@ export const providerHandlers = HttpApiBuilder.group(InstanceHttpApi, "provider"
 
     const list = Effect.fn("ProviderHttpApi.list")(function* () {
       const config = yield* cfg.get()
-      const all = yield* ModelsDev.Service.use((s) => s.get())
+      const all: Record<string, ModelsDev.Provider> = yield* ModelsDev.Service.use((s) => s.get())
       const disabled = new Set(config.disabled_providers ?? [])
       const enabled = config.enabled_providers ? new Set(config.enabled_providers) : undefined
       const filtered: Record<string, (typeof all)[string]> = {}
@@ -25,7 +25,7 @@ export const providerHandlers = HttpApiBuilder.group(InstanceHttpApi, "provider"
         if ((enabled ? enabled.has(key) : true) && !disabled.has(key)) filtered[key] = value
       }
       const connected = yield* provider.list()
-      const providers = Object.assign(
+      const providers: Record<string, Provider.Info> = Object.assign(
         mapValues(filtered, (item) => Provider.fromModelsDevProvider(item)),
         connected,
       )

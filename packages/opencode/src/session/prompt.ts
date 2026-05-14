@@ -81,6 +81,7 @@ const elog = EffectLogger.create({ service: "session.prompt" })
 export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
   readonly prompt: (input: PromptInput) => Effect.Effect<MessageV2.WithParts>
+  readonly promptAsync: (input: PromptInput) => Effect.Effect<MessageV2.WithParts>
   readonly loop: (input: LoopInput) => Effect.Effect<MessageV2.WithParts>
   readonly shell: (input: ShellInput) => Effect.Effect<MessageV2.WithParts>
   readonly command: (input: CommandInput) => Effect.Effect<MessageV2.WithParts>
@@ -1368,7 +1369,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       return { info, parts }
     }, Effect.scoped)
 
-    const prompt: (input: PromptInput) => Effect.Effect<MessageV2.WithParts> = Effect.fn("SessionPrompt.prompt")(
+    const preparePromptMessage = Effect.fn("SessionPrompt.preparePromptMessage")(
       function* (input: PromptInput) {
         const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
         yield* revert.cleanup(session)
@@ -1385,9 +1386,56 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         }
 
         if (input.noReply === true) return message
-        return yield* loop({ sessionID: input.sessionID })
+        return message
       },
     )
+
+    const isPromptCovered = Effect.fnUntraced(function* (message: MessageV2.WithParts) {
+      const messages = yield* sessions.messages({ sessionID: message.info.sessionID })
+      return messages.some((msg) => {
+        if (msg.info.role === "user") return false
+        const created = msg.info.time.created
+        return msg.info.id > message.info.id && created >= message.info.time.created
+      })
+    })
+
+    const materializePrompt = Effect.fn("SessionPrompt.materializePrompt")(function* (message: MessageV2.WithParts) {
+      let result = yield* loop({ sessionID: message.info.sessionID })
+      if (yield* isPromptCovered(message)) return result
+      result = yield* loop({ sessionID: message.info.sessionID })
+      return result
+    })
+
+    const prompt: (input: PromptInput) => Effect.Effect<MessageV2.WithParts> = Effect.fn("SessionPrompt.prompt")(
+      function* (input: PromptInput) {
+        const message = yield* preparePromptMessage(input)
+        if (input.noReply === true) return message
+        return yield* materializePrompt(message)
+      },
+    )
+
+    const promptAsync: (input: PromptInput) => Effect.Effect<MessageV2.WithParts> = Effect.fn(
+      "SessionPrompt.promptAsync",
+    )(function* (input: PromptInput) {
+      const message = yield* preparePromptMessage(input)
+      if (input.noReply === true) return message
+
+      yield* materializePrompt(message).pipe(
+        Effect.catchCause((cause) =>
+          Effect.gen(function* () {
+            const message = Cause.pretty(cause)
+            yield* elog.error("prompt_async failed", { sessionID: input.sessionID, error: message })
+            yield* bus.publish(Session.Event.Error, {
+              sessionID: input.sessionID,
+              error: new NamedError.Unknown({ message }).toObject(),
+            })
+          }),
+        ),
+        Effect.forkIn(scope, { startImmediately: true }),
+      )
+
+      return message
+    })
 
     const lastAssistant = Effect.fnUntraced(function* (sessionID: SessionID) {
       const match = yield* sessions.findMessage(sessionID, (m) => m.info.role !== "user")
@@ -1441,7 +1489,8 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             lastAssistant?.finish &&
             !["tool-calls"].includes(lastAssistant.finish) &&
             !hasToolCalls &&
-            lastUser.id < lastAssistant.id
+            lastUser.id < lastAssistant.id &&
+            lastUser.time.created <= lastAssistant.time.created
           ) {
             yield* slog.info("exiting loop")
             break
@@ -1760,6 +1809,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
     return Service.of({
       cancel,
       prompt,
+      promptAsync,
       loop,
       shell,
       command,

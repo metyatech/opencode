@@ -1171,7 +1171,10 @@ const layer: Layer.Layer<
         const bridge = yield* EffectBridge.make()
         const cfg = yield* config.get()
         const modelsDev = yield* modelsDevSvc.get()
-        const database = mapValues(modelsDev, fromModelsDevProvider)
+        const database: Record<string, Info> = {}
+        for (const [providerID, provider] of Object.entries(modelsDev)) {
+          database[providerID] = fromModelsDevProvider(provider)
+        }
 
         const providers: Record<ProviderID, Info> = {} as Record<ProviderID, Info>
         const languages = new Map<string, LanguageModelV3>()
@@ -1197,13 +1200,11 @@ const layer: Layer.Layer<
         function mergeProvider(providerID: ProviderID, provider: Partial<Info>) {
           const existing = providers[providerID]
           if (existing) {
-            // @ts-expect-error
             providers[providerID] = mergeDeep(existing, provider)
             return
           }
           const match = database[providerID]
           if (!match) return
-          // @ts-expect-error
           providers[providerID] = mergeDeep(match, provider)
         }
 
@@ -1356,7 +1357,7 @@ const layer: Layer.Layer<
         }
 
         // load apikeys
-        const auths = yield* auth.all().pipe(Effect.orDie)
+        const auths: Record<string, Auth.Info> = yield* auth.all().pipe(Effect.orDie)
         for (const [id, provider] of Object.entries(auths)) {
           const providerID = ProviderID.make(id)
           if (disabled.has(providerID)) continue
