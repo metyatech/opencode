@@ -318,6 +318,48 @@ const addSubtask = (sessionID: SessionID, messageID: MessageID, model = ref) =>
     })
   })
 
+const addCompaction = (sessionID: SessionID, messageID: MessageID) =>
+  Effect.gen(function* () {
+    const session = yield* Session.Service
+    yield* session.updatePart({
+      id: PartID.ascending(),
+      messageID,
+      sessionID,
+      type: "compaction",
+      auto: true,
+    })
+  })
+
+const addSummary = (sessionID: SessionID, parentID: MessageID, text: string) =>
+  Effect.gen(function* () {
+    const session = yield* Session.Service
+    const assistant: MessageV2.Assistant = {
+      id: MessageID.ascending(),
+      role: "assistant",
+      parentID,
+      sessionID,
+      mode: "compaction",
+      agent: "compaction",
+      summary: true,
+      finish: "stop",
+      cost: 0,
+      path: { cwd: "/tmp", root: "/tmp" },
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      modelID: ref.modelID,
+      providerID: ref.providerID,
+      time: { created: Date.now(), completed: Date.now() },
+    }
+    yield* session.updateMessage(assistant)
+    yield* session.updatePart({
+      id: PartID.ascending(),
+      messageID: assistant.id,
+      sessionID,
+      type: "text",
+      text,
+    })
+    return assistant
+  })
+
 const boot = Effect.fn("test.boot")(function* (input?: { title?: string }) {
   const config = yield* Config.Service
   const prompt = yield* SessionPrompt.Service
@@ -1206,6 +1248,86 @@ it.live(
         expect(inputs).toHaveLength(2)
         const lastInput = JSON.stringify(inputs.at(-1)?.messages)
         expect((lastInput.match(/retry me once/g) ?? []).length).toBe(1)
+      }),
+      { git: true, config: providerCfg },
+    ),
+  10_000,
+)
+
+it.live(
+  "quota failure during compaction emits a visible notice and clears pending compaction",
+  () =>
+    provideTmpdirServer(
+      Effect.fnUntraced(function* ({ llm }) {
+        const bus = yield* Bus.Service
+        const compaction = yield* SessionCompaction.Service
+        const prompt = yield* SessionPrompt.Service
+        const sessions = yield* Session.Service
+        const chat = yield* sessions.create({ title: "Compaction quota" })
+        const notices: string[] = []
+        const unsubscribe = yield* bus.subscribeCallback(Session.Event.Error, (evt) => {
+          if (evt.properties.sessionID !== chat.id) return
+          const data = evt.properties.error?.data
+          const message = data && "message" in data && typeof data.message === "string" ? data.message : undefined
+          if (typeof message === "string") notices.push(message)
+        })
+        yield* Effect.addFinalizer(() => Effect.sync(unsubscribe))
+
+        const prior = yield* user(chat.id, "older context")
+        yield* addCompaction(chat.id, prior.id)
+        const previousSummary = "## Goal\n- Keep the prior summary available."
+        yield* addSummary(chat.id, prior.id, previousSummary)
+        yield* seed(chat.id, { finish: "stop" })
+        yield* compaction.create({ sessionID: chat.id, agent: "build", model: ref, auto: true })
+
+        const before = yield* sessions.messages({ sessionID: chat.id })
+        const pending = before.findLast(
+          (msg): msg is MessageV2.WithParts & { info: MessageV2.User } =>
+            msg.info.role === "user" && msg.parts.some((part) => part.type === "compaction"),
+        )
+        expect(pending).toBeDefined()
+        if (!pending) throw new Error("expected pending compaction")
+
+        yield* llm.error(429, { error: { message: "The usage limit has been reached" } })
+        const result = yield* compaction.process({
+          sessionID: chat.id,
+          parentID: pending.info.id,
+          messages: before,
+          auto: true,
+        })
+
+        expect(result).toBe("stop")
+        yield* Effect.promise(async () => {
+          const end = Date.now() + 5_000
+          while (Date.now() < end) {
+            if (notices.some((notice) => notice.includes("Could not compact this session"))) return
+            await new Promise((done) => setTimeout(done, 20))
+          }
+          throw new Error("timed out waiting for compaction quota notice")
+        })
+
+        const after = yield* sessions.messages({ sessionID: chat.id })
+        expect(SessionCompaction.hasPendingCompaction(after)).toBe(false)
+        const summaries = after.filter(
+          (msg): msg is MessageV2.WithParts & { info: MessageV2.Assistant } =>
+            msg.info.role === "assistant" && msg.info.summary === true,
+        )
+        const fallbackSummary = summaries.at(-1)
+        expect(fallbackSummary?.info.error).toBeUndefined()
+        expect(fallbackSummary?.info.finish).toBe("stop")
+        expect(fallbackSummary?.parts.some((part) => part.type === "text" && part.text === previousSummary)).toBe(true)
+
+        yield* prompt.prompt({
+          sessionID: chat.id,
+          agent: "build",
+          model: ref,
+          noReply: true,
+          parts: [{ type: "text", text: "next prompt after failed compaction" }],
+        })
+        yield* llm.text("next answer")
+        const next = yield* prompt.loop({ sessionID: chat.id })
+        expect(next.info.role).toBe("assistant")
+        expect(next.parts.some((part) => part.type === "text" && part.text === "next answer")).toBe(true)
       }),
       { git: true, config: providerCfg },
     ),

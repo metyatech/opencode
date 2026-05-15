@@ -648,7 +648,8 @@ export const layer: Layer.Layer<
         const error = parse(e)
         if (MessageV2.ContextOverflowError.isInstance(error)) {
           ctx.needsCompaction = true
-          yield* bus.publish(Session.Event.Error, { sessionID: ctx.sessionID, error })
+          if (!ctx.assistantMessage.summary)
+            yield* bus.publish(Session.Event.Error, { sessionID: ctx.sessionID, error })
           return
         }
         if (!ctx.assistantMessage.summary) {
@@ -663,10 +664,12 @@ export const layer: Layer.Layer<
           })
         }
         ctx.assistantMessage.error = error
-        yield* bus.publish(Session.Event.Error, {
-          sessionID: ctx.assistantMessage.sessionID,
-          error: ctx.assistantMessage.error,
-        })
+        if (!ctx.assistantMessage.summary) {
+          yield* bus.publish(Session.Event.Error, {
+            sessionID: ctx.assistantMessage.sessionID,
+            error: ctx.assistantMessage.error,
+          })
+        }
         yield* status.set(ctx.sessionID, { type: "idle" })
       })
 

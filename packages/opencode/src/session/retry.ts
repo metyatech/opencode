@@ -71,7 +71,7 @@ const QUOTA_EXHAUSTION_PATTERNS: ReadonlyArray<RegExp> = [
   /payment\s+required/i,
 ]
 
-function isQuotaExhausted(message: unknown): boolean {
+export function isQuotaExhausted(message: unknown): boolean {
   if (typeof message !== "string" || message.length === 0) return false
   return QUOTA_EXHAUSTION_PATTERNS.some((p) => p.test(message))
 }

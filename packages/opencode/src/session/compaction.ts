@@ -21,6 +21,8 @@ import { makeRuntime } from "@/effect/run-service"
 import { fn } from "@/util/fn"
 import { EventV2 } from "@/v2/event"
 import { SessionEvent } from "@/v2/session-event"
+import { NamedError } from "@opencode-ai/core/util/error"
+import { SessionRetry } from "./retry"
 
 const log = Log.create({ service: "session.compaction" })
 
@@ -93,6 +95,47 @@ type CompletedCompaction = {
   summary: string | undefined
 }
 
+const COMPACTION_LIMIT_PATTERNS: ReadonlyArray<RegExp> = [
+  /capacity\s+(?:has\s+been\s+)?exhausted/i,
+  /resource[_\s-]*exhausted/i,
+  /429[^]*\b(?:quota|capacity|resource|limit|usage)\b/i,
+]
+
+function errorText(error: NonNullable<MessageV2.Assistant["error"]>) {
+  const dataMessage = "message" in error.data && typeof error.data.message === "string" ? error.data.message : undefined
+  const values = [dataMessage, MessageV2.APIError.isInstance(error) ? error.data.responseBody : undefined].filter(
+    (item): item is string => typeof item === "string" && item.length > 0,
+  )
+  return values.join("\n")
+}
+
+function isLimitExhausted(error: NonNullable<MessageV2.Assistant["error"]>) {
+  const text = errorText(error)
+  return (
+    SessionRetry.isQuotaExhausted(text) ||
+    (MessageV2.APIError.isInstance(error) &&
+      (SessionRetry.isQuotaExhausted(error.data.message) || SessionRetry.isQuotaExhausted(error.data.responseBody))) ||
+    COMPACTION_LIMIT_PATTERNS.some((pattern) => pattern.test(text))
+  )
+}
+
+function compactionErrorMessage(input: {
+  error: NonNullable<MessageV2.Assistant["error"]>
+  hasPreviousSummary: boolean
+}) {
+  if (isLimitExhausted(input.error)) {
+    return input.hasPreviousSummary
+      ? "Could not compact this session because the compaction model quota or capacity is exhausted. The session can continue with the last available summary."
+      : "Could not compact this session because the compaction model quota or capacity is exhausted. Try again after quota resets or switch models."
+  }
+  const text = errorText(input.error).split("\n").find(Boolean)
+  return `Could not compact this session${text ? `: ${text}` : "."}`
+}
+
+function visibleError(message: string): NonNullable<MessageV2.Assistant["error"]> {
+  return new NamedError.Unknown({ message }).toObject() as NonNullable<MessageV2.Assistant["error"]>
+}
+
 function summaryText(message: MessageV2.WithParts) {
   const text = message.parts
     .filter((part): part is MessageV2.TextPart => part.type === "text")
@@ -121,12 +164,22 @@ function completedCompactions(messages: MessageV2.WithParts[]) {
   })
 }
 
+function resolvedCompactionIDs(messages: MessageV2.WithParts[]) {
+  const ids = new Set<MessageID>()
+  for (const msg of messages) {
+    if (msg.info.role !== "assistant") continue
+    if (!msg.info.summary || !msg.info.finish) continue
+    ids.add(msg.info.parentID)
+  }
+  return ids
+}
+
 export function hasPendingCompaction(messages: MessageV2.WithParts[]) {
   return pendingCompaction(messages) !== undefined
 }
 
 function pendingCompaction(messages: MessageV2.WithParts[]) {
-  const completed = new Set(completedCompactions(messages).map((item) => messages[item.userIndex]?.info.id).filter(Boolean))
+  const completed = resolvedCompactionIDs(messages)
   return messages.findLast(
     (msg): msg is MessageV2.WithParts & { info: MessageV2.User } =>
       msg.info.role === "user" && msg.parts.some((part) => part.type === "compaction") && !completed.has(msg.info.id),
@@ -470,14 +523,63 @@ export const layer: Layer.Layer<
         model,
       })
 
-      if (result === "compact") {
-        processor.message.error = new MessageV2.ContextOverflowError({
-          message: replay
-            ? "Conversation history too large to compact - exceeds model context limit"
-            : "Session too large to compact - context exceeds model limit even after stripping media",
-        }).toObject()
-        processor.message.finish = "error"
+      const finishFailedCompaction = Effect.fn("SessionCompaction.finishFailed")(function* (
+        error: NonNullable<MessageV2.Assistant["error"]>,
+      ) {
+        const current = (yield* session.messages({ sessionID: input.sessionID })).find(
+          (item) => item.info.id === msg.id,
+        )
+        const currentSummary = current ? summaryText(current) : undefined
+        const reusePreviousSummary = previousSummary !== undefined && isLimitExhausted(error) && !currentSummary
+        yield* bus.publish(Session.Event.Error, {
+          sessionID: input.sessionID,
+          error: visibleError(
+            compactionErrorMessage({
+              error,
+              hasPreviousSummary: reusePreviousSummary,
+            }),
+          ),
+        })
+
+        if (reusePreviousSummary) {
+          yield* session.updatePart({
+            id: PartID.ascending(),
+            messageID: msg.id,
+            sessionID: input.sessionID,
+            type: "text",
+            text: previousSummary ?? "",
+            synthetic: true,
+            time: {
+              start: Date.now(),
+              end: Date.now(),
+            },
+          })
+          processor.message.error = undefined
+          processor.message.finish = "stop"
+        } else {
+          processor.message.error = error
+          processor.message.finish = "error"
+        }
+
+        processor.message.time.completed ??= Date.now()
         yield* session.updateMessage(processor.message)
+        EventV2.run(SessionEvent.Compaction.Ended.Sync, {
+          sessionID: input.sessionID,
+          timestamp: DateTime.makeUnsafe(Date.now()),
+          text: reusePreviousSummary ? (previousSummary ?? "") : "",
+          include: reusePreviousSummary ? selected.tail_start_id : undefined,
+        })
+        if (reusePreviousSummary) yield* bus.publish(Event.Compacted, { sessionID: input.sessionID })
+      })
+
+      if (result === "compact") {
+        yield* finishFailedCompaction(
+          new MessageV2.ContextOverflowError({
+            message: replay
+              ? "Conversation history too large to compact - exceeds model context limit"
+              : "Session too large to compact - context exceeds model limit even after stripping media",
+          }).toObject(),
+        )
         return "stop"
       }
 
@@ -570,7 +672,10 @@ export const layer: Layer.Layer<
         }
       }
 
-      if (processor.message.error) return "stop"
+      if (processor.message.error) {
+        yield* finishFailedCompaction(processor.message.error)
+        return "stop"
+      }
       if (result === "continue") {
         const summary = summaryText(
           (yield* session.messages({ sessionID: input.sessionID })).find((item) => item.info.id === msg.id) ?? {
