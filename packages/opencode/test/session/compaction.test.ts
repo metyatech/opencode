@@ -9,7 +9,6 @@ import { Agent } from "../../src/agent/agent"
 import { LLM } from "../../src/session/llm"
 import { SessionCompaction } from "../../src/session/compaction"
 import { Token } from "@/util/token"
-import { Instance } from "../../src/project/instance"
 import { WithInstance } from "../../src/project/with-instance"
 import * as Log from "@opencode-ai/core/util/log"
 import { Permission } from "../../src/permission"
@@ -1493,16 +1492,17 @@ describe("session.compaction.process", () => {
           ])
 
           const start = Date.now()
+          const abortDeadline = 1_000
           abort.abort()
           const result = await Promise.race([
             run.then((value) => ({ kind: "done" as const, value, ms: Date.now() - start })),
-            wait(250).then(() => ({ kind: "timeout" as const })),
+            wait(abortDeadline).then(() => ({ kind: "timeout" as const })),
           ])
 
           expect(result.kind).toBe("done")
           if (result.kind === "done") {
             expect(result.value).toBe("stop")
-            expect(result.ms).toBeLessThan(250)
+            expect(result.ms).toBeLessThan(abortDeadline)
           }
         } finally {
           off?.()

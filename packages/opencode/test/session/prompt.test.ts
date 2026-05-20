@@ -318,7 +318,7 @@ const addSubtask = (sessionID: SessionID, messageID: MessageID, model = ref) =>
     })
   })
 
-const addCompaction = (sessionID: SessionID, messageID: MessageID) =>
+const addCompaction = (sessionID: SessionID, messageID: MessageID, tailStartID?: MessageID) =>
   Effect.gen(function* () {
     const session = yield* Session.Service
     yield* session.updatePart({
@@ -327,6 +327,7 @@ const addCompaction = (sessionID: SessionID, messageID: MessageID) =>
       sessionID,
       type: "compaction",
       auto: true,
+      tail_start_id: tailStartID,
     })
   })
 
@@ -411,6 +412,65 @@ it.live("loop calls LLM and returns assistant message", () =>
       const parts = result.parts.filter((p) => p.type === "text")
       expect(parts.some((p) => p.type === "text" && p.text === "world")).toBe(true)
       expect(yield* llm.hits).toHaveLength(1)
+    }),
+    { git: true, config: providerCfg },
+  ),
+)
+
+it.live("loop ignores stale retained-tail tokens after completed compaction", () =>
+  provideTmpdirServer(
+    Effect.fnUntraced(function* ({ llm }) {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Pinned",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+
+      const old = yield* seed(chat.id, { finish: "stop" })
+      old.assistant.tokens = {
+        total: 120_000,
+        input: 120_000,
+        output: 0,
+        reasoning: 0,
+        cache: { read: 0, write: 0 },
+      }
+      old.assistant.time.completed = Date.now()
+      yield* sessions.updateMessage(old.assistant)
+
+      const compactUser = yield* user(chat.id, "compact the older context")
+      yield* addCompaction(chat.id, compactUser.id, old.assistant.id)
+      yield* addSummary(chat.id, compactUser.id, "summary of the older context")
+
+      const continueUser = yield* sessions.updateMessage({
+        id: MessageID.ascending(),
+        role: "user",
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        time: { created: Date.now() },
+      })
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: continueUser.id,
+        sessionID: chat.id,
+        type: "text",
+        text: "Continue if you have next steps.",
+        synthetic: true,
+        metadata: { compaction_continue: true },
+      })
+
+      yield* llm.text("normal continuation")
+      yield* llm.text("unexpected second call")
+
+      const result = yield* prompt.loop({ sessionID: chat.id })
+      expect(yield* llm.calls).toBe(1)
+      expect(result.info.role).toBe("assistant")
+      expect(result.parts.some((part) => part.type === "text" && part.text === "normal continuation")).toBe(true)
+
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const compactions = messages.flatMap((msg) => msg.parts).filter((part) => part.type === "compaction")
+      expect(compactions).toHaveLength(1)
     }),
     { git: true, config: providerCfg },
   ),

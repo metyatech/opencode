@@ -1569,6 +1569,12 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           let lastUser: MessageV2.User | undefined
           let lastAssistant: MessageV2.Assistant | undefined
           let lastFinished: MessageV2.Assistant | undefined
+          const lastCompactionSummary = msgs.reduce<MessageV2.Assistant | undefined>((latest, msg) => {
+            if (msg.info.role !== "assistant") return latest
+            if (msg.info.summary !== true || !msg.info.finish || msg.info.error) return latest
+            if (latest && latest.id > msg.info.id) return latest
+            return msg.info
+          }, undefined)
           let tasks: (MessageV2.CompactionPart | MessageV2.SubtaskPart)[] = []
           for (let i = msgs.length - 1; i >= 0; i--) {
             const msg = msgs[i]
@@ -1635,6 +1641,9 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           if (
             lastFinished &&
             lastFinished.summary !== true &&
+            // Retained tail messages can be ordered after the compaction summary,
+            // but their token usage still belongs to the pre-compaction request.
+            (!lastCompactionSummary || lastFinished.id > lastCompactionSummary.id) &&
             (yield* compaction.isOverflow({ tokens: lastFinished.tokens, model }))
           ) {
             yield* compaction.create({ sessionID, agent: lastUser.agent, model: lastUser.model, auto: true })
