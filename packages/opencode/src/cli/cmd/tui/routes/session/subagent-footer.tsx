@@ -4,13 +4,9 @@ import { useSync } from "@tui/context/sync"
 import { useTheme } from "@tui/context/theme"
 import { SplitBorder } from "@tui/component/border"
 import type { AssistantMessage } from "@opencode-ai/sdk/v2"
-import { useCommandDialog } from "@tui/component/dialog-command"
-import { useKeybind } from "../../context/keybind"
 import { Locale } from "@/util/locale"
 import { useTerminalDimensions } from "@opentui/solid"
-import { usage as contextUsage } from "@/session/overflow"
-import type { Config } from "@/config/config"
-import type { Provider } from "@/provider/provider"
+import { useCommandShortcut, useOpencodeKeymap } from "../../keymap"
 
 export function SubagentFooter() {
   const route = useRouteData("session")
@@ -39,18 +35,13 @@ export function SubagentFooter() {
     const last = msg.findLast((item): item is AssistantMessage => item.role === "assistant" && item.tokens.output > 0)
     if (!last) return
 
-    const model = sync.data.provider.find((item) => item.id === last.providerID)?.models[last.modelID]
-    if (!model) return
-    const { total, percent } = contextUsage({
-      cfg: sync.data.config as Config.Info,
-      tokens: last.tokens,
-      model: model as Provider.Model,
-    })
-    const tokens = total
+    const tokens =
+      last.tokens.input + last.tokens.output + last.tokens.reasoning + last.tokens.cache.read + last.tokens.cache.write
     if (tokens <= 0) return
 
-    const pct = percent !== undefined ? `${percent}%` : undefined
-    const cost = msg.reduce((sum, item) => sum + (item.role === "assistant" ? item.cost : 0), 0)
+    const model = sync.data.provider.find((item) => item.id === last.providerID)?.models[last.modelID]
+    const pct = model?.limit.context ? `${Math.round((tokens / model.limit.context) * 100)}%` : undefined
+    const cost = session()?.cost ?? 0
 
     const money = new Intl.NumberFormat("en-US", {
       style: "currency",
@@ -64,8 +55,10 @@ export function SubagentFooter() {
   })
 
   const { theme } = useTheme()
-  const keybind = useKeybind()
-  const command = useCommandDialog()
+  const keymap = useOpencodeKeymap()
+  const parentShortcut = useCommandShortcut("session.parent")
+  const previousShortcut = useCommandShortcut("session.child.previous")
+  const nextShortcut = useCommandShortcut("session.child.next")
   const [hover, setHover] = createSignal<"parent" | "prev" | "next" | null>(null)
   useTerminalDimensions()
 
@@ -104,31 +97,31 @@ export function SubagentFooter() {
             <box
               onMouseOver={() => setHover("parent")}
               onMouseOut={() => setHover(null)}
-              onMouseUp={() => command.trigger("session.parent")}
+              onMouseUp={() => keymap.dispatchCommand("session.parent")}
               backgroundColor={hover() === "parent" ? theme.backgroundElement : theme.backgroundPanel}
             >
               <text fg={theme.text}>
-                Parent <span style={{ fg: theme.textMuted }}>{keybind.print("session_parent")}</span>
+                Parent <span style={{ fg: theme.textMuted }}>{parentShortcut()}</span>
               </text>
             </box>
             <box
               onMouseOver={() => setHover("prev")}
               onMouseOut={() => setHover(null)}
-              onMouseUp={() => command.trigger("session.child.previous")}
+              onMouseUp={() => keymap.dispatchCommand("session.child.previous")}
               backgroundColor={hover() === "prev" ? theme.backgroundElement : theme.backgroundPanel}
             >
               <text fg={theme.text}>
-                Prev <span style={{ fg: theme.textMuted }}>{keybind.print("session_child_cycle_reverse")}</span>
+                Prev <span style={{ fg: theme.textMuted }}>{previousShortcut()}</span>
               </text>
             </box>
             <box
               onMouseOver={() => setHover("next")}
               onMouseOut={() => setHover(null)}
-              onMouseUp={() => command.trigger("session.child.next")}
+              onMouseUp={() => keymap.dispatchCommand("session.child.next")}
               backgroundColor={hover() === "next" ? theme.backgroundElement : theme.backgroundPanel}
             >
               <text fg={theme.text}>
-                Next <span style={{ fg: theme.textMuted }}>{keybind.print("session_child_cycle")}</span>
+                Next <span style={{ fg: theme.textMuted }}>{nextShortcut()}</span>
               </text>
             </box>
           </box>

@@ -18,3 +18,4 @@
 {"id":"jcMAIGM1","description":"Show TUI notice and unblock sessions when opencode compaction fails due to quota","stage":"committed","createdAt":"2026-05-15T05:08:55.516Z","updatedAt":"2026-05-15T05:22:44.746Z","committedEventId":"x4cH7j2tw3QGI6NZ"}
 {"id":"XPWpJTBT","description":"Fix duplicate auto-compaction after retained tail messages","stage":"committed","createdAt":"2026-05-20T02:20:33.583Z","updatedAt":"2026-05-20T02:32:34.135Z","committedEventId":"hU5C4aIILqAbXpx-"}
 {"id":"mYMO32eg","description":"Stop opencode retry loop on Claude subscription issue and enable fallback","stage":"committed","createdAt":"2026-05-28T12:52:22.575Z","updatedAt":"2026-05-28T12:54:54.198Z","committedEventId":"OlbVUp2zhf11EQAe"}
+{"id":"oi45EFJ0","description":"Merge latest upstream opencode into metyatech fork and verify local CLI","stage":"committed","createdAt":"2026-05-28T13:06:52.828Z","updatedAt":"2026-05-28T13:18:08.519Z","committedEventId":"_qUukiGiJpt_ESp9"}
