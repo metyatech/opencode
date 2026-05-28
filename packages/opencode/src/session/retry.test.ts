@@ -59,6 +59,7 @@ describe("SessionRetry.retryable", () => {
       "Payment Required",
       "Out of credits, please top up",
       "Subscription quota exceeded",
+      "Claude Max subscription issue. Check your subscription status at https://claude.ai/settings/billing.",
       "Monthly limit reached",
       "Quota will reset after 2025-05-01",
       "Usage limit has been reached for this month",
