@@ -87,6 +87,61 @@ function isOrphanedInterruptedTool(part: MessageV2.ToolPart) {
   return part.state.status === "error" && part.state.metadata?.interrupted === true
 }
 
+const NO_PROGRESS_LOOP_THRESHOLD = 3
+const NO_PROGRESS_LOOP_MESSAGE =
+  "Stopped because the last 3 assistant steps only repeated non-mutating compose-agentsmd/read-only tool calls under the same request and the workspace snapshot did not change. Please send a new instruction if you want me to continue another way."
+
+const READ_ONLY_TOOL_NAMES = new Set(["read", "grep", "glob", "list", "lsp_diagnostics"])
+const MUTATING_TOOL_NAMES = new Set(["apply_patch", "edit", "write"])
+
+function normalizedShellCommand(command: unknown) {
+  return typeof command === "string" ? command.trim().replace(/\s+/g, " ") : ""
+}
+
+function isComposeAgentsMdCommand(command: unknown) {
+  const normalized = normalizedShellCommand(command)
+  return normalized === "compose-agentsmd" || normalized === "npx compose-agentsmd"
+}
+
+function isNoProgressTool(part: MessageV2.ToolPart) {
+  if (part.state.status !== "completed") return false
+  if (MUTATING_TOOL_NAMES.has(part.tool)) return false
+  if (READ_ONLY_TOOL_NAMES.has(part.tool)) return true
+  return part.tool === "bash" && isComposeAgentsMdCommand(part.state.input.command)
+}
+
+function detectNoProgressToolLoop(msgs: MessageV2.WithParts[], parentID: MessageID) {
+  const recent = msgs
+    .filter((msg) => msg.info.role === "assistant" && msg.info.parentID === parentID && msg.info.finish === "tool-calls")
+    .sort((a, b) => b.info.id.localeCompare(a.info.id))
+    .slice(0, NO_PROGRESS_LOOP_THRESHOLD)
+
+  if (recent.length < NO_PROGRESS_LOOP_THRESHOLD) return
+
+  const snapshots = new Set<string>()
+  const toolNames = new Set<string>()
+  for (const msg of recent) {
+    const tools = msg.parts.filter((part): part is MessageV2.ToolPart => part.type === "tool")
+    if (tools.length === 0) return
+    if (!tools.some((toolPart) => toolPart.tool === "bash" && isComposeAgentsMdCommand(toolPart.state.input.command))) return
+    if (!tools.every(isNoProgressTool)) return
+
+    for (const toolPart of tools) toolNames.add(toolPart.tool)
+
+    const finish = msg.parts.findLast((part): part is MessageV2.StepFinishPart => part.type === "step-finish")
+    if (!finish?.snapshot) return
+    snapshots.add(finish.snapshot)
+  }
+
+  if (snapshots.size !== 1) return
+
+  return {
+    count: recent.length,
+    snapshot: Array.from(snapshots)[0],
+    tools: Array.from(toolNames).sort(),
+  }
+}
+
 export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
   readonly prompt: (input: PromptInput) => Effect.Effect<MessageV2.WithParts, Image.Error>
@@ -1417,6 +1472,37 @@ export const layer = Layer.effect(
           }
           const maxSteps = agent.steps ?? Infinity
           const isLastStep = step >= maxSteps
+          const noProgressLoop = detectNoProgressToolLoop(msgs, lastUser.id)
+          if (noProgressLoop) {
+            const now = Date.now()
+            const msg: MessageV2.Assistant = {
+              id: MessageID.ascending(),
+              parentID: lastUser.id,
+              role: "assistant",
+              mode: agent.name,
+              agent: agent.name,
+              variant: lastUser.model.variant,
+              path: { cwd: ctx.directory, root: ctx.worktree },
+              cost: 0,
+              tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+              modelID: model.id,
+              providerID: model.providerID,
+              time: { created: now, completed: now },
+              sessionID,
+              finish: "stop",
+            }
+            yield* sessions.updateMessage(msg)
+            yield* sessions.updatePart({
+              id: PartID.ascending(),
+              messageID: msg.id,
+              sessionID,
+              type: "text",
+              text: NO_PROGRESS_LOOP_MESSAGE,
+              metadata: { no_progress_guard: noProgressLoop },
+            } satisfies MessageV2.TextPart)
+            yield* slog.warn("stopping no-progress tool loop", noProgressLoop)
+            break
+          }
           msgs = yield* SessionReminders.apply({ messages: msgs, agent, session }).pipe(
             Effect.provideService(RuntimeFlags.Service, flags),
             Effect.provideService(AppFileSystem.Service, fsys),

@@ -414,6 +414,62 @@ const seed = Effect.fn("test.seed")(function* (sessionID: SessionID, opts?: { fi
   return { user: msg, assistant }
 })
 
+const addAssistantToolStep = Effect.fn("test.addAssistantToolStep")(function* (
+  sessionID: SessionID,
+  parentID: MessageID,
+  input: {
+    tool: string
+    toolInput?: Record<string, unknown>
+    snapshot?: string
+  },
+) {
+  const session = yield* Session.Service
+  const now = Date.now()
+  const assistant: MessageV2.Assistant = {
+    id: MessageID.ascending(),
+    role: "assistant",
+    parentID,
+    sessionID,
+    mode: "build",
+    agent: "build",
+    cost: 0,
+    path: { cwd: "/tmp", root: "/tmp" },
+    tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+    modelID: ref.modelID,
+    providerID: ref.providerID,
+    time: { created: now, completed: now },
+    finish: "tool-calls",
+  }
+  yield* session.updateMessage(assistant)
+  yield* session.updatePart({
+    id: PartID.ascending(),
+    messageID: assistant.id,
+    sessionID,
+    type: "tool",
+    callID: `call-${assistant.id}`,
+    tool: input.tool,
+    state: {
+      status: "completed",
+      input: input.toolInput ?? {},
+      output: "",
+      title: input.tool,
+      metadata: {},
+      time: { start: now, end: now },
+    },
+  })
+  yield* session.updatePart({
+    id: PartID.ascending(),
+    messageID: assistant.id,
+    sessionID,
+    type: "step-finish",
+    reason: "tool-calls",
+    snapshot: input.snapshot ?? "snapshot-no-progress",
+    cost: 0,
+    tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+  })
+  return assistant
+})
+
 const addSubtask = (sessionID: SessionID, messageID: MessageID, model = ref) =>
   Effect.gen(function* () {
     const session = yield* Session.Service
@@ -645,6 +701,67 @@ it.instance("loop continues when finish is tool-calls", () =>
       expect(result.parts.some((part) => part.type === "text" && part.text === "second")).toBe(true)
       expect(result.info.finish).toBe("stop")
     }
+  }),
+)
+
+noLLMServer.instance(
+  "loop stops repeated no-progress compose-agentsmd tool calls",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({ title: "No progress guard" })
+      const msg = yield* user(session.id, "continue")
+
+      for (let index = 0; index < 3; index++) {
+        yield* addAssistantToolStep(session.id, msg.id, {
+          tool: "bash",
+          toolInput: { command: "compose-agentsmd" },
+        })
+      }
+
+      const result = yield* prompt.loop({ sessionID: session.id })
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role === "assistant") {
+        expect(result.info.finish).toBe("stop")
+      }
+      expect(
+        result.parts.some(
+          (part) =>
+            part.type === "text" &&
+            part.text.includes("only repeated non-mutating compose-agentsmd/read-only tool calls"),
+        ),
+      ).toBe(true)
+    }),
+  { config: cfg },
+)
+
+it.instance("loop keeps going when repeated tool-call steps include a file edit", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({ title: "No progress guard edit" })
+    const msg = yield* user(session.id, "continue")
+
+    yield* addAssistantToolStep(session.id, msg.id, {
+      tool: "bash",
+      toolInput: { command: "compose-agentsmd" },
+    })
+    yield* addAssistantToolStep(session.id, msg.id, {
+      tool: "apply_patch",
+      toolInput: { patch: "*** Begin Patch\n*** End Patch" },
+    })
+    yield* addAssistantToolStep(session.id, msg.id, {
+      tool: "bash",
+      toolInput: { command: "compose-agentsmd" },
+    })
+    yield* llm.text("continued after edit")
+
+    const result = yield* prompt.loop({ sessionID: session.id })
+    expect(yield* llm.calls).toBe(1)
+    expect(result.info.role).toBe("assistant")
+    expect(result.parts.some((part) => part.type === "text" && part.text === "continued after edit")).toBe(true)
   }),
 )
 

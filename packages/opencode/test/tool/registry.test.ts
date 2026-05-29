@@ -137,6 +137,23 @@ describe("tool.registry", () => {
     }),
   )
 
+  it.instance("exposes apply_patch instead of edit/write for non-GPT-4 OpenAI GPT models", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const agent = yield* Agent.Service
+      const tools = yield* registry.tools({
+        providerID: ProviderID.make("openai"),
+        modelID: ModelID.make("gpt-5.4"),
+        agent: yield* agent.defaultInfo(),
+      })
+      const ids = tools.map((tool) => tool.id)
+
+      expect(ids).toContain("apply_patch")
+      expect(ids).not.toContain("edit")
+      expect(ids).not.toContain("write")
+    }),
+  )
+
   it.instance("hides task background parameter unless experimental background subagents are enabled", () =>
     Effect.gen(function* () {
       const registry = yield* ToolRegistry.Service
