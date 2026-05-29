@@ -70,6 +70,10 @@ function backgroundOutput(sessionID: SessionID) {
   ].join("\n")
 }
 
+function isNonEmptyTextPart(part: MessageV2.Part): part is MessageV2.TextPart {
+  return part.type === "text" && part.text.trim().length > 0
+}
+
 function backgroundMessage(input: {
   sessionID: SessionID
   description: string
@@ -206,7 +210,11 @@ export const TaskTool = Tool.define(
           },
           parts,
         })
-        return result.parts.findLast((item) => item.type === "text")?.text ?? ""
+        const text = result.parts.findLast(isNonEmptyTextPart)?.text
+        if (!text) {
+          return yield* Effect.fail(new Error(`Subagent ${nextSession.id} completed without a text result.`))
+        }
+        return text
       })
 
       const resumeParent: (input: { userID: MessageID; attempts?: number }) => Effect.Effect<void> = Effect.fn(
@@ -221,7 +229,8 @@ export const TaskTool = Tool.define(
             Stream.runDrain,
             Effect.timeoutOption("1 second"),
           )
-          return yield* resumeParent({ ...input, attempts: (input.attempts ?? 0) + 1 })
+          yield* resumeParent({ ...input, attempts: (input.attempts ?? 0) + 1 })
+          return
         }
 
         const latest = yield* sessions
