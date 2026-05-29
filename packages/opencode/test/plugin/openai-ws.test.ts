@@ -176,7 +176,7 @@ describe("plugin.openai.ws-pool", () => {
     fetch.close()
   })
 
-  test("falls back to HTTP after websocket setup retries are exhausted", async () => {
+  test("falls back to HTTP immediately when websocket setup fails", async () => {
     const attempts: string[] = []
     await using server = await createRejectingWebSocketServer(() => attempts.push("websocket"))
     const fetch = OpenAIWebSocketPool.createWebSocketFetch({
@@ -186,16 +186,17 @@ describe("plugin.openai.ws-pool", () => {
     })
 
     const first = await fetch(server.url, streamRequest({ [TITLE_HEADER]: "false" }))
-    expect(await readTextError(first.text())).toBeInstanceOf(ProviderError.ResponseStreamError)
     const second = await fetch(server.url, streamRequest({ [TITLE_HEADER]: "false" }))
     const third = await fetch(server.url, streamRequest({ [TITLE_HEADER]: "false" }))
 
+    expect(await first.text()).toBe("http")
     expect(await second.text()).toBe("http")
     expect(await third.text()).toBe("http")
-    expect(attempts).toEqual(["websocket", "websocket"])
-    expect(server.httpRequests).toHaveLength(2)
+    expect(attempts).toEqual(["websocket"])
+    expect(server.httpRequests).toHaveLength(3)
     expect(server.httpRequests[0]?.headers[TITLE_HEADER]).toBeUndefined()
     expect(server.httpRequests[1]?.headers[TITLE_HEADER]).toBeUndefined()
+    expect(server.httpRequests[2]?.headers[TITLE_HEADER]).toBeUndefined()
     fetch.close()
   })
 

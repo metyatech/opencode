@@ -1,6 +1,5 @@
 import WebSocket from "ws"
 import * as Log from "@opencode-ai/core/util/log"
-import { ProviderError } from "@/provider/error"
 import { isRecord } from "@/util/record"
 import { OpenAIWebSocket } from "./ws"
 
@@ -153,19 +152,15 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
         throw error
       }
 
-      recordStreamFailure(entry)
+      entry.fallback = true
+      const message = describeError(error)
       log.warn("websocket setup failed", {
         key,
-        error: error instanceof Error ? error.message : String(error),
-        fallback: entry.fallback ? "http" : undefined,
+        error: message,
+        fallback: "http",
       })
       invalidate(entry)
-      if (entry.fallback) return httpFetch(input, httpInit)
-      return failedResponse(
-        new ProviderError.ResponseStreamError(error instanceof Error ? error.message : String(error), {
-          cause: error,
-        }),
-      )
+      return httpFetch(input, httpInit)
     }
   }
 
@@ -201,18 +196,21 @@ function connectionLimitError(event: Record<string, unknown>) {
   return new Error(typeof event.error.message === "string" ? event.error.message : CONNECTION_LIMIT_REACHED_CODE)
 }
 
-function failedResponse(error: ProviderError.ResponseStreamError) {
-  return new Response(
-    new ReadableStream({
-      start(controller) {
-        controller.error(error)
-      },
-    }),
-    {
-      status: 200,
-      headers: { "content-type": "text/event-stream" },
-    },
-  )
+function describeError(error: unknown) {
+  if (error instanceof Error && error.message) return error.message
+  if (!isRecord(error)) return String(error)
+
+  const message = typeof error.message === "string" && error.message.trim() ? error.message.trim() : undefined
+  if (message) return message
+
+  const name = typeof error.name === "string" && error.name.trim() ? error.name.trim() : undefined
+  const type = typeof error.type === "string" && error.type.trim() ? error.type.trim() : undefined
+  const constructorName = (() => {
+    const constructor = error.constructor
+    return typeof constructor === "function" && constructor.name.trim() ? constructor.name.trim() : undefined
+  })()
+
+  return [name ?? constructorName, type].filter(Boolean).join(": ") || String(error)
 }
 
 async function socket(
