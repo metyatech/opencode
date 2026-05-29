@@ -2,19 +2,22 @@ import * as Tool from "./tool"
 import DESCRIPTION from "./task.txt"
 import { ToolJsonSchema } from "./json-schema"
 import { BackgroundJob } from "@/background/job"
+import { Bus } from "@/bus"
 import { Session } from "@/session/session"
+import { SessionStatus } from "@/session/status"
 import { SessionID, MessageID } from "../session/schema"
 import { MessageV2 } from "../session/message-v2"
 import { Agent } from "../agent/agent"
 import { deriveSubagentSessionPermission } from "../agent/subagent-permissions"
 import type { SessionPrompt } from "../session/prompt"
 import { Config } from "@/config/config"
-import { Cause, Effect, Exit, Schema, Scope } from "effect"
+import { Cause, Effect, Exit, Option, Schema, Scope, Stream } from "effect"
 import { EffectBridge } from "@/effect/bridge"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 
 export interface TaskPromptOps {
   cancel(sessionID: SessionID): Effect.Effect<void>
+  loop(input: SessionPrompt.LoopInput): Effect.Effect<MessageV2.WithParts>
   resolvePromptParts(template: string): Effect.Effect<SessionPrompt.PromptInput["parts"]>
   prompt(input: SessionPrompt.PromptInput): Effect.Effect<MessageV2.WithParts>
 }
@@ -98,8 +101,10 @@ export const TaskTool = Tool.define(
   Effect.gen(function* () {
     const agent = yield* Agent.Service
     const background = yield* BackgroundJob.Service
+    const bus = yield* Bus.Service
     const config = yield* Config.Service
     const sessions = yield* Session.Service
+    const status = yield* SessionStatus.Service
     const scope = yield* Scope.Scope
     const flags = yield* RuntimeFlags.Service
 
@@ -165,6 +170,10 @@ export const TaskTool = Tool.define(
         modelID: msg.info.modelID,
         providerID: msg.info.providerID,
       }
+      const parentModel = {
+        modelID: msg.info.modelID,
+        providerID: msg.info.providerID,
+      }
       const metadata = {
         parentSessionId: ctx.sessionID,
         sessionId: nextSession.id,
@@ -200,29 +209,56 @@ export const TaskTool = Tool.define(
         return result.parts.findLast((item) => item.type === "text")?.text ?? ""
       })
 
+      const resumeParent: (input: { userID: MessageID; attempts?: number }) => Effect.Effect<void> = Effect.fn(
+        "TaskTool.resumeParent",
+      )(function* (input) {
+        if ((yield* status.get(ctx.sessionID)).type !== "idle") {
+          if ((input.attempts ?? 0) >= 60) return
+          const stream = yield* Scope.provide(scope)(bus.subscribe(SessionStatus.Event.Idle))
+          yield* stream.pipe(
+            Stream.filter((event) => event.properties.sessionID === ctx.sessionID),
+            Stream.take(1),
+            Stream.runDrain,
+            Effect.timeoutOption("1 second"),
+          )
+          return yield* resumeParent({ ...input, attempts: (input.attempts ?? 0) + 1 })
+        }
+
+        const latest = yield* sessions
+          .findMessage(ctx.sessionID, (item) => item.info.role === "user")
+          .pipe(Effect.catchCause(() => Effect.succeed(Option.none<MessageV2.WithParts>())))
+        if (Option.isNone(latest)) return
+        if (latest.value.info.id !== input.userID) return
+        yield* ops.loop({ sessionID: ctx.sessionID }).pipe(Effect.ignore)
+      })
+
       const inject = Effect.fn("TaskTool.injectBackgroundResult")(function* (
         state: "completed" | "error",
         text: string,
       ) {
         const currentParent = yield* sessions.get(ctx.sessionID)
-        yield* ops
-          .prompt({
-            sessionID: ctx.sessionID,
-            agent: currentParent.agent ?? ctx.agent,
-            parts: [
-              {
-                type: "text",
-                synthetic: true,
-                text: backgroundMessage({
-                  sessionID: nextSession.id,
-                  description: params.description,
-                  state,
-                  text,
-                }),
-              },
-            ],
-          })
-          .pipe(Effect.ignore, Effect.forkIn(scope, { startImmediately: true }))
+        const message = yield* ops.prompt({
+          sessionID: ctx.sessionID,
+          noReply: true,
+          model: parentModel,
+          agent: currentParent.agent ?? ctx.agent,
+          parts: [
+            {
+              type: "text",
+              synthetic: true,
+              text: backgroundMessage({
+                sessionID: nextSession.id,
+                description: params.description,
+                state,
+                text,
+              }),
+            },
+          ],
+        })
+        yield* resumeParent({ userID: message.info.id }).pipe(
+          Effect.ignore,
+          Effect.forkIn(scope, { startImmediately: true }),
+        )
       })
 
       const existing = yield* background.get(nextSession.id)

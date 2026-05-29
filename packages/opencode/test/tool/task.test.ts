@@ -86,6 +86,19 @@ const seed = Effect.fn("TaskToolTest.seed")(function* (title = "Pinned") {
 function stubOps(opts?: { onPrompt?: (input: SessionPrompt.PromptInput) => void; text?: string }): TaskPromptOps {
   return {
     cancel: () => Effect.void,
+    loop: (input) =>
+      Effect.succeed(
+        reply(
+          {
+            sessionID: input.sessionID,
+            messageID: MessageID.ascending(),
+            agent: "build",
+            model: ref,
+            parts: [],
+          },
+          opts?.text ?? "done",
+        ),
+      ),
     resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
     prompt: (input) =>
       Effect.sync(() => {
@@ -300,6 +313,19 @@ describe("tool.task", () => {
           Effect.sync(() => {
             cancelled.resolve(sessionID)
           }),
+        loop: (input) =>
+          Effect.succeed(
+            reply(
+              {
+                sessionID: input.sessionID,
+                messageID: MessageID.ascending(),
+                agent: "build",
+                model: ref,
+                parts: [],
+              },
+              "looped",
+            ),
+          ),
         resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
         prompt: (input) =>
           Effect.promise(() => {
@@ -570,7 +596,24 @@ describe("tool.task", () => {
             promptOps: {
               ...stubOps({ text: "background done" }),
               prompt: (input) =>
-                input.sessionID === chat.id ? Effect.never : Effect.succeed(reply(input, "background done")),
+                input.sessionID === chat.id
+                  ? Effect.succeed(reply(input, "queued parent result"))
+                  : Effect.succeed(reply(input, "background done")),
+              loop: (input) =>
+                input.sessionID === chat.id
+                  ? Effect.never
+                  : Effect.succeed(
+                      reply(
+                        {
+                          sessionID: input.sessionID,
+                          messageID: MessageID.ascending(),
+                          agent: "build",
+                          model: ref,
+                          parts: [],
+                        },
+                        "looped",
+                      ),
+                    ),
             } satisfies TaskPromptOps,
           },
           messages: [],
@@ -582,6 +625,94 @@ describe("tool.task", () => {
       const waited = yield* jobs.wait({ id: result.metadata.sessionId, timeout: 1_000 })
       expect(waited.timedOut).toBe(false)
       expect(waited.info?.status).toBe("completed")
+    }),
+  )
+
+  background.instance("background task resumes parent after it becomes idle", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const sessions = yield* Session.Service
+      const status = yield* SessionStatus.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const loops: SessionID[] = []
+      const parentPrompted = defer<MessageID>()
+      const resumed = defer<void>()
+
+      yield* status.set(chat.id, { type: "busy" })
+
+      const result = yield* def.execute(
+        {
+          description: "inspect bug",
+          prompt: "look into the cache key path",
+          subagent_type: "general",
+          background: true,
+        },
+        {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: {
+            promptOps: {
+              ...stubOps({ text: "background done" }),
+              prompt: (input) => {
+                if (input.sessionID !== chat.id) return Effect.succeed(reply(input, "background done"))
+                return Effect.gen(function* () {
+                  const info = yield* sessions.updateMessage({
+                    id: input.messageID ?? MessageID.ascending(),
+                    role: "user",
+                    sessionID: input.sessionID,
+                    agent: input.agent ?? "build",
+                    model: input.model ?? ref,
+                    time: { created: Date.now() },
+                  })
+                  const text = input.parts.find((part) => part.type === "text")
+                  const part = yield* sessions.updatePart({
+                    id: PartID.ascending(),
+                    messageID: info.id,
+                    sessionID: input.sessionID,
+                    type: "text",
+                    text: text?.text ?? "",
+                    synthetic: text && "synthetic" in text ? text.synthetic : undefined,
+                  } satisfies MessageV2.TextPart)
+                  parentPrompted.resolve(info.id)
+                  return { info, parts: [part] }
+                })
+              },
+              loop: (input) =>
+                Effect.sync(() => {
+                  loops.push(input.sessionID)
+                  resumed.resolve()
+                  return reply(
+                    {
+                      sessionID: input.sessionID,
+                      messageID: MessageID.ascending(),
+                      agent: "build",
+                      model: ref,
+                      parts: [],
+                    },
+                    "looped",
+                  )
+                }),
+            } satisfies TaskPromptOps,
+          },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+
+      const waited = yield* jobs.wait({ id: result.metadata.sessionId, timeout: 1_000 })
+      expect(waited.timedOut).toBe(false)
+      expect(waited.info?.status).toBe("completed")
+      yield* Effect.promise(() => parentPrompted.promise)
+      expect(loops).toEqual([])
+
+      yield* status.set(chat.id, { type: "idle" })
+      yield* Effect.promise(() => resumed.promise).pipe(Effect.timeout("2 seconds"))
+      expect(loops).toEqual([chat.id])
     }),
   )
 
