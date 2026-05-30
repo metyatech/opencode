@@ -385,6 +385,29 @@ const user = Effect.fn("test.user")(function* (sessionID: SessionID, text: strin
   return msg
 })
 
+const compactionContinueUser = Effect.fn("test.compactionContinueUser")(function* (sessionID: SessionID) {
+  const session = yield* Session.Service
+  const msg = yield* session.updateMessage({
+    id: MessageID.ascending(),
+    role: "user",
+    sessionID,
+    agent: "build",
+    model: ref,
+    time: { created: Date.now() },
+    summary: { title: "Retained task", body: "Continue the retained task.", diffs: [] },
+  })
+  yield* session.updatePart({
+    id: PartID.ascending(),
+    messageID: msg.id,
+    sessionID,
+    type: "text",
+    text: "Continue if you have next steps.",
+    synthetic: true,
+    metadata: { compaction_continue: true },
+  })
+  return msg
+})
+
 const seed = Effect.fn("test.seed")(function* (sessionID: SessionID, opts?: { finish?: string }) {
   const session = yield* Session.Service
   const msg = yield* user(sessionID, "hello")
@@ -705,7 +728,7 @@ it.instance("loop continues when finish is tool-calls", () =>
 )
 
 noLLMServer.instance(
-  "loop stops repeated no-progress compose-agentsmd tool calls",
+  "loop stops repeated identical tool observations",
   () =>
     Effect.gen(function* () {
       const prompt = yield* SessionPrompt.Service
@@ -715,8 +738,8 @@ noLLMServer.instance(
 
       for (let index = 0; index < 3; index++) {
         yield* addAssistantToolStep(session.id, msg.id, {
-          tool: "bash",
-          toolInput: { command: "compose-agentsmd" },
+          tool: "workspace_probe",
+          toolInput: { query: "state" },
         })
       }
 
@@ -729,14 +752,14 @@ noLLMServer.instance(
         result.parts.some(
           (part) =>
             part.type === "text" &&
-            part.text.includes("only repeated non-mutating compose-agentsmd/read-only tool calls"),
+            part.text.includes("repeated the same tool observations under the same request"),
         ),
       ).toBe(true)
     }),
   { config: cfg },
 )
 
-it.instance("loop keeps going when repeated tool-call steps include a file edit", () =>
+it.instance("loop keeps going when recent tool observations are not identical", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(providerCfg)
     const prompt = yield* SessionPrompt.Service
@@ -745,16 +768,19 @@ it.instance("loop keeps going when repeated tool-call steps include a file edit"
     const msg = yield* user(session.id, "continue")
 
     yield* addAssistantToolStep(session.id, msg.id, {
-      tool: "bash",
-      toolInput: { command: "compose-agentsmd" },
+      tool: "workspace_probe",
+      toolInput: { query: "state" },
+      snapshot: "snapshot-before",
     })
     yield* addAssistantToolStep(session.id, msg.id, {
       tool: "apply_patch",
       toolInput: { patch: "*** Begin Patch\n*** End Patch" },
+      snapshot: "snapshot-after-edit",
     })
     yield* addAssistantToolStep(session.id, msg.id, {
-      tool: "bash",
-      toolInput: { command: "compose-agentsmd" },
+      tool: "workspace_probe",
+      toolInput: { query: "state" },
+      snapshot: "snapshot-after-edit",
     })
     yield* llm.text("continued after edit")
 
@@ -762,6 +788,28 @@ it.instance("loop keeps going when repeated tool-call steps include a file edit"
     expect(yield* llm.calls).toBe(1)
     expect(result.info.role).toBe("assistant")
     expect(result.parts.some((part) => part.type === "text" && part.text === "continued after edit")).toBe(true)
+  }),
+)
+
+it.instance("compaction continuation is sent to the model as internal resume state", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({ title: "Compaction continuation" })
+    yield* compactionContinueUser(session.id)
+    yield* llm.text("continued")
+
+    const result = yield* prompt.loop({ sessionID: session.id })
+    expect(result.info.role).toBe("assistant")
+    expect(result.parts.some((part) => part.type === "text" && part.text === "continued")).toBe(true)
+
+    const inputs = yield* llm.inputs
+    const latestInput = JSON.stringify(inputs.at(-1))
+    expect(latestInput).toContain("Internal continuation after session compaction")
+    expect(latestInput).toContain("not a new user request")
+    expect(latestInput).toContain("do not restart request-intake")
+    expect(latestInput).not.toContain("Continue if you have next steps.")
   }),
 )
 

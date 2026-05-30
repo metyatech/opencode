@@ -36,6 +36,14 @@ interface FetchDecompressionError extends Error {
 }
 
 export const SYNTHETIC_ATTACHMENT_PROMPT = "Attached media from tool result:"
+export const INTERNAL_COMPACTION_CONTINUATION_PROMPT = [
+  "<system-reminder>",
+  "Internal continuation after session compaction.",
+  "This is not a new user request.",
+  "Continue the in-progress request from the retained summary and recent conversation.",
+  "Do not restart request-intake, intent-routing, or turn-start procedures solely because of this continuation marker.",
+  "</system-reminder>",
+].join("\n")
 export { isMedia }
 
 export const AbortedError = NamedError.create("MessageAbortedError", { message: Schema.String })
@@ -560,6 +568,14 @@ export type WithParts = {
   parts: Part[]
 }
 
+export function isCompactionContinuationPart(part: Part) {
+  return part.type === "text" && part.synthetic === true && part.metadata?.compaction_continue === true
+}
+
+export function isCompactionContinuationMessage(msg: WithParts) {
+  return msg.info.role === "user" && msg.parts.some(isCompactionContinuationPart)
+}
+
 const Cursor = Schema.Struct({
   id: MessageID,
   time: Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0)),
@@ -704,7 +720,7 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
         if (part.type === "text" && !part.ignored && part.text !== "")
           userMessage.parts.push({
             type: "text",
-            text: part.text,
+            text: isCompactionContinuationPart(part) ? INTERNAL_COMPACTION_CONTINUATION_PROMPT : part.text,
           })
         // text/plain and directory files are converted into text parts, ignore them
         if (part.type === "file" && part.mime !== "text/plain" && part.mime !== "application/x-directory") {

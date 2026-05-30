@@ -89,28 +89,59 @@ function isOrphanedInterruptedTool(part: MessageV2.ToolPart) {
 
 const NO_PROGRESS_LOOP_THRESHOLD = 3
 const NO_PROGRESS_LOOP_MESSAGE =
-  "Stopped because the last 3 assistant steps only repeated non-mutating compose-agentsmd/read-only tool calls under the same request and the workspace snapshot did not change. Please send a new instruction if you want me to continue another way."
+  "Stopped because the last 3 assistant steps repeated the same tool observations under the same request without adding new state or context. Please send a new instruction if you want me to continue another way."
 
-const READ_ONLY_TOOL_NAMES = new Set(["read", "grep", "glob", "list", "lsp_diagnostics"])
-const MUTATING_TOOL_NAMES = new Set(["apply_patch", "edit", "write"])
+const INTERNAL_CONTINUATION_SYSTEM_PROMPT =
+  "The latest user-role message is an internal continuation marker generated after session compaction, not a new human request. Continue the in-progress request from retained state; do not restart request-intake, intent-routing, or turn-start procedures because of that marker."
 
-function normalizedShellCommand(command: unknown) {
-  return typeof command === "string" ? command.trim().replace(/\s+/g, " ") : ""
+function stableJson(value: unknown): string {
+  return JSON.stringify(sortJsonValue(value))
 }
 
-function isComposeAgentsMdCommand(command: unknown) {
-  const normalized = normalizedShellCommand(command)
-  return normalized === "compose-agentsmd" || normalized === "npx compose-agentsmd"
+function sortJsonValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortJsonValue)
+  if (!value || typeof value !== "object") return value
+  const record = value as Record<string, unknown>
+  return Object.fromEntries(Object.keys(record).sort().map((key) => [key, sortJsonValue(record[key])]))
 }
 
-function isNoProgressTool(part: MessageV2.ToolPart) {
-  if (part.state.status !== "completed") return false
-  if (MUTATING_TOOL_NAMES.has(part.tool)) return false
-  if (READ_ONLY_TOOL_NAMES.has(part.tool)) return true
-  return part.tool === "bash" && isComposeAgentsMdCommand(part.state.input.command)
+function toolObservation(part: MessageV2.ToolPart): unknown {
+  if (part.state.status === "completed") {
+    return {
+      tool: part.tool,
+      status: part.state.status,
+      input: sortJsonValue(part.state.input),
+      output: part.state.output,
+    }
+  }
+  if (part.state.status === "error") {
+    return {
+      tool: part.tool,
+      status: part.state.status,
+      input: sortJsonValue(part.state.input),
+      error: part.state.error,
+    }
+  }
+  return
 }
 
-function detectNoProgressToolLoop(msgs: MessageV2.WithParts[], parentID: MessageID) {
+function stepObservationFingerprint(msg: MessageV2.WithParts) {
+  const tools = msg.parts.filter((part): part is MessageV2.ToolPart => part.type === "tool")
+  if (tools.length === 0) return
+
+  const finish = msg.parts.findLast((part): part is MessageV2.StepFinishPart => part.type === "step-finish")
+  if (!finish?.snapshot) return
+
+  const observations = tools.map(toolObservation)
+  if (observations.some((observation) => observation === undefined)) return
+
+  return stableJson({
+    snapshot: finish.snapshot,
+    observations,
+  })
+}
+
+function detectRepeatedToolObservationLoop(msgs: MessageV2.WithParts[], parentID: MessageID) {
   const recent = msgs
     .filter((msg) => msg.info.role === "assistant" && msg.info.parentID === parentID && msg.info.finish === "tool-calls")
     .sort((a, b) => b.info.id.localeCompare(a.info.id))
@@ -118,27 +149,13 @@ function detectNoProgressToolLoop(msgs: MessageV2.WithParts[], parentID: Message
 
   if (recent.length < NO_PROGRESS_LOOP_THRESHOLD) return
 
-  const snapshots = new Set<string>()
-  const toolNames = new Set<string>()
-  for (const msg of recent) {
-    const tools = msg.parts.filter((part): part is MessageV2.ToolPart => part.type === "tool")
-    if (tools.length === 0) return
-    if (!tools.some((toolPart) => toolPart.tool === "bash" && isComposeAgentsMdCommand(toolPart.state.input.command))) return
-    if (!tools.every(isNoProgressTool)) return
-
-    for (const toolPart of tools) toolNames.add(toolPart.tool)
-
-    const finish = msg.parts.findLast((part): part is MessageV2.StepFinishPart => part.type === "step-finish")
-    if (!finish?.snapshot) return
-    snapshots.add(finish.snapshot)
-  }
-
-  if (snapshots.size !== 1) return
+  const fingerprints = recent.map(stepObservationFingerprint)
+  const first = fingerprints[0]
+  if (!first || !fingerprints.every((fingerprint) => fingerprint === first)) return
 
   return {
     count: recent.length,
-    snapshot: Array.from(snapshots)[0],
-    tools: Array.from(toolNames).sort(),
+    fingerprint: first,
   }
 }
 
@@ -1472,7 +1489,7 @@ export const layer = Layer.effect(
           }
           const maxSteps = agent.steps ?? Infinity
           const isLastStep = step >= maxSteps
-          const noProgressLoop = detectNoProgressToolLoop(msgs, lastUser.id)
+          const noProgressLoop = detectRepeatedToolObservationLoop(msgs, lastUser.id)
           if (noProgressLoop) {
             const now = Date.now()
             const msg: MessageV2.Assistant = {
@@ -1604,6 +1621,10 @@ export const layer = Layer.effect(
               MessageV2.toModelMessagesEffect(msgs, model),
             ])
             const system = [...env, ...instructions, ...(skills ? [skills] : [])]
+            const latestUserMsg = msgs.findLast((m) => m.info.role === "user")
+            if (latestUserMsg && MessageV2.isCompactionContinuationMessage(latestUserMsg)) {
+              system.push(INTERNAL_CONTINUATION_SYSTEM_PROMPT)
+            }
             const format = lastUser.format ?? { type: "text" as const }
             if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
             const result = yield* handle.process({
