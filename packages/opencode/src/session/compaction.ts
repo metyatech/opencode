@@ -104,20 +104,35 @@ function summaryText(message: MessageV2.WithParts) {
 
 function completedCompactions(messages: MessageV2.WithParts[]) {
   const users = new Map<MessageID, number>()
+  const compactionUsers: number[] = []
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i]
     if (msg.info.role !== "user") continue
     if (!msg.parts.some((part) => part.type === "compaction")) continue
     users.set(msg.info.id, i)
+    compactionUsers.push(i)
   }
 
-  return messages.flatMap((msg, assistantIndex): CompletedCompaction[] => {
-    if (msg.info.role !== "assistant") return []
-    if (!msg.info.summary || !msg.info.finish || msg.info.error) return []
-    const userIndex = users.get(msg.info.parentID)
-    if (userIndex === undefined) return []
-    return [{ userIndex, assistantIndex, summary: summaryText(msg) }]
-  })
+  const paired = new Set<number>()
+  const result: CompletedCompaction[] = []
+  for (const [assistantIndex, msg] of messages.entries()) {
+    if (!MessageV2.isFinishedSummaryAssistant(msg)) continue
+    let userIndex = users.get(msg.info.parentID)
+    if (userIndex === undefined && MessageV2.isCompactionSummaryAssistant(msg)) {
+      for (let i = compactionUsers.length - 1; i >= 0; i--) {
+        const candidate = compactionUsers[i]
+        if (candidate >= assistantIndex) continue
+        if (paired.has(candidate)) continue
+        userIndex = candidate
+        break
+      }
+    }
+    if (userIndex === undefined) continue
+    if (paired.has(userIndex)) continue
+    paired.add(userIndex)
+    result.push({ userIndex, assistantIndex, summary: summaryText(msg) })
+  }
+  return result
 }
 
 function buildPrompt(input: { previousSummary?: string; context: string[] }) {

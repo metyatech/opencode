@@ -1030,6 +1030,7 @@ export const get = Effect.fn("MessageV2.get")(function* (input: { sessionID: Ses
 export function filterCompacted(msgs: Iterable<WithParts>) {
   const result = [] as WithParts[]
   const completed = new Set<string>()
+  let pendingCompactionSummaries = 0
   let retain: MessageID | undefined
   for (const msg of msgs) {
     result.push(msg)
@@ -1037,18 +1038,20 @@ export function filterCompacted(msgs: Iterable<WithParts>) {
       if (msg.info.id === retain) break
       continue
     }
-    if (msg.info.role === "user" && completed.has(msg.info.id)) {
+    if (msg.info.role === "user") {
       const part = msg.parts.find((item): item is CompactionPart => item.type === "compaction")
       if (!part) continue
+      if (!completed.has(msg.info.id) && pendingCompactionSummaries === 0) continue
+      if (pendingCompactionSummaries > 0) pendingCompactionSummaries--
       if (!part.tail_start_id) break
       retain = part.tail_start_id
       if (msg.info.id === retain) break
       continue
     }
-    if (msg.info.role === "user" && completed.has(msg.info.id) && msg.parts.some((part) => part.type === "compaction"))
-      break
-    if (msg.info.role === "assistant" && msg.info.summary && msg.info.finish && !msg.info.error)
+    if (isFinishedSummaryAssistant(msg)) {
       completed.add(msg.info.parentID)
+      if (isCompactionSummaryAssistant(msg)) pendingCompactionSummaries++
+    }
   }
   result.reverse()
   const compactionIndex = result.findLastIndex(
@@ -1064,9 +1067,8 @@ export function filterCompacted(msgs: Iterable<WithParts>) {
     ? result.findIndex(
         (msg, index) =>
           index > compactionIndex &&
-          msg.info.role === "assistant" &&
-          msg.info.summary &&
-          msg.info.parentID === compaction.info.id,
+          isFinishedSummaryAssistant(msg) &&
+          (msg.info.parentID === compaction.info.id || isCompactionSummaryAssistant(msg)),
       )
     : -1
   const tailIndex = part?.tail_start_id ? result.findIndex((msg) => msg.info.id === part.tail_start_id) : -1
@@ -1078,6 +1080,14 @@ export function filterCompacted(msgs: Iterable<WithParts>) {
     ]
   }
   return result
+}
+
+export function isFinishedSummaryAssistant(msg: WithParts): msg is WithParts & { info: Assistant } {
+  return msg.info.role === "assistant" && msg.info.summary === true && !!msg.info.finish && !msg.info.error
+}
+
+export function isCompactionSummaryAssistant(msg: WithParts): msg is WithParts & { info: Assistant } {
+  return isFinishedSummaryAssistant(msg) && (msg.info.agent === "compaction" || msg.info.mode === "compaction")
 }
 
 export const filterCompactedEffect = Effect.fnUntraced(function* (sessionID: SessionID) {

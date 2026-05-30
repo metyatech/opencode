@@ -1420,6 +1420,42 @@ describe("session.compaction.process", () => {
     { git: true },
   )
 
+  itCompaction.instance(
+    "anchors repeated compactions with a legacy fallback summary",
+    () => {
+      const stub = llm()
+      let captured = ""
+      stub.push(
+        reply("summary two", (input) => {
+          captured = JSON.stringify(input.messages)
+        }),
+      )
+
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const test = yield* TestInstance
+        const session = yield* ssn.create({})
+        yield* createUserMessage(session.id, "older context")
+        yield* createUserMessage(session.id, "keep this turn")
+        yield* createCompactionMarker(session.id)
+        const fallback = yield* createUserMessage(session.id, "Continue if there is remaining work.")
+        yield* createSummaryAssistantMessage(session.id, fallback.id, test.directory, "summary one")
+
+        yield* createUserMessage(session.id, "latest turn")
+        yield* createCompactionMarker(session.id)
+
+        const msgs = MessageV2.filterCompacted(MessageV2.stream(session.id))
+        const parent = msgs.at(-1)?.info.id
+        expect(parent).toBeTruthy()
+        yield* SessionCompaction.use.process({ parentID: parent!, messages: msgs, sessionID: session.id, auto: false })
+
+        expect(captured).toContain("<previous-summary>")
+        expect(captured).toContain("summary one")
+      }).pipe(withCompaction({ llm: stub.layer }))
+    },
+    { git: true },
+  )
+
   itCompaction.instance("keeps recent pre-compaction turns across repeated compactions", () => {
     const stub = llm()
     stub.push(reply("summary one"))

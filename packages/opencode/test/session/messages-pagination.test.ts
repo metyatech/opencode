@@ -85,7 +85,13 @@ const addUser = Effect.fn("Test.addUser")(function* (sessionID: SessionID, text?
 const addAssistant = Effect.fn("Test.addAssistant")(function* (
   sessionID: SessionID,
   parentID: MessageID,
-  opts?: { summary?: boolean; finish?: string; error?: MessageV2.Assistant["error"] },
+  opts?: {
+    summary?: boolean
+    finish?: string
+    error?: MessageV2.Assistant["error"]
+    agent?: string
+    mode?: string
+  },
 ) {
   const session = yield* SessionNs.Service
   const id = MessageID.ascending()
@@ -97,8 +103,8 @@ const addAssistant = Effect.fn("Test.addAssistant")(function* (
     parentID,
     modelID: ModelID.make("test"),
     providerID: ProviderID.make("test"),
-    mode: "",
-    agent: "default",
+    mode: opts?.mode ?? "",
+    agent: opts?.agent ?? "default",
     path: { cwd: "/", root: "/" },
     cost: 0,
     tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
@@ -749,6 +755,55 @@ describe("MessageV2.filterCompacted", () => {
         const result = MessageV2.filterCompacted(MessageV2.stream(sessionID))
 
         expect(result.map((item) => item.info.id)).toEqual([c1, s1, u2, a2, u3, a3])
+      }),
+    ),
+  )
+
+  it.instance("recognizes legacy fallback compaction summaries", () =>
+    withSession(({ session, sessionID }) =>
+      Effect.gen(function* () {
+        const u1 = yield* addUser(sessionID, "old")
+        const a1 = yield* addAssistant(sessionID, u1, { finish: "end_turn" })
+        yield* session.updatePart({
+          id: PartID.ascending(),
+          sessionID,
+          messageID: a1,
+          type: "text",
+          text: "old reply",
+        })
+
+        const u2 = yield* addUser(sessionID, "recent")
+        const a2 = yield* addAssistant(sessionID, u2, { finish: "end_turn" })
+        yield* session.updatePart({
+          id: PartID.ascending(),
+          sessionID,
+          messageID: a2,
+          type: "text",
+          text: "recent reply",
+        })
+
+        const c1 = yield* addUser(sessionID)
+        yield* addCompactionPart(sessionID, c1, u2)
+        const fallback = yield* addUser(sessionID, "Continue if there is remaining work.")
+        const s1 = yield* addAssistant(sessionID, fallback, {
+          summary: true,
+          finish: "end_turn",
+          agent: "compaction",
+          mode: "compaction",
+        })
+        yield* session.updatePart({
+          id: PartID.ascending(),
+          sessionID,
+          messageID: s1,
+          type: "text",
+          text: "legacy fallback summary",
+        })
+
+        const u3 = yield* addUser(sessionID, "next")
+
+        const result = MessageV2.filterCompacted(MessageV2.stream(sessionID))
+
+        expect(result.map((item) => item.info.id)).toEqual([c1, fallback, s1, u2, a2, u3])
       }),
     ),
   )
