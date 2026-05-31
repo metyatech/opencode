@@ -117,6 +117,10 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
             invalidate(entry)
           }
         },
+        onTerminalBeforeFirstEvent: (event) => {
+          entry.fallback = true
+          log.warn("websocket terminal failure before first event", { key, type: event.type, fallback: "http" })
+        },
         onConnectionInvalid: (error) => {
           log.warn("websocket invalidated", { key, error: error.message })
           entry.busy = false
@@ -191,8 +195,9 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
   return Object.assign(websocketFetch, { close })
 }
 
-function connectionLimitError(event: Record<string, unknown>) {
-  if (event.type !== "error" || !isRecord(event.error) || event.error.code !== CONNECTION_LIMIT_REACHED_CODE) return
+function connectionLimitError(event: Record<string, unknown>): Error | undefined {
+  if (event.type !== "error" || !isRecord(event.error) || event.error.code !== CONNECTION_LIMIT_REACHED_CODE)
+    return undefined
   return new Error(typeof event.error.message === "string" ? event.error.message : CONNECTION_LIMIT_REACHED_CODE)
 }
 
@@ -210,7 +215,14 @@ function describeError(error: unknown) {
     return typeof constructor === "function" && constructor.name.trim() ? constructor.name.trim() : undefined
   })()
 
-  return [name ?? constructorName, type].filter(Boolean).join(": ") || String(error)
+  const json = (() => {
+    try {
+      return JSON.stringify(error)
+    } catch {
+      return undefined
+    }
+  })()
+  return [name ?? constructorName, type].filter(Boolean).join(": ") || json || "Unknown error"
 }
 
 async function socket(

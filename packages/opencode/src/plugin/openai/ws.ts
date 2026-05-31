@@ -3,6 +3,7 @@
 
 import WebSocket from "ws"
 import { ProviderError } from "@/provider/error"
+import { isRecord } from "@/util/record"
 
 export const PROTOCOL_HEADER = "responses_websockets=2026-02-06"
 
@@ -21,6 +22,7 @@ export interface StreamResponsesWebSocketOptions {
   onFirstEvent?: () => void
   onComplete?: (event: Record<string, unknown>) => void
   onTerminal?: (event: Record<string, unknown>) => void
+  onTerminalBeforeFirstEvent?: (event: Record<string, unknown>) => void
   onRetryableTerminal?: (event: Record<string, unknown>) => Promise<WebSocket | undefined>
   onConnectionInvalid?: (error: ProviderError.ResponseStreamError) => void
   onAbort?: (error: Error) => void
@@ -168,7 +170,7 @@ export function streamResponsesWebSocket(options: StreamResponsesWebSocketOption
       return
     }
 
-    const text = data.toString()
+    const text = rawDataText(data)
     const event = (() => {
       try {
         const parsed = JSON.parse(text)
@@ -200,6 +202,12 @@ export function streamResponsesWebSocket(options: StreamResponsesWebSocketOption
         )
         return
       }
+    }
+
+    if (!emitted && isTerminalFailureEvent(event)) {
+      options.onTerminalBeforeFirstEvent?.(event)
+      invalidate(new ProviderError.ResponseStreamError(terminalFailureMessage(event)))
+      return
     }
 
     if (!emitted) options.onFirstEvent?.()
@@ -321,6 +329,43 @@ function closeMessage(message: string, code: number, reason: Buffer) {
   if (code === 1009) details.push("message too big")
   if (reason.length > 0) details.push(reason.toString())
   return `${message} (${details.join(": ")})`
+}
+
+function rawDataText(data: WebSocket.RawData) {
+  if (Buffer.isBuffer(data)) return data.toString()
+  if (Array.isArray(data)) return Buffer.concat(data).toString()
+  return Buffer.from(data).toString()
+}
+
+function isTerminalFailureEvent(event: unknown): event is Record<string, unknown> {
+  return (
+    isRecord(event) &&
+    (event.type === "response.failed" || event.type === "response.incomplete" || event.type === "error")
+  )
+}
+
+function terminalFailureMessage(event: Record<string, unknown>) {
+  const type = typeof event.type === "string" ? event.type : "unknown"
+  const details = terminalFailureDetails(event)
+  return `WebSocket terminal failure before first response event: ${type}${details ? `: ${details}` : ""}`
+}
+
+function terminalFailureDetails(event: Record<string, unknown>): string | undefined {
+  const error = errorDetails(event.error)
+  if (error) return error
+
+  const responseError = isRecord(event.response) ? errorDetails(event.response.error) : undefined
+  if (responseError) return responseError
+
+  return typeof event.message === "string" && event.message.trim() ? event.message.trim() : undefined
+}
+
+function errorDetails(error: unknown): string | undefined {
+  if (!isRecord(error)) return undefined
+
+  const code = typeof error.code === "string" && error.code.trim() ? error.code.trim() : undefined
+  const message = typeof error.message === "string" && error.message.trim() ? error.message.trim() : undefined
+  return [code, message].filter(Boolean).join(": ") || undefined
 }
 
 export * as OpenAIWebSocket from "./ws"

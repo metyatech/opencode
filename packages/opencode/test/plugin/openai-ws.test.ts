@@ -221,12 +221,17 @@ describe("plugin.openai.ws-pool", () => {
     fetch.close()
   })
 
-  test("invalidates but does not reuse a socket after terminal failure frames", async () => {
+  test("falls back to HTTP immediately when terminal failure arrives before first response event", async () => {
     let connections = 0
     await using server = await createWebSocketServer((socket) => {
       connections += 1
       socket.once("message", () => {
-        socket.send(JSON.stringify({ type: connections === 1 ? "response.failed" : "response.completed" }))
+        socket.send(
+          JSON.stringify({
+            type: "response.failed",
+            response: { status: "failed", error: { message: "failed before output" } },
+          }),
+        )
       })
     })
     const fetch = OpenAIWebSocketPool.createWebSocketFetch({
@@ -234,7 +239,36 @@ describe("plugin.openai.ws-pool", () => {
     })
 
     const first = await fetch(server.url, streamRequest())
-    expect(await first.text()).toContain('data: {"type":"response.failed"}')
+    expect(await first.text()).toBe("http")
+
+    const second = await fetch(server.url, streamRequest())
+    expect(await second.text()).toBe("http")
+    expect(connections).toBe(1)
+    expect(server.httpRequests).toHaveLength(2)
+    fetch.close()
+  })
+
+  test("invalidates but does not reuse a socket after partial-output terminal failure frames", async () => {
+    let connections = 0
+    await using server = await createWebSocketServer((socket) => {
+      connections += 1
+      socket.once("message", () => {
+        if (connections === 1) {
+          socket.send(JSON.stringify({ type: "response.output_text.delta", delta: "started" }))
+          socket.send(JSON.stringify({ type: "response.failed" }))
+          return
+        }
+        socket.send(JSON.stringify({ type: "response.completed" }))
+      })
+    })
+    const fetch = OpenAIWebSocketPool.createWebSocketFetch({
+      url: server.url,
+    })
+
+    const first = await fetch(server.url, streamRequest())
+    const firstText = await first.text()
+    expect(firstText).toContain('data: {"type":"response.output_text.delta","delta":"started"}')
+    expect(firstText).toContain('data: {"type":"response.failed"}')
 
     const second = await fetch(server.url, streamRequest())
     expect(await second.text()).toContain('data: {"type":"response.completed"}')
