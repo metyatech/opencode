@@ -87,6 +87,19 @@ function isOrphanedInterruptedTool(part: MessageV2.ToolPart) {
   return part.state.status === "error" && part.state.metadata?.interrupted === true
 }
 
+function requiresToolFollowUp(part: MessageV2.ToolPart) {
+  return !part.metadata?.providerExecuted && !isOrphanedInterruptedTool(part)
+}
+
+function latestStepHasToolFollowUp(parts: MessageV2.Part[]) {
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const part = parts[i]
+    if (part.type === "tool" && requiresToolFollowUp(part)) return true
+    if (part.type === "step-start") return false
+  }
+  return false
+}
+
 const NO_PROGRESS_LOOP_THRESHOLD = 3
 const NO_PROGRESS_LOOP_MESSAGE =
   "Stopped because the last 3 assistant steps repeated the same tool observations under the same request without adding new state or context. Please send a new instruction if you want me to continue another way."
@@ -102,10 +115,14 @@ function sortJsonValue(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(sortJsonValue)
   if (!value || typeof value !== "object") return value
   const record = value as Record<string, unknown>
-  return Object.fromEntries(Object.keys(record).sort().map((key) => [key, sortJsonValue(record[key])]))
+  return Object.fromEntries(
+    Object.keys(record)
+      .sort()
+      .map((key) => [key, sortJsonValue(record[key])]),
+  )
 }
 
-function toolObservation(part: MessageV2.ToolPart): unknown {
+function toolObservation(part: MessageV2.ToolPart): Record<string, unknown> | undefined {
   if (part.state.status === "completed") {
     return {
       tool: part.tool,
@@ -122,36 +139,57 @@ function toolObservation(part: MessageV2.ToolPart): unknown {
       error: part.state.error,
     }
   }
-  return
+  return undefined
 }
 
-function stepObservationFingerprint(msg: MessageV2.WithParts) {
-  const tools = msg.parts.filter((part): part is MessageV2.ToolPart => part.type === "tool")
-  if (tools.length === 0) return
-
-  const finish = msg.parts.findLast((part): part is MessageV2.StepFinishPart => part.type === "step-finish")
-  if (!finish?.snapshot) return
-
+function stepObservationFingerprint(tools: MessageV2.ToolPart[], snapshot: string | undefined): string | undefined {
+  if (tools.length === 0 || !snapshot) return undefined
   const observations = tools.map(toolObservation)
-  if (observations.some((observation) => observation === undefined)) return
+  if (observations.some((observation) => observation === undefined)) return undefined
 
   return stableJson({
-    snapshot: finish.snapshot,
+    snapshot,
     observations,
   })
 }
 
-function detectRepeatedToolObservationLoop(msgs: MessageV2.WithParts[], parentID: MessageID) {
+function stepObservationFingerprints(msg: MessageV2.WithParts) {
+  const fingerprints: string[] = []
+  let tools: MessageV2.ToolPart[] = []
+
+  for (const part of msg.parts) {
+    if (part.type === "step-start") {
+      tools = []
+      continue
+    }
+    if (part.type === "tool") {
+      tools.push(part)
+      continue
+    }
+    if (part.type !== "step-finish") continue
+
+    const fingerprint = stepObservationFingerprint(tools, part.snapshot)
+    if (fingerprint) fingerprints.push(fingerprint)
+    tools = []
+  }
+
+  return fingerprints
+}
+
+function detectRepeatedToolObservationLoop(
+  msgs: MessageV2.WithParts[],
+  parentID: MessageID,
+): { count: number; fingerprint: string } | undefined {
   const recent = msgs
-    .filter((msg) => msg.info.role === "assistant" && msg.info.parentID === parentID && msg.info.finish === "tool-calls")
+    .filter((msg) => msg.info.role === "assistant" && msg.info.parentID === parentID)
     .sort((a, b) => b.info.id.localeCompare(a.info.id))
+    .flatMap((msg) => stepObservationFingerprints(msg).reverse())
     .slice(0, NO_PROGRESS_LOOP_THRESHOLD)
 
-  if (recent.length < NO_PROGRESS_LOOP_THRESHOLD) return
+  if (recent.length < NO_PROGRESS_LOOP_THRESHOLD) return undefined
 
-  const fingerprints = recent.map(stepObservationFingerprint)
-  const first = fingerprints[0]
-  if (!first || !fingerprints.every((fingerprint) => fingerprint === first)) return
+  const first = recent[0]
+  if (!recent.every((fingerprint) => fingerprint === first)) return undefined
 
   return {
     count: recent.length,
@@ -1416,10 +1454,7 @@ export const layer = Layer.effect(
           // Some providers return "stop" even when the assistant message contains
           // tool calls. Keep the loop running so tool results can be sent back to
           // the model, but ignore cleanup-marked interrupted orphans.
-          const hasToolCalls =
-            lastAssistantMsg?.parts.some(
-              (part) => part.type === "tool" && !part.metadata?.providerExecuted && !isOrphanedInterruptedTool(part),
-            ) ?? false
+          const hasToolCalls = lastAssistantMsg ? latestStepHasToolFollowUp(lastAssistantMsg.parts) : false
 
           if (
             lastAssistant?.finish &&
@@ -1520,27 +1555,44 @@ export const layer = Layer.effect(
             yield* slog.warn("stopping no-progress tool loop", noProgressLoop)
             break
           }
-          msgs = yield* SessionReminders.apply({ messages: msgs, agent, session }).pipe(
-            Effect.provideService(RuntimeFlags.Service, flags),
-            Effect.provideService(AppFileSystem.Service, fsys),
-            Effect.provideService(Session.Service, sessions),
-          )
 
-          const msg: MessageV2.Assistant = {
-            id: MessageID.ascending(),
-            parentID: lastUser.id,
-            role: "assistant",
-            mode: agent.name,
-            agent: agent.name,
-            variant: lastUser.model.variant,
-            path: { cwd: ctx.directory, root: ctx.worktree },
-            cost: 0,
-            tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
-            modelID: model.id,
-            providerID: model.providerID,
-            time: { created: Date.now() },
-            sessionID,
+          const followUpAssistant =
+            lastAssistantMsg?.info.role === "assistant" &&
+            lastAssistantMsg.info.parentID === lastUser.id &&
+            lastAssistantMsg.info.finish === "tool-calls" &&
+            !lastAssistantMsg.info.error
+              ? lastAssistantMsg.info
+              : undefined
+
+          if (!followUpAssistant) {
+            msgs = yield* SessionReminders.apply({ messages: msgs, agent, session }).pipe(
+              Effect.provideService(RuntimeFlags.Service, flags),
+              Effect.provideService(AppFileSystem.Service, fsys),
+              Effect.provideService(Session.Service, sessions),
+            )
           }
+
+          const msg: MessageV2.Assistant = followUpAssistant
+            ? {
+                ...followUpAssistant,
+                time: { created: followUpAssistant.time.created },
+              }
+            : {
+                id: MessageID.ascending(),
+                parentID: lastUser.id,
+                role: "assistant",
+                mode: agent.name,
+                agent: agent.name,
+                variant: lastUser.model.variant,
+                path: { cwd: ctx.directory, root: ctx.worktree },
+                cost: 0,
+                tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+                modelID: model.id,
+                providerID: model.providerID,
+                time: { created: Date.now() },
+                sessionID,
+              }
+          if (followUpAssistant) delete msg.finish
           yield* sessions.updateMessage(msg)
 
           const finalizeInterruptedAssistant = Effect.gen(function* () {
@@ -1668,8 +1720,18 @@ export const layer = Layer.effect(
                 auto: true,
                 overflow: !handle.message.finish,
               })
+              return "continue" as const
             }
-            return "continue" as const
+            const responseHasToolFollowUp = latestStepHasToolFollowUp(MessageV2.parts(handle.message.id))
+            const latestAfterSampling = MessageV2.latest(yield* MessageV2.filterCompactedEffect(sessionID))
+            const hasPendingInput =
+              latestAfterSampling.user !== undefined && latestAfterSampling.user.id > handle.message.id
+            const needsFollowUp =
+              !handle.message.finish ||
+              handle.message.finish === "tool-calls" ||
+              responseHasToolFollowUp ||
+              hasPendingInput
+            return needsFollowUp ? ("continue" as const) : ("break" as const)
           }).pipe(
             Effect.ensuring(instruction.clear(handle.message.id)),
             Effect.onInterrupt(() => finalizeInterruptedAssistant),

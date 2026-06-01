@@ -724,6 +724,14 @@ it.instance("loop continues when finish is tool-calls", () =>
       expect(result.parts.some((part) => part.type === "text" && part.text === "second")).toBe(true)
       expect(result.info.finish).toBe("stop")
     }
+    const messages = yield* sessions.messages({ sessionID: session.id })
+    const assistants = messages.filter((msg) => msg.info.role === "assistant")
+    expect(assistants).toHaveLength(1)
+    expect(assistants[0].parts.filter((part) => part.type === "step-finish")).toHaveLength(2)
+
+    const repeated = yield* prompt.loop({ sessionID: session.id })
+    expect(yield* llm.calls).toBe(2)
+    expect(repeated.info.id).toBe(result.info.id)
   }),
 )
 
@@ -751,8 +759,83 @@ noLLMServer.instance(
       expect(
         result.parts.some(
           (part) =>
-            part.type === "text" &&
-            part.text.includes("repeated the same tool observations under the same request"),
+            part.type === "text" && part.text.includes("repeated the same tool observations under the same request"),
+        ),
+      ).toBe(true)
+    }),
+  { config: cfg },
+)
+
+noLLMServer.instance(
+  "loop stops repeated identical tool observations in one assistant turn",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({ title: "No progress guard single turn" })
+      const msg = yield* user(session.id, "continue")
+      const now = Date.now()
+      const assistant = yield* sessions.updateMessage({
+        id: MessageID.ascending(),
+        role: "assistant",
+        parentID: msg.id,
+        sessionID: session.id,
+        mode: "build",
+        agent: "build",
+        cost: 0,
+        path: { cwd: "/tmp", root: "/tmp" },
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        modelID: ref.modelID,
+        providerID: ref.providerID,
+        time: { created: now, completed: now },
+        finish: "tool-calls",
+      } satisfies MessageV2.Assistant)
+
+      for (let index = 0; index < 3; index++) {
+        yield* sessions.updatePart({
+          id: PartID.ascending(),
+          messageID: assistant.id,
+          sessionID: session.id,
+          type: "step-start",
+          snapshot: "snapshot-no-progress",
+        })
+        yield* sessions.updatePart({
+          id: PartID.ascending(),
+          messageID: assistant.id,
+          sessionID: session.id,
+          type: "tool",
+          callID: `call-${index}`,
+          tool: "workspace_probe",
+          state: {
+            status: "completed",
+            input: { query: "state" },
+            output: "",
+            title: "workspace_probe",
+            metadata: {},
+            time: { start: now, end: now },
+          },
+        })
+        yield* sessions.updatePart({
+          id: PartID.ascending(),
+          messageID: assistant.id,
+          sessionID: session.id,
+          type: "step-finish",
+          reason: "tool-calls",
+          snapshot: "snapshot-no-progress",
+          cost: 0,
+          tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        })
+      }
+
+      const result = yield* prompt.loop({ sessionID: session.id })
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role === "assistant") {
+        expect(result.info.finish).toBe("stop")
+      }
+      expect(
+        result.parts.some(
+          (part) =>
+            part.type === "text" && part.text.includes("repeated the same tool observations under the same request"),
         ),
       ).toBe(true)
     }),

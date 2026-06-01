@@ -34,6 +34,23 @@ const log = Log.create({ service: "session.processor" })
 
 export type Result = "compact" | "stop" | "continue"
 
+function addTokens(
+  current: MessageV2.Assistant["tokens"],
+  next: MessageV2.Assistant["tokens"],
+): MessageV2.Assistant["tokens"] {
+  return {
+    total:
+      current.total === undefined && next.total === undefined ? undefined : (current.total ?? 0) + (next.total ?? 0),
+    input: current.input + next.input,
+    output: current.output + next.output,
+    reasoning: current.reasoning + next.reasoning,
+    cache: {
+      read: current.cache.read + next.cache.read,
+      write: current.cache.write + next.cache.write,
+    },
+  }
+}
+
 export interface Handle {
   readonly message: MessageV2.Assistant
   readonly updateToolCall: (
@@ -575,7 +592,7 @@ export const layer = Layer.effect(
             }
             ctx.assistantMessage.finish = value.reason
             ctx.assistantMessage.cost += usage.cost
-            ctx.assistantMessage.tokens = usage.tokens
+            ctx.assistantMessage.tokens = addTokens(ctx.assistantMessage.tokens, usage.tokens)
             yield* session.updatePart({
               id: PartID.ascending(),
               reason: value.reason,
