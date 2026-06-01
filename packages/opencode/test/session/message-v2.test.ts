@@ -243,6 +243,32 @@ describe("session.message-v2.toModelMessage", () => {
     ])
   })
 
+  test("converts compaction continuation markers as system messages", async () => {
+    const messageID = "m-user"
+
+    const input: MessageV2.WithParts[] = [
+      {
+        info: userInfo(messageID),
+        parts: [
+          {
+            ...basePart(messageID, "p1"),
+            type: "text",
+            text: "Continue if you have next steps.",
+            synthetic: true,
+            metadata: { compaction_continue: true },
+          },
+        ] as MessageV2.Part[],
+      },
+    ]
+
+    const result = await MessageV2.toModelMessages(input, model)
+
+    expect(result).toHaveLength(1)
+    expect(result[0]?.role).toBe("system")
+    expect(JSON.stringify(result[0])).toContain("not a new user request")
+    expect(JSON.stringify(result[0])).not.toContain("Continue if you have next steps.")
+  })
+
   test("converts user text/file parts and injects compaction/subtask prompts", async () => {
     const messageID = "m-user"
 

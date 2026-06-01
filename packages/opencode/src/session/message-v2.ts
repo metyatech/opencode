@@ -716,11 +716,24 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
         parts: [],
       }
       for (const part of msg.parts) {
+        if (isCompactionContinuationPart(part)) {
+          result.push({
+            id: msg.info.id,
+            role: "system",
+            parts: [
+              {
+                type: "text",
+                text: INTERNAL_COMPACTION_CONTINUATION_PROMPT,
+              },
+            ],
+          })
+          continue
+        }
         // User message parts should never be empty
         if (part.type === "text" && !part.ignored && part.text !== "")
           userMessage.parts.push({
             type: "text",
-            text: isCompactionContinuationPart(part) ? INTERNAL_COMPACTION_CONTINUATION_PROMPT : part.text,
+            text: part.text,
           })
         // text/plain and directory files are converted into text parts, ignore them
         if (part.type === "file" && part.mime !== "text/plain" && part.mime !== "application/x-directory") {
