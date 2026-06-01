@@ -880,11 +880,16 @@ it.instance("compaction continuation is sent to the model as internal resume sta
     const prompt = yield* SessionPrompt.Service
     const sessions = yield* Session.Service
     const session = yield* sessions.create({ title: "Compaction continuation" })
-    yield* compactionContinueUser(session.id)
+    const seeded = yield* seed(session.id, { finish: "stop" })
+    const continuation = yield* compactionContinueUser(session.id)
     yield* llm.text("continued")
 
     const result = yield* prompt.loop({ sessionID: session.id })
     expect(result.info.role).toBe("assistant")
+    if (result.info.role === "assistant") {
+      expect(result.info.parentID).toBe(seeded.user.id)
+      expect(result.info.parentID).not.toBe(continuation.id)
+    }
     expect(result.parts.some((part) => part.type === "text" && part.text === "continued")).toBe(true)
 
     const inputs = yield* llm.inputs

@@ -1649,8 +1649,16 @@ describe("session.message-v2.latest", () => {
 
     expect(state.finished?.id).toBe(SUMMARY_ASSISTANT)
     expect(state.finished?.summary).toBe(true)
-    expect(state.user?.id).toBe(CONTINUE_USER)
+    expect(state.user?.id).toBe(TAIL_USER)
+    expect(state.internalContinuation?.id).toBe(CONTINUE_USER)
     expect(state.tasks).toEqual([])
+  })
+
+  test("uses a synthetic continuation as user only when no real user exists", () => {
+    const state = MessageV2.latest([continueUser])
+
+    expect(state.user?.id).toBe(CONTINUE_USER)
+    expect(state.internalContinuation?.id).toBe(CONTINUE_USER)
   })
 
   test("a fresh compaction-user newer than the latest summary surfaces in tasks", () => {
@@ -1676,6 +1684,7 @@ describe("session.message-v2.latest", () => {
 
     expect(state.finished?.id).toBe(SUMMARY_ASSISTANT)
     expect(state.user?.id).toBe(NEW_COMPACTION_USER)
+    expect(state.internalContinuation?.id).toBe(CONTINUE_USER)
     expect(state.tasks).toHaveLength(1)
     expect(state.tasks[0]).toMatchObject({ type: "compaction", auto: true })
   })

@@ -1113,23 +1113,38 @@ export const filterCompactedEffect = Effect.fnUntraced(function* (sessionID: Ses
 // is monotonic via MessageID.ascending) so a pre-compaction overflowing tail
 // assistant doesn't get mistaken for the most recent turn. tasks are
 // compaction/subtask parts attached to user messages newer than the latest
-// finished assistant — i.e. unprocessed work.
+// finished assistant - i.e. unprocessed work.
+function isTaskOnlyMessage(msg: WithParts) {
+  return msg.parts.length > 0 && msg.parts.every((p) => p.type === "compaction" || p.type === "subtask")
+}
+
 export function latest(msgs: WithParts[]) {
-  let user: User | undefined
   let assistant: Assistant | undefined
   let finished: Assistant | undefined
+  let internalContinuation: User | undefined
   for (const msg of msgs) {
     const info = msg.info
-    if (info.role === "user" && (!user || info.id > user.id)) user = info
+    if (info.role === "user" && isCompactionContinuationMessage(msg)) {
+      if (!internalContinuation || info.id > internalContinuation.id) internalContinuation = info
+    }
     if (info.role === "assistant" && (!assistant || info.id > assistant.id)) assistant = info
     if (info.role === "assistant" && info.finish && (!finished || info.id > finished.id)) finished = info
   }
+  let user: User | undefined
+  for (const msg of msgs) {
+    const info = msg.info
+    if (info.role !== "user") continue
+    if (isCompactionContinuationMessage(msg)) continue
+    if (finished && info.id <= finished.id && isTaskOnlyMessage(msg)) continue
+    if (!user || info.id > user.id) user = info
+  }
+  user ??= internalContinuation
   const tasks = msgs.flatMap((m) =>
     finished && m.info.id <= finished.id
       ? []
       : m.parts.filter((p): p is CompactionPart | SubtaskPart => p.type === "compaction" || p.type === "subtask"),
   )
-  return { user, assistant, finished, tasks }
+  return { user, assistant, finished, tasks, internalContinuation }
 }
 
 export function fromError(

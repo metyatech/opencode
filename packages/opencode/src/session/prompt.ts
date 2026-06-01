@@ -1444,9 +1444,19 @@ export const layer = Layer.effect(
 
           let msgs = yield* MessageV2.filterCompactedEffect(sessionID)
 
-          const { user: lastUser, assistant: lastAssistant, finished: lastFinished, tasks } = MessageV2.latest(msgs)
+          const {
+            user: lastUser,
+            assistant: lastAssistant,
+            finished: lastFinished,
+            tasks,
+            internalContinuation,
+          } = MessageV2.latest(msgs)
 
           if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
+          const pendingInternalContinuation =
+            internalContinuation !== undefined &&
+            (!lastAssistant || internalContinuation.id > lastAssistant.id) &&
+            internalContinuation.id >= lastUser.id
 
           const lastAssistantMsg = msgs.findLast(
             (msg) => msg.info.role === "assistant" && msg.info.id === lastAssistant?.id,
@@ -1460,7 +1470,8 @@ export const layer = Layer.effect(
             lastAssistant?.finish &&
             !["tool-calls"].includes(lastAssistant.finish) &&
             !hasToolCalls &&
-            lastUser.id < lastAssistant.id
+            lastUser.id < lastAssistant.id &&
+            !pendingInternalContinuation
           ) {
             const orphan = lastAssistantMsg?.parts.find(
               (part): part is MessageV2.ToolPart => part.type === "tool" && isOrphanedInterruptedTool(part),
@@ -1614,7 +1625,7 @@ export const layer = Layer.effect(
             .pipe(Effect.onInterrupt(() => finalizeInterruptedAssistant))
 
           const outcome: "break" | "continue" = yield* Effect.gen(function* () {
-            const lastUserMsg = msgs.findLast((m) => m.info.role === "user")
+            const lastUserMsg = msgs.find((m) => m.info.id === lastUser.id)
             const bypassAgentCheck = lastUserMsg?.parts.some((p) => p.type === "agent") ?? false
             const promptOps = yield* ops()
 
@@ -1673,8 +1684,7 @@ export const layer = Layer.effect(
               MessageV2.toModelMessagesEffect(msgs, model),
             ])
             const system = [...env, ...instructions, ...(skills ? [skills] : [])]
-            const latestUserMsg = msgs.findLast((m) => m.info.role === "user")
-            if (latestUserMsg && MessageV2.isCompactionContinuationMessage(latestUserMsg)) {
+            if (pendingInternalContinuation) {
               system.push(INTERNAL_CONTINUATION_SYSTEM_PROMPT)
             }
             const format = lastUser.format ?? { type: "text" as const }
@@ -1725,7 +1735,9 @@ export const layer = Layer.effect(
             const responseHasToolFollowUp = latestStepHasToolFollowUp(MessageV2.parts(handle.message.id))
             const latestAfterSampling = MessageV2.latest(yield* MessageV2.filterCompactedEffect(sessionID))
             const hasPendingInput =
-              latestAfterSampling.user !== undefined && latestAfterSampling.user.id > handle.message.id
+              (latestAfterSampling.user !== undefined && latestAfterSampling.user.id > handle.message.id) ||
+              (latestAfterSampling.internalContinuation !== undefined &&
+                latestAfterSampling.internalContinuation.id > handle.message.id)
             const needsFollowUp =
               !handle.message.finish ||
               handle.message.finish === "tool-calls" ||
