@@ -717,15 +717,9 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
       }
       for (const part of msg.parts) {
         if (isCompactionContinuationPart(part)) {
-          result.push({
-            id: msg.info.id,
-            role: "system",
-            parts: [
-              {
-                type: "text",
-                text: INTERNAL_COMPACTION_CONTINUATION_PROMPT,
-              },
-            ],
+          userMessage.parts.push({
+            type: "text",
+            text: INTERNAL_COMPACTION_CONTINUATION_PROMPT,
           })
           continue
         }

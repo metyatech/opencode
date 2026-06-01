@@ -243,7 +243,7 @@ describe("session.message-v2.toModelMessage", () => {
     ])
   })
 
-  test("converts compaction continuation markers as system messages", async () => {
+  test("converts compaction continuation markers as internal user continuation messages", async () => {
     const messageID = "m-user"
 
     const input: MessageV2.WithParts[] = [
@@ -264,9 +264,55 @@ describe("session.message-v2.toModelMessage", () => {
     const result = await MessageV2.toModelMessages(input, model)
 
     expect(result).toHaveLength(1)
-    expect(result[0]?.role).toBe("system")
+    expect(result[0]?.role).toBe("user")
     expect(JSON.stringify(result[0])).toContain("not a new user request")
     expect(JSON.stringify(result[0])).not.toContain("Continue if you have next steps.")
+  })
+
+  test("does not emit mid-conversation system messages for compaction continuations", async () => {
+    const userID = "m-user"
+    const assistantID = "m-assistant"
+    const continuationID = "m-continuation"
+
+    const input: MessageV2.WithParts[] = [
+      {
+        info: userInfo(userID),
+        parts: [
+          {
+            ...basePart(userID, "u1"),
+            type: "text",
+            text: "original task",
+          },
+        ] as MessageV2.Part[],
+      },
+      {
+        info: assistantInfo(assistantID, userID),
+        parts: [
+          {
+            ...basePart(assistantID, "a1"),
+            type: "text",
+            text: "progress",
+          },
+        ] as MessageV2.Part[],
+      },
+      {
+        info: userInfo(continuationID),
+        parts: [
+          {
+            ...basePart(continuationID, "c1"),
+            type: "text",
+            text: "Continue if you have next steps.",
+            synthetic: true,
+            metadata: { compaction_continue: true },
+          },
+        ] as MessageV2.Part[],
+      },
+    ]
+
+    const result = await MessageV2.toModelMessages(input, model)
+
+    expect(result.map((item) => item.role)).toStrictEqual(["user", "assistant", "user"])
+    expect(JSON.stringify(result[2])).toContain("not a new user request")
   })
 
   test("converts user text/file parts and injects compaction/subtask prompts", async () => {
