@@ -1008,6 +1008,72 @@ it.instance("compaction fallback continuation runs on the fallback model after a
   }),
 )
 
+it.instance("fallback tool-call follow-up keeps the fallback assistant model", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerWithFallbackCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({
+      title: "Fallback tool follow-up",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    const original = yield* user(session.id, "continue the current work")
+    const now = Date.now()
+    const assistant = yield* sessions.updateMessage({
+      id: MessageID.ascending(),
+      role: "assistant",
+      parentID: original.id,
+      sessionID: session.id,
+      mode: "build",
+      agent: "build",
+      variant: "high",
+      cost: 0,
+      path: { cwd: "/tmp", root: "/tmp" },
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      modelID: ModelID.make("fallback-model"),
+      providerID: ref.providerID,
+      time: { created: now, completed: now },
+      finish: "tool-calls",
+    } satisfies MessageV2.Assistant)
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: assistant.id,
+      sessionID: session.id,
+      type: "tool",
+      callID: "call-fallback-follow-up",
+      tool: "bash",
+      state: {
+        status: "completed",
+        input: { command: "echo ok" },
+        output: "ok",
+        title: "bash",
+        metadata: {},
+        time: { start: now, end: now },
+      },
+    } satisfies MessageV2.ToolPart)
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: assistant.id,
+      sessionID: session.id,
+      type: "step-finish",
+      reason: "tool-calls",
+      snapshot: "snapshot-fallback-tool-follow-up",
+      cost: 0,
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+    } satisfies MessageV2.StepFinishPart)
+    yield* llm.textMatch((hit) => hit.body.model === "fallback-model", "fallback follow-up")
+
+    const result = yield* prompt.loop({ sessionID: session.id })
+
+    expect(result.info.role).toBe("assistant")
+    if (result.info.role === "assistant") {
+      expect(result.info.modelID).toBe(ModelID.make("fallback-model"))
+    }
+    expect(result.parts.some((part) => part.type === "text" && part.text === "fallback follow-up")).toBe(true)
+    expect((yield* llm.inputs).at(-1)?.model).toBe("fallback-model")
+  }),
+)
+
 it.instance("glob tool keeps instance context during prompt runs", () =>
   Effect.gen(function* () {
     const { dir, llm } = yield* useServerConfig(providerCfg)

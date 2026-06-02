@@ -1462,6 +1462,20 @@ export const layer = Layer.effect(
           const lastAssistantMsg = msgs.findLast(
             (msg) => msg.info.role === "assistant" && msg.info.id === lastAssistant?.id,
           )
+          const followUpAssistant =
+            lastAssistantMsg?.info.role === "assistant" &&
+            lastAssistantMsg.info.parentID === lastUser.id &&
+            lastAssistantMsg.info.finish === "tool-calls" &&
+            !lastAssistantMsg.info.error
+              ? lastAssistantMsg.info
+              : undefined
+          const executionModel = followUpAssistant
+            ? {
+                providerID: followUpAssistant.providerID,
+                modelID: followUpAssistant.modelID,
+                ...(followUpAssistant.variant ? { variant: followUpAssistant.variant } : {}),
+              }
+            : executionUser.model
           // Some providers return "stop" even when the assistant message contains
           // tool calls. Keep the loop running so tool results can be sent back to
           // the model, but ignore cleanup-marked interrupted orphans.
@@ -1494,12 +1508,12 @@ export const layer = Layer.effect(
           if (step === 1)
             yield* title({
               session,
-              modelID: executionUser.model.modelID,
-              providerID: executionUser.model.providerID,
+              modelID: executionModel.modelID,
+              providerID: executionModel.providerID,
               history: msgs,
             }).pipe(Effect.ignore, Effect.forkIn(scope))
 
-          const model = yield* getModel(executionUser.model.providerID, executionUser.model.modelID, sessionID)
+          const model = yield* getModel(executionModel.providerID, executionModel.modelID, sessionID)
           const task = tasks.pop()
 
           if (task?.type === "subtask") {
@@ -1524,7 +1538,7 @@ export const layer = Layer.effect(
             lastFinished.summary !== true &&
             (yield* compaction.isOverflow({ tokens: lastFinished.tokens, model }))
           ) {
-            yield* compaction.create({ sessionID, agent: executionUser.agent, model: executionUser.model, auto: true })
+            yield* compaction.create({ sessionID, agent: executionUser.agent, model: executionModel, auto: true })
             continue
           }
 
@@ -1547,7 +1561,7 @@ export const layer = Layer.effect(
               role: "assistant",
               mode: agent.name,
               agent: agent.name,
-              variant: executionUser.model.variant,
+              variant: executionModel.variant,
               path: { cwd: ctx.directory, root: ctx.worktree },
               cost: 0,
               tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
@@ -1570,14 +1584,6 @@ export const layer = Layer.effect(
             break
           }
 
-          const followUpAssistant =
-            lastAssistantMsg?.info.role === "assistant" &&
-            lastAssistantMsg.info.parentID === lastUser.id &&
-            lastAssistantMsg.info.finish === "tool-calls" &&
-            !lastAssistantMsg.info.error
-              ? lastAssistantMsg.info
-              : undefined
-
           if (!followUpAssistant) {
             msgs = yield* SessionReminders.apply({ messages: msgs, agent, session }).pipe(
               Effect.provideService(RuntimeFlags.Service, flags),
@@ -1597,7 +1603,7 @@ export const layer = Layer.effect(
                 role: "assistant",
                 mode: agent.name,
                 agent: agent.name,
-                variant: executionUser.model.variant,
+                variant: executionModel.variant,
                 path: { cwd: ctx.directory, root: ctx.worktree },
                 cost: 0,
                 tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
@@ -1729,7 +1735,7 @@ export const layer = Layer.effect(
               yield* compaction.create({
                 sessionID,
                 agent: executionUser.agent,
-                model: executionUser.model,
+                model: executionModel,
                 auto: true,
                 overflow: !handle.message.finish,
               })
