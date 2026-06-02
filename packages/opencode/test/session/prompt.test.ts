@@ -2438,6 +2438,55 @@ it.instance(
   3_000,
 )
 
+it.instance(
+  "records retryable API errors when prompt is cancelled during retry backoff",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const status = yield* SessionStatus.Service
+      const session = yield* sessions.create({ title: "Prompt retry cancel regression" })
+
+      yield* llm.error(503, {
+        error: {
+          code: "MODEL_CAPACITY_EXHAUSTED",
+          message: "No capacity available for model test-model on the server",
+          status: "RESOURCE_EXHAUSTED",
+        },
+      })
+
+      const fiber = yield* prompt
+        .prompt({
+          sessionID: session.id,
+          agent: "build",
+          parts: [{ type: "text", text: "Retry me" }],
+        })
+        .pipe(Effect.forkChild)
+
+      yield* llm.wait(1)
+      yield* pollWithTimeout(
+        status.get(session.id).pipe(Effect.map((info) => (info.type === "retry" ? info : undefined))),
+        "session did not enter retry backoff",
+      )
+      yield* prompt.cancel(session.id)
+
+      const exit = yield* Fiber.await(fiber)
+      expect(Exit.isSuccess(exit)).toBe(true)
+
+      const msgs = yield* sessions.messages({ sessionID: session.id })
+      const last = msgs.findLast((msg) => msg.info.role === "assistant")
+      expect(last?.info.role).toBe("assistant")
+      if (last?.info.role === "assistant") {
+        expect(MessageV2.APIError.isInstance(last.info.error)).toBe(true)
+        if (MessageV2.APIError.isInstance(last.info.error)) {
+          expect(last.info.error.data.message).toContain("No capacity available")
+        }
+      }
+    }),
+  10_000,
+)
+
 // Agent variant
 
 noLLMServer.instance(

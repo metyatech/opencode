@@ -144,6 +144,7 @@ export const layer = Layer.effect(
           providerID: input.model.providerID,
           aborted,
         })
+      let retryError: ReturnType<typeof parse> | undefined
 
       const settleToolCall = Effect.fn("SessionProcessor.settleToolCall")(function* (toolCallID: string) {
         const done = ctx.toolcalls[toolCallID]?.done
@@ -765,9 +766,13 @@ export const layer = Layer.effect(
         yield* session.updateMessage(ctx.assistantMessage)
       })
 
-      const halt = Effect.fn("SessionProcessor.halt")(function* (e: unknown) {
-        slog.error("process", { error: errorMessage(e), stack: e instanceof Error ? e.stack : undefined })
-        const error = parse(e)
+      const errorText = (error: ReturnType<typeof parse>, fallback: unknown) =>
+        isRecord(error.data) && typeof error.data.message === "string" ? error.data.message : errorMessage(fallback)
+
+      const haltParsed = Effect.fn("SessionProcessor.haltParsed")(function* (
+        error: ReturnType<typeof parse>,
+        e: unknown,
+      ) {
         if (MessageV2.ContextOverflowError.isInstance(error)) {
           ctx.needsCompaction = true
           if (!ctx.assistantMessage.summary)
@@ -781,7 +786,7 @@ export const layer = Layer.effect(
               sessionID: ctx.sessionID,
               error: {
                 type: "unknown",
-                message: errorMessage(e),
+                message: errorText(error, e),
               },
               timestamp: DateTime.makeUnsafe(Date.now()),
             })
@@ -797,15 +802,33 @@ export const layer = Layer.effect(
         yield* status.set(ctx.sessionID, { type: "idle" })
       })
 
+      const halt = Effect.fn("SessionProcessor.halt")(function* (e: unknown) {
+        slog.error("process", { error: errorMessage(e), stack: e instanceof Error ? e.stack : undefined })
+        yield* haltParsed(parse(e), e)
+      })
+
+      const interrupt = Effect.fn("SessionProcessor.interrupt")(function* () {
+        aborted = true
+        if (ctx.assistantMessage.error) return
+        if (retryError) {
+          slog.error("process", { error: errorText(retryError, retryError) })
+          ctx.assistantMessage.error = retryError
+          return
+        }
+        yield* halt(new DOMException("Aborted", "AbortError"))
+      })
+
       const process = Effect.fn("SessionProcessor.process")(function* (streamInput: LLM.StreamInput) {
         slog.info("process")
         ctx.needsCompaction = false
         ctx.shouldBreak = (yield* config.get()).experimental?.continue_loop_on_deny !== true
+        retryError = undefined
 
         return yield* Effect.gen(function* () {
           yield* Effect.gen(function* () {
             ctx.currentText = undefined
             ctx.reasoningMap = {}
+            retryError = undefined
             yield* status.set(ctx.sessionID, { type: "busy" })
             const stream = llm.stream(streamInput)
 
@@ -815,14 +838,7 @@ export const layer = Layer.effect(
               Stream.runDrain,
             )
           }).pipe(
-            Effect.onInterrupt(() =>
-              Effect.gen(function* () {
-                aborted = true
-                if (!ctx.assistantMessage.error) {
-                  yield* halt(new DOMException("Aborted", "AbortError"))
-                }
-              }),
-            ),
+            Effect.onInterrupt(interrupt),
             Effect.catchCauseIf(
               (cause) => !Cause.hasInterruptsOnly(cause),
               (cause) => Effect.fail(Cause.squash(cause)),
@@ -832,6 +848,7 @@ export const layer = Layer.effect(
                 provider: input.model.providerID,
                 parse,
                 set: (info) => {
+                  retryError = info.error
                   // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
                   const event = flags.experimentalEventSystem
                     ? events.publish(SessionEvent.Retried, {
@@ -858,6 +875,7 @@ export const layer = Layer.effect(
                 },
               }),
             ),
+            Effect.onInterrupt(interrupt),
             Effect.catch(halt),
             Effect.ensuring(cleanup()),
           )

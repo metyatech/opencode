@@ -196,10 +196,16 @@ function parseJSON(value: unknown) {
   })
 }
 
-export function policy(opts: {
+export function policy<E extends Err>(opts: {
   provider: string
-  parse: (error: unknown) => Err
-  set: (input: { attempt: number; message: string; action?: Retryable["action"]; next: number }) => Effect.Effect<void>
+  parse: (error: unknown) => E
+  set: (input: {
+    attempt: number
+    error: E
+    message: string
+    action?: Retryable["action"]
+    next: number
+  }) => Effect.Effect<void>
 }) {
   return Schedule.fromStepWithMetadata(
     Effect.succeed((meta: Schedule.InputMetadata<unknown>) => {
@@ -211,6 +217,7 @@ export function policy(opts: {
         const now = yield* Clock.currentTimeMillis
         yield* opts.set({
           attempt: meta.attempt,
+          error,
           message: retry.message,
           action: retry.action,
           next: now + wait,
