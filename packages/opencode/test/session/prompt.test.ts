@@ -294,6 +294,27 @@ function providerCfg(url: string) {
   }
 }
 
+function providerWithFallbackCfg(url: string) {
+  const base = providerCfg(url)
+  return {
+    ...base,
+    provider: {
+      ...base.provider,
+      test: {
+        ...base.provider.test,
+        models: {
+          ...base.provider.test.models,
+          "fallback-model": {
+            ...base.provider.test.models["test-model"],
+            id: "fallback-model",
+            name: "Fallback Model",
+          },
+        },
+      },
+    },
+  }
+}
+
 const writeText = Effect.fn("test.writeText")(function* (file: string, text: string) {
   const fs = yield* AppFileSystem.Service
   yield* fs.writeWithDirs(file, text)
@@ -385,14 +406,17 @@ const user = Effect.fn("test.user")(function* (sessionID: SessionID, text: strin
   return msg
 })
 
-const compactionContinueUser = Effect.fn("test.compactionContinueUser")(function* (sessionID: SessionID) {
+const compactionContinueUser = Effect.fn("test.compactionContinueUser")(function* (
+  sessionID: SessionID,
+  model: MessageV2.User["model"] = ref,
+) {
   const session = yield* Session.Service
   const msg = yield* session.updateMessage({
     id: MessageID.ascending(),
     role: "user",
     sessionID,
     agent: "build",
-    model: ref,
+    model,
     time: { created: Date.now() },
     summary: { title: "Retained task", body: "Continue the retained task.", diffs: [] },
   })
@@ -406,6 +430,53 @@ const compactionContinueUser = Effect.fn("test.compactionContinueUser")(function
     metadata: { compaction_continue: true },
   })
   return msg
+})
+
+const compactionMarker = Effect.fn("test.compactionMarker")(function* (sessionID: SessionID) {
+  const session = yield* Session.Service
+  const msg = yield* session.updateMessage({
+    id: MessageID.ascending(),
+    role: "user",
+    sessionID,
+    agent: "build",
+    model: ref,
+    time: { created: Date.now() },
+  })
+  yield* session.updatePart({
+    id: PartID.ascending(),
+    messageID: msg.id,
+    sessionID,
+    type: "compaction",
+    auto: true,
+  })
+  return msg
+})
+
+const erroredCompactionAssistant = Effect.fn("test.erroredCompactionAssistant")(function* (
+  sessionID: SessionID,
+  parentID: MessageID,
+) {
+  const session = yield* Session.Service
+  return yield* session.updateMessage({
+    id: MessageID.ascending(),
+    role: "assistant",
+    parentID,
+    sessionID,
+    mode: "compaction",
+    agent: "compaction",
+    cost: 0,
+    path: { cwd: "/tmp", root: "/tmp" },
+    tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+    modelID: ref.modelID,
+    providerID: ref.providerID,
+    time: { created: Date.now(), completed: Date.now() },
+    summary: true,
+    error: new MessageV2.APIError({
+      message: "Too Many Requests: quota exceeded",
+      statusCode: 429,
+      isRetryable: true,
+    }).toObject(),
+  })
 })
 
 const seed = Effect.fn("test.seed")(function* (sessionID: SessionID, opts?: { finish?: string }) {
@@ -898,6 +969,42 @@ it.instance("compaction continuation is sent to the model as internal resume sta
     expect(latestInput).toContain("not a new user request")
     expect(latestInput).toContain("do not restart request-intake")
     expect(latestInput).not.toContain("Continue if you have next steps.")
+  }),
+)
+
+it.instance("compaction fallback continuation runs on the fallback model after a summary error", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerWithFallbackCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({ title: "Pinned" })
+    const original = yield* user(session.id, "finish the current work")
+    const compaction = yield* compactionMarker(session.id)
+    yield* erroredCompactionAssistant(session.id, compaction.id)
+    const continuation = yield* compactionContinueUser(session.id, {
+      providerID: ref.providerID,
+      modelID: ModelID.make("fallback-model"),
+      variant: "high",
+    })
+    yield* llm.text("resumed on fallback")
+
+    const result = yield* prompt.loop({ sessionID: session.id })
+
+    expect(result.info.role).toBe("assistant")
+    if (result.info.role === "assistant") {
+      expect(result.info.parentID).toBe(original.id)
+      expect(result.info.parentID).not.toBe(compaction.id)
+      expect(result.info.parentID).not.toBe(continuation.id)
+      expect(result.info.providerID).toBe(ref.providerID)
+      expect(result.info.modelID).toBe(ModelID.make("fallback-model"))
+      expect(result.info.variant).toBe("high")
+    }
+    expect(result.parts.some((part) => part.type === "text" && part.text === "resumed on fallback")).toBe(true)
+
+    const inputs = yield* llm.inputs
+    expect(inputs.at(-1)?.model).toBe("fallback-model")
+    const messages = yield* sessions.messages({ sessionID: session.id })
+    expect(messages.filter((msg) => msg.info.role === "assistant" && msg.info.summary)).toHaveLength(1)
   }),
 )
 

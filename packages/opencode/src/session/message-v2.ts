@@ -1122,7 +1122,9 @@ export function latest(msgs: WithParts[]) {
       if (!internalContinuation || info.id > internalContinuation.id) internalContinuation = info
     }
     if (info.role === "assistant" && (!assistant || info.id > assistant.id)) assistant = info
-    if (info.role === "assistant" && info.finish && (!finished || info.id > finished.id)) finished = info
+    if (info.role === "assistant" && (info.finish || info.error) && (!finished || info.id > finished.id)) {
+      finished = info
+    }
   }
   let user: User | undefined
   for (const msg of msgs) {

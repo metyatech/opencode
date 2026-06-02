@@ -1457,6 +1457,7 @@ export const layer = Layer.effect(
             internalContinuation !== undefined &&
             (!lastAssistant || internalContinuation.id > lastAssistant.id) &&
             internalContinuation.id >= lastUser.id
+          const executionUser = pendingInternalContinuation && internalContinuation ? internalContinuation : lastUser
 
           const lastAssistantMsg = msgs.findLast(
             (msg) => msg.info.role === "assistant" && msg.info.id === lastAssistant?.id,
@@ -1465,10 +1466,12 @@ export const layer = Layer.effect(
           // tool calls. Keep the loop running so tool results can be sent back to
           // the model, but ignore cleanup-marked interrupted orphans.
           const hasToolCalls = lastAssistantMsg ? latestStepHasToolFollowUp(lastAssistantMsg.parts) : false
+          const lastAssistantTerminal = lastAssistant?.finish ?? (lastAssistant?.error ? "error" : undefined)
 
           if (
-            lastAssistant?.finish &&
-            !["tool-calls"].includes(lastAssistant.finish) &&
+            lastAssistant &&
+            lastAssistantTerminal &&
+            !["tool-calls"].includes(lastAssistantTerminal) &&
             !hasToolCalls &&
             lastUser.id < lastAssistant.id &&
             !pendingInternalContinuation
@@ -1491,12 +1494,12 @@ export const layer = Layer.effect(
           if (step === 1)
             yield* title({
               session,
-              modelID: lastUser.model.modelID,
-              providerID: lastUser.model.providerID,
+              modelID: executionUser.model.modelID,
+              providerID: executionUser.model.providerID,
               history: msgs,
             }).pipe(Effect.ignore, Effect.forkIn(scope))
 
-          const model = yield* getModel(lastUser.model.providerID, lastUser.model.modelID, sessionID)
+          const model = yield* getModel(executionUser.model.providerID, executionUser.model.modelID, sessionID)
           const task = tasks.pop()
 
           if (task?.type === "subtask") {
@@ -1521,15 +1524,15 @@ export const layer = Layer.effect(
             lastFinished.summary !== true &&
             (yield* compaction.isOverflow({ tokens: lastFinished.tokens, model }))
           ) {
-            yield* compaction.create({ sessionID, agent: lastUser.agent, model: lastUser.model, auto: true })
+            yield* compaction.create({ sessionID, agent: executionUser.agent, model: executionUser.model, auto: true })
             continue
           }
 
-          const agent = yield* agents.get(lastUser.agent)
+          const agent = yield* agents.get(executionUser.agent)
           if (!agent) {
             const available = (yield* agents.list()).filter((a) => !a.hidden).map((a) => a.name)
             const hint = available.length ? ` Available agents: ${available.join(", ")}` : ""
-            const error = new NamedError.Unknown({ message: `Agent not found: "${lastUser.agent}".${hint}` })
+            const error = new NamedError.Unknown({ message: `Agent not found: "${executionUser.agent}".${hint}` })
             yield* bus.publish(Session.Event.Error, { sessionID, error: error.toObject() })
             throw error
           }
@@ -1544,7 +1547,7 @@ export const layer = Layer.effect(
               role: "assistant",
               mode: agent.name,
               agent: agent.name,
-              variant: lastUser.model.variant,
+              variant: executionUser.model.variant,
               path: { cwd: ctx.directory, root: ctx.worktree },
               cost: 0,
               tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
@@ -1594,7 +1597,7 @@ export const layer = Layer.effect(
                 role: "assistant",
                 mode: agent.name,
                 agent: agent.name,
-                variant: lastUser.model.variant,
+                variant: executionUser.model.variant,
                 path: { cwd: ctx.directory, root: ctx.worktree },
                 cost: 0,
                 tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
@@ -1725,8 +1728,8 @@ export const layer = Layer.effect(
             if (result === "compact") {
               yield* compaction.create({
                 sessionID,
-                agent: lastUser.agent,
-                model: lastUser.model,
+                agent: executionUser.agent,
+                model: executionUser.model,
                 auto: true,
                 overflow: !handle.message.finish,
               })

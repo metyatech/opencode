@@ -1625,6 +1625,7 @@ describe("session.message-v2.latest", () => {
   const OVERFLOW_ASSISTANT = MessageID.make("msg_002")
   const COMPACTION_USER = MessageID.make("msg_003")
   const SUMMARY_ASSISTANT = MessageID.make("msg_004")
+  const ERRORED_SUMMARY_ASSISTANT = MessageID.make("msg_004a")
   const CONTINUE_USER = MessageID.make("msg_005")
   const NEW_COMPACTION_USER = MessageID.make("msg_006")
 
@@ -1660,6 +1661,23 @@ describe("session.message-v2.latest", () => {
       summary: true,
       finish: "stop",
       tokens: { input: 150_000, output: 1_500, reasoning: 0, cache: { read: 0, write: 0 }, total: 151_500 },
+    } as MessageV2.Assistant,
+    parts: [],
+  }
+
+  const erroredSummaryAssistant: MessageV2.WithParts = {
+    info: {
+      ...assistantInfo(
+        ERRORED_SUMMARY_ASSISTANT,
+        COMPACTION_USER,
+        new MessageV2.APIError({
+          message: "Too Many Requests: quota exceeded",
+          statusCode: 429,
+          isRetryable: true,
+        }).toObject(),
+      ),
+      summary: true,
+      time: { created: 0, completed: 1 },
     } as MessageV2.Assistant,
     parts: [],
   }
@@ -1733,5 +1751,14 @@ describe("session.message-v2.latest", () => {
     expect(state.internalContinuation?.id).toBe(CONTINUE_USER)
     expect(state.tasks).toHaveLength(1)
     expect(state.tasks[0]).toMatchObject({ type: "compaction", auto: true })
+  })
+
+  test("errored compaction summary is terminal for stale task selection", () => {
+    const state = MessageV2.latest([tailUser, overflowAssistant, compactionUser, erroredSummaryAssistant, continueUser])
+
+    expect(state.finished?.id).toBe(ERRORED_SUMMARY_ASSISTANT)
+    expect(state.user?.id).toBe(TAIL_USER)
+    expect(state.internalContinuation?.id).toBe(CONTINUE_USER)
+    expect(state.tasks).toEqual([])
   })
 })
