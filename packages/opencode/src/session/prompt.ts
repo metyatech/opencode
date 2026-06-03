@@ -197,6 +197,10 @@ function detectRepeatedToolObservationLoop(
   }
 }
 
+function assistantTerminalTime(info: MessageV2.Assistant) {
+  return info.time.completed ?? info.time.created
+}
+
 export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
   readonly prompt: (input: PromptInput) => Effect.Effect<MessageV2.WithParts, Image.Error>
@@ -1376,10 +1380,19 @@ export const layer = Layer.effect(
         throw error
       }
 
-      const now = Date.now()
+      const terminalReply = yield* sessions
+        .findMessage(
+          input.sessionID,
+          (msg) =>
+            msg.info.role === "assistant" && msg.info.parentID === input.messageID && msg.info.error !== undefined,
+        )
+        .pipe(Effect.orDie)
+      const retryCreatedAt = Option.isSome(terminalReply)
+        ? Math.max(Date.now(), assistantTerminalTime(terminalReply.value.info as MessageV2.Assistant) + 1)
+        : Date.now()
       const info: MessageV2.User = {
         ...retryMessage.info,
-        time: { created: now },
+        time: { created: retryCreatedAt },
         agent: ag.name,
         model: {
           providerID: input.model.providerID,
@@ -1481,6 +1494,11 @@ export const layer = Layer.effect(
           // the model, but ignore cleanup-marked interrupted orphans.
           const hasToolCalls = lastAssistantMsg ? latestStepHasToolFollowUp(lastAssistantMsg.parts) : false
           const lastAssistantTerminal = lastAssistant?.finish ?? (lastAssistant?.error ? "error" : undefined)
+          const latestUserWasRetriedAfterAssistant =
+            lastAssistant !== undefined &&
+            lastAssistant.error !== undefined &&
+            lastAssistant.parentID === lastUser.id &&
+            lastUser.time.created > assistantTerminalTime(lastAssistant)
 
           if (
             lastAssistant &&
@@ -1488,7 +1506,8 @@ export const layer = Layer.effect(
             !["tool-calls"].includes(lastAssistantTerminal) &&
             !hasToolCalls &&
             lastUser.id < lastAssistant.id &&
-            !pendingInternalContinuation
+            !pendingInternalContinuation &&
+            !latestUserWasRetriedAfterAssistant
           ) {
             const orphan = lastAssistantMsg?.parts.find(
               (part): part is MessageV2.ToolPart => part.type === "tool" && isOrphanedInterruptedTool(part),

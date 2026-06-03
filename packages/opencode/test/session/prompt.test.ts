@@ -479,6 +479,30 @@ const erroredCompactionAssistant = Effect.fn("test.erroredCompactionAssistant")(
   })
 })
 
+const erroredAssistant = Effect.fn("test.erroredAssistant")(function* (sessionID: SessionID, parentID: MessageID) {
+  const session = yield* Session.Service
+  const now = Math.max(0, Date.now() - 1_000)
+  return yield* session.updateMessage({
+    id: MessageID.ascending(),
+    role: "assistant",
+    parentID,
+    sessionID,
+    mode: "build",
+    agent: "build",
+    cost: 0,
+    path: { cwd: "/tmp", root: "/tmp" },
+    tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+    modelID: ref.modelID,
+    providerID: ref.providerID,
+    time: { created: now, completed: now },
+    error: new MessageV2.APIError({
+      message: "The requested model is not supported.",
+      statusCode: 400,
+      isRetryable: false,
+    }).toObject(),
+  })
+})
+
 const seed = Effect.fn("test.seed")(function* (sessionID: SessionID, opts?: { finish?: string }) {
   const session = yield* Session.Service
   const msg = yield* user(sessionID, "hello")
@@ -1071,6 +1095,89 @@ it.instance("fallback tool-call follow-up keeps the fallback assistant model", (
     }
     expect(result.parts.some((part) => part.type === "text" && part.text === "fallback follow-up")).toBe(true)
     expect((yield* llm.inputs).at(-1)?.model).toBe("fallback-model")
+  }),
+)
+
+it.instance("retry runs after an errored assistant when retry updates the latest user turn", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerWithFallbackCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({ title: "Fallback retry after unsupported model" })
+    const original = yield* user(session.id, "continue the current work")
+    yield* erroredAssistant(session.id, original.id)
+    yield* llm.textMatch((hit) => hit.body.model === "fallback-model", "fallback retry reply")
+
+    const result = yield* prompt.retry({
+      sessionID: session.id,
+      messageID: original.id,
+      agent: "build",
+      model: {
+        providerID: ref.providerID,
+        modelID: ModelID.make("fallback-model"),
+      },
+      variant: "high",
+    })
+
+    expect(yield* llm.calls).toBe(1)
+    expect(result.info.role).toBe("assistant")
+    if (result.info.role === "assistant") {
+      expect(result.info.parentID).toBe(original.id)
+      expect(result.info.modelID).toBe(ModelID.make("fallback-model"))
+      expect(result.info.variant).toBe("high")
+    }
+    expect(result.parts.some((part) => part.type === "text" && part.text === "fallback retry reply")).toBe(true)
+    expect((yield* llm.inputs).at(-1)?.model).toBe("fallback-model")
+
+    const messages = yield* sessions.messages({ sessionID: session.id })
+    expect(messages.filter((msg) => msg.info.role === "user")).toHaveLength(1)
+    expect(messages.filter((msg) => msg.info.role === "assistant")).toHaveLength(2)
+  }),
+)
+
+it.instance("retryAsync materializes a fallback assistant after an errored latest turn", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerWithFallbackCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({ title: "Async fallback retry after unsupported model" })
+    const original = yield* user(session.id, "continue the current work")
+    yield* erroredAssistant(session.id, original.id)
+    yield* llm.textMatch((hit) => hit.body.model === "fallback-model", "async fallback retry reply")
+
+    const retryMessage = yield* prompt.retryAsync({
+      sessionID: session.id,
+      messageID: original.id,
+      agent: "build",
+      model: {
+        providerID: ref.providerID,
+        modelID: ModelID.make("fallback-model"),
+      },
+      variant: "high",
+    })
+
+    expect(retryMessage.info.id).toBe(original.id)
+    const fallbackAssistant = yield* pollWithTimeout(
+      Effect.gen(function* () {
+        const messages = yield* sessions.messages({ sessionID: session.id })
+        return messages.find(
+          (msg) =>
+            msg.info.role === "assistant" &&
+            msg.info.modelID === ModelID.make("fallback-model") &&
+            msg.parts.some((part) => part.type === "text" && part.text === "async fallback retry reply"),
+        )
+      }),
+      "fallback retry assistant was not created",
+    )
+    expect(yield* llm.calls).toBe(1)
+    expect(fallbackAssistant.info.role).toBe("assistant")
+    if (fallbackAssistant.info.role === "assistant") {
+      expect(fallbackAssistant.info.parentID).toBe(original.id)
+      expect(fallbackAssistant.info.variant).toBe("high")
+    }
+    expect(
+      fallbackAssistant.parts.some((part) => part.type === "text" && part.text === "async fallback retry reply"),
+    ).toBe(true)
   }),
 )
 
