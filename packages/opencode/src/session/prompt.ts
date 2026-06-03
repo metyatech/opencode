@@ -808,7 +808,7 @@ export const layer = Layer.effect(
         }
       }
       const match = yield* sessions
-        .findMessage(sessionID, (m) => m.info.role === "user" && !!m.info.model)
+        .findMessage(sessionID, (m) => MessageV2.isHumanUserMessage(m) && !!m.info.model)
         .pipe(Effect.orDie)
       if (Option.isSome(match) && match.value.info.role === "user") return match.value.info.model
       return yield* provider.defaultModel().pipe(Effect.orDie)
@@ -1359,7 +1359,7 @@ export const layer = Layer.effect(
 
     const latestUserMessage = Effect.fnUntraced(function* (sessionID: SessionID) {
       const messages = yield* MessageV2.filterCompactedEffect(sessionID)
-      return messages.findLast((msg) => msg.info.role === "user")
+      return messages.findLast(MessageV2.isHumanUserMessage)
     })
 
     const prepareRetryMessage = Effect.fn("SessionPrompt.prepareRetryMessage")(function* (input: RetryInput) {
@@ -1371,6 +1371,9 @@ export const layer = Layer.effect(
       )
       if (retryMessage.info.role !== "user") {
         throw new NamedError.Unknown({ message: `Message is not a user prompt: ${input.messageID}` })
+      }
+      if (MessageV2.isInternalContinuationMessage(retryMessage)) {
+        throw new NamedError.Unknown({ message: `Cannot retry an internal continuation: ${input.messageID}` })
       }
       const lastUser = yield* latestUserMessage(input.sessionID)
       if (!lastUser || lastUser.info.id !== input.messageID) {
@@ -1722,13 +1725,14 @@ export const layer = Layer.effect(
               }
             }
 
-            yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
+            const modelInputMessages = msgs.filter((msg) => !MessageV2.isInternalContinuationMessage(msg))
+            yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: modelInputMessages })
 
             const [skills, env, instructions, modelMsgs] = yield* Effect.all([
               sys.skills(agent),
               sys.environment(model),
               instruction.system().pipe(Effect.orDie),
-              MessageV2.toModelMessagesEffect(msgs, model),
+              MessageV2.toModelMessagesEffect(modelInputMessages, model),
             ])
             const system = [...env, ...instructions, ...(skills ? [skills] : [])]
             if (pendingInternalContinuation) {

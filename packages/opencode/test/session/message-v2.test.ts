@@ -243,7 +243,7 @@ describe("session.message-v2.toModelMessage", () => {
     ])
   })
 
-  test("converts compaction continuation markers as internal user continuation messages", async () => {
+  test("drops compaction continuation markers from model user messages", async () => {
     const messageID = "m-user"
 
     const input: MessageV2.WithParts[] = [
@@ -263,13 +263,10 @@ describe("session.message-v2.toModelMessage", () => {
 
     const result = await MessageV2.toModelMessages(input, model)
 
-    expect(result).toHaveLength(1)
-    expect(result[0]?.role).toBe("user")
-    expect(JSON.stringify(result[0])).toContain("not a new user request")
-    expect(JSON.stringify(result[0])).not.toContain("Continue if you have next steps.")
+    expect(result).toHaveLength(0)
   })
 
-  test("does not emit mid-conversation system messages for compaction continuations", async () => {
+  test("does not emit model messages for compaction continuations", async () => {
     const userID = "m-user"
     const assistantID = "m-assistant"
     const continuationID = "m-continuation"
@@ -311,8 +308,9 @@ describe("session.message-v2.toModelMessage", () => {
 
     const result = await MessageV2.toModelMessages(input, model)
 
-    expect(result.map((item) => item.role)).toStrictEqual(["user", "assistant", "user"])
-    expect(JSON.stringify(result[2])).toContain("not a new user request")
+    expect(result.map((item) => item.role)).toStrictEqual(["user", "assistant"])
+    expect(JSON.stringify(result)).not.toContain("not a new user request")
+    expect(JSON.stringify(result)).not.toContain("Continue if you have next steps.")
   })
 
   test("converts user text/file parts and injects compaction/subtask prompts", async () => {
@@ -1718,10 +1716,10 @@ describe("session.message-v2.latest", () => {
     expect(state.tasks).toEqual([])
   })
 
-  test("uses a synthetic continuation as user only when no real user exists", () => {
+  test("does not promote a synthetic continuation to latest user", () => {
     const state = MessageV2.latest([continueUser])
 
-    expect(state.user?.id).toBe(CONTINUE_USER)
+    expect(state.user).toBeUndefined()
     expect(state.internalContinuation?.id).toBe(CONTINUE_USER)
   })
 

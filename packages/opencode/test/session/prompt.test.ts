@@ -1131,11 +1131,22 @@ it.instance("compaction continuation is sent to the model as internal resume sta
     expect(result.parts.some((part) => part.type === "text" && part.text === "continued")).toBe(true)
 
     const inputs = yield* llm.inputs
-    const latestInput = JSON.stringify(inputs.at(-1))
-    expect(latestInput).toContain("Internal continuation after session compaction")
-    expect(latestInput).toContain("not a new user request")
-    expect(latestInput).toContain("do not restart request-intake")
-    expect(latestInput).not.toContain("Continue if you have next steps.")
+    const latestInput = inputs.at(-1)
+    const latestMessages = Array.isArray(latestInput?.messages) ? latestInput.messages : []
+    const systemMessages = latestMessages.filter(
+      (msg) => typeof msg === "object" && msg !== null && "role" in msg && msg.role === "system",
+    )
+    const userMessages = latestMessages.filter(
+      (msg) => typeof msg === "object" && msg !== null && "role" in msg && msg.role === "user",
+    )
+    expect(JSON.stringify(systemMessages)).toContain("internal continuation marker")
+    expect(JSON.stringify(systemMessages)).toContain("not a new human request")
+    expect(JSON.stringify(systemMessages)).toContain("do not restart request-intake")
+    expect(userMessages).toHaveLength(1)
+    expect(JSON.stringify(userMessages)).toContain("hello")
+    expect(JSON.stringify(userMessages)).not.toContain("Internal continuation after session compaction")
+    expect(JSON.stringify(userMessages)).not.toContain("not a new user request")
+    expect(JSON.stringify(userMessages)).not.toContain("Continue if you have next steps.")
   }),
 )
 
@@ -1275,6 +1286,40 @@ it.instance("retry runs after an errored assistant when retry updates the latest
     const messages = yield* sessions.messages({ sessionID: session.id })
     expect(messages.filter((msg) => msg.info.role === "user")).toHaveLength(1)
     expect(messages.filter((msg) => msg.info.role === "assistant")).toHaveLength(2)
+  }),
+)
+
+it.instance("retry rejects internal compaction continuations", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({ title: "Reject retry continuation" })
+    yield* seed(session.id, { finish: "stop" })
+    const continuation = yield* compactionContinueUser(session.id)
+    yield* llm.text("unexpected continuation retry")
+
+    const exit = yield* prompt
+      .retry({
+        sessionID: session.id,
+        messageID: continuation.id,
+        agent: "build",
+        model: {
+          providerID: ref.providerID,
+          modelID: ref.modelID,
+        },
+      })
+      .pipe(Effect.exit)
+
+    expect(Exit.isFailure(exit)).toBe(true)
+    if (Exit.isFailure(exit)) {
+      const err = Cause.squash(exit.cause)
+      expect(NamedError.Unknown.isInstance(err)).toBe(true)
+      if (NamedError.Unknown.isInstance(err)) {
+        expect(err.data.message).toContain("Cannot retry an internal continuation")
+      }
+    }
+    expect(yield* llm.calls).toBe(0)
   }),
 )
 

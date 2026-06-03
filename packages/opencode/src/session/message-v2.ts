@@ -36,14 +36,6 @@ interface FetchDecompressionError extends Error {
 }
 
 export const SYNTHETIC_ATTACHMENT_PROMPT = "Attached media from tool result:"
-export const INTERNAL_COMPACTION_CONTINUATION_PROMPT = [
-  "<system-reminder>",
-  "Internal continuation after session compaction.",
-  "This is not a new user request.",
-  "Continue the in-progress request from the retained summary and recent conversation.",
-  "Do not restart request-intake, intent-routing, or turn-start procedures solely because of this continuation marker.",
-  "</system-reminder>",
-].join("\n")
 export { isMedia }
 
 export const AbortedError = NamedError.create("MessageAbortedError", { message: Schema.String })
@@ -572,8 +564,16 @@ export function isCompactionContinuationPart(part: Part) {
   return part.type === "text" && part.synthetic === true && part.metadata?.compaction_continue === true
 }
 
-export function isCompactionContinuationMessage(msg: WithParts) {
+export function isCompactionContinuationMessage(msg: WithParts): msg is WithParts & { info: User } {
   return msg.info.role === "user" && msg.parts.some(isCompactionContinuationPart)
+}
+
+export function isInternalContinuationMessage(msg: WithParts): msg is WithParts & { info: User } {
+  return isCompactionContinuationMessage(msg)
+}
+
+export function isHumanUserMessage(msg: WithParts): msg is WithParts & { info: User } {
+  return msg.info.role === "user" && !isInternalContinuationMessage(msg)
 }
 
 const Cursor = Schema.Struct({
@@ -710,19 +710,13 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
     if (msg.parts.length === 0) continue
 
     if (msg.info.role === "user") {
+      if (isInternalContinuationMessage(msg)) continue
       const userMessage: UIMessage = {
         id: msg.info.id,
         role: "user",
         parts: [],
       }
       for (const part of msg.parts) {
-        if (isCompactionContinuationPart(part)) {
-          userMessage.parts.push({
-            type: "text",
-            text: INTERNAL_COMPACTION_CONTINUATION_PROMPT,
-          })
-          continue
-        }
         // User message parts should never be empty
         if (part.type === "text" && !part.ignored && part.text !== "")
           userMessage.parts.push({
@@ -1118,8 +1112,8 @@ export function latest(msgs: WithParts[]) {
   let internalContinuation: User | undefined
   for (const msg of msgs) {
     const info = msg.info
-    if (info.role === "user" && isCompactionContinuationMessage(msg)) {
-      if (!internalContinuation || info.id > internalContinuation.id) internalContinuation = info
+    if (isInternalContinuationMessage(msg)) {
+      if (!internalContinuation || msg.info.id > internalContinuation.id) internalContinuation = msg.info
     }
     if (info.role === "assistant" && (!assistant || info.id > assistant.id)) assistant = info
     if (info.role === "assistant" && (info.finish || info.error) && (!finished || info.id > finished.id)) {
@@ -1128,13 +1122,11 @@ export function latest(msgs: WithParts[]) {
   }
   let user: User | undefined
   for (const msg of msgs) {
+    if (!isHumanUserMessage(msg)) continue
     const info = msg.info
-    if (info.role !== "user") continue
-    if (isCompactionContinuationMessage(msg)) continue
     if (finished && info.id <= finished.id && isTaskOnlyMessage(msg)) continue
     if (!user || info.id > user.id) user = info
   }
-  user ??= internalContinuation
   const tasks = msgs.flatMap((m) =>
     finished && m.info.id <= finished.id
       ? []
