@@ -100,6 +100,13 @@ function latestStepHasToolFollowUp(parts: MessageV2.Part[]) {
   return false
 }
 
+function assistantRequestTokens(msg: MessageV2.WithParts & { info: MessageV2.Assistant }) {
+  const steps = msg.parts.filter((part): part is MessageV2.StepFinishPart => part.type === "step-finish")
+  if (steps.length === 0) return [msg.info.tokens]
+
+  return steps.map((part) => part.tokens)
+}
+
 const NO_PROGRESS_LOOP_THRESHOLD = 3
 const NO_PROGRESS_LOOP_MESSAGE =
   "Stopped because the last 3 assistant steps repeated the same tool observations under the same request without adding new state or context. Please send a new instruction if you want me to continue another way."
@@ -1552,11 +1559,23 @@ export const layer = Layer.effect(
             continue
           }
 
-          if (
-            lastFinished &&
-            lastFinished.summary !== true &&
-            (yield* compaction.isOverflow({ tokens: lastFinished.tokens, model }))
-          ) {
+          let lastFinishedOverflow = false
+          if (lastFinished && lastFinished.summary !== true) {
+            const lastFinishedMsg = msgs.find(
+              (msg): msg is MessageV2.WithParts & { info: MessageV2.Assistant } =>
+                msg.info.role === "assistant" && msg.info.id === lastFinished.id,
+            )
+            if (lastFinishedMsg) {
+              for (const tokens of assistantRequestTokens(lastFinishedMsg)) {
+                if (yield* compaction.isOverflow({ tokens, model })) {
+                  lastFinishedOverflow = true
+                  break
+                }
+              }
+            }
+          }
+
+          if (lastFinishedOverflow) {
             yield* compaction.create({ sessionID, agent: executionUser.agent, model: executionModel, auto: true })
             continue
           }

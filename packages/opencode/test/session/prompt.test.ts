@@ -588,6 +588,77 @@ const addAssistantToolStep = Effect.fn("test.addAssistantToolStep")(function* (
   return assistant
 })
 
+function assistantTokens(input: number): MessageV2.Assistant["tokens"] {
+  return { input, output: 0, reasoning: 0, cache: { read: 0, write: 0 } }
+}
+
+const addFinishedToolCallAssistant = Effect.fn("test.addFinishedToolCallAssistant")(function* (
+  sessionID: SessionID,
+  parentID: MessageID,
+  input: {
+    messageTokens: MessageV2.Assistant["tokens"]
+    stepTokens: MessageV2.Assistant["tokens"][]
+  },
+) {
+  const session = yield* Session.Service
+  const now = Date.now()
+  const assistant: MessageV2.Assistant = {
+    id: MessageID.ascending(),
+    role: "assistant",
+    parentID,
+    sessionID,
+    mode: "build",
+    agent: "build",
+    cost: 0,
+    path: { cwd: "/tmp", root: "/tmp" },
+    tokens: input.messageTokens,
+    modelID: ref.modelID,
+    providerID: ref.providerID,
+    time: { created: now, completed: now },
+    finish: "tool-calls",
+  }
+  yield* session.updateMessage(assistant)
+
+  for (let index = 0; index < input.stepTokens.length; index++) {
+    const tokens = input.stepTokens[index]
+    yield* session.updatePart({
+      id: PartID.ascending(),
+      messageID: assistant.id,
+      sessionID,
+      type: "step-start",
+      snapshot: `snapshot-${index}`,
+    } satisfies MessageV2.StepStartPart)
+    yield* session.updatePart({
+      id: PartID.ascending(),
+      messageID: assistant.id,
+      sessionID,
+      type: "tool",
+      callID: `call-${index}`,
+      tool: "bash",
+      state: {
+        status: "completed",
+        input: { command: `echo ${index}` },
+        output: "ok",
+        title: "bash",
+        metadata: {},
+        time: { start: now, end: now },
+      },
+    } satisfies MessageV2.ToolPart)
+    yield* session.updatePart({
+      id: PartID.ascending(),
+      messageID: assistant.id,
+      sessionID,
+      type: "step-finish",
+      reason: "tool-calls",
+      snapshot: `snapshot-${index}`,
+      cost: 0,
+      tokens,
+    } satisfies MessageV2.StepFinishPart)
+  }
+
+  return assistant
+})
+
 const addSubtask = (sessionID: SessionID, messageID: MessageID, model = ref) =>
   Effect.gen(function* () {
     const session = yield* Session.Service
@@ -967,6 +1038,78 @@ it.instance("loop keeps going when recent tool observations are not identical", 
     expect(result.info.role).toBe("assistant")
     expect(result.parts.some((part) => part.type === "text" && part.text === "continued after edit")).toBe(true)
   }),
+)
+
+raceNoLLMServer.instance(
+  "loop does not auto compact when only cumulative assistant tokens exceed the limit",
+  () =>
+    Effect.gen(function* () {
+      processorCreateStarted.length = 0
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          processorCreateStarted.length = 0
+        }),
+      )
+
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({ title: "Cumulative tokens" })
+      const msg = yield* user(session.id, "continue")
+      yield* addFinishedToolCallAssistant(session.id, msg.id, {
+        messageTokens: assistantTokens(160_000),
+        stepTokens: [assistantTokens(80_000), assistantTokens(80_000)],
+      })
+
+      const started = yield* Deferred.make<void>()
+      processorCreateStarted.push(() => succeedVoid(started))
+      const fiber = yield* prompt.loop({ sessionID: session.id }).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(Deferred.await(started), "timed out waiting for follow-up processor", "3 seconds")
+
+      const messages = yield* sessions.messages({ sessionID: session.id })
+      expect(messages.some((message) => message.parts.some((part) => part.type === "compaction"))).toBe(false)
+
+      yield* prompt.cancel(session.id)
+      const exit = yield* Fiber.await(fiber)
+      expect(Exit.isSuccess(exit)).toBe(true)
+    }),
+  { config: cfg },
+  5_000,
+)
+
+raceNoLLMServer.instance(
+  "loop auto compacts when any assistant step exceeds the limit",
+  () =>
+    Effect.gen(function* () {
+      processorCreateStarted.length = 0
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          processorCreateStarted.length = 0
+        }),
+      )
+
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({ title: "Step overflow" })
+      const msg = yield* user(session.id, "continue")
+      yield* addFinishedToolCallAssistant(session.id, msg.id, {
+        messageTokens: assistantTokens(91_000),
+        stepTokens: [assistantTokens(91_000)],
+      })
+
+      const started = yield* Deferred.make<void>()
+      processorCreateStarted.push(() => succeedVoid(started))
+      const fiber = yield* prompt.loop({ sessionID: session.id }).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(Deferred.await(started), "timed out waiting for compaction processor", "3 seconds")
+
+      const messages = yield* sessions.messages({ sessionID: session.id })
+      expect(messages.some((message) => message.parts.some((part) => part.type === "compaction"))).toBe(true)
+
+      yield* prompt.cancel(session.id)
+      const exit = yield* Fiber.await(fiber)
+      expect(Exit.isSuccess(exit)).toBe(true)
+    }),
+  { config: cfg },
+  5_000,
 )
 
 it.instance("compaction continuation is sent to the model as internal resume state", () =>
