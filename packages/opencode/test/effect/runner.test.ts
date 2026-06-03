@@ -250,6 +250,35 @@ describe("Runner", () => {
     }),
   )
 
+  it.live(
+    "cancel releases ensureRunning callers before interrupted finalizers complete",
+    Effect.gen(function* () {
+      const s = yield* Scope.Scope
+      const interrupted = yield* Deferred.make<void>()
+      const holdFinalizer = yield* Deferred.make<void>()
+      const runner = Runner.make<string>(s, { onInterrupt: Effect.succeed("interrupted") })
+
+      yield* Effect.gen(function* () {
+        const fiber = yield* runner
+          .ensureRunning(
+            Effect.never.pipe(
+              Effect.onInterrupt(() => Deferred.succeed(interrupted, undefined)),
+              Effect.ensuring(Deferred.await(holdFinalizer)),
+              Effect.as("never"),
+            ),
+          )
+          .pipe(Effect.forkChild)
+        yield* waitForState(runner, "Running")
+
+        const cancel = yield* runner.cancel.pipe(Effect.forkChild)
+        yield* Deferred.await(interrupted).pipe(Effect.timeout("250 millis"))
+
+        expect(yield* Fiber.join(fiber).pipe(Effect.timeout("250 millis"))).toBe("interrupted")
+        yield* Fiber.await(cancel).pipe(Effect.timeout("250 millis"))
+      }).pipe(Effect.ensuring(Deferred.succeed(holdFinalizer, undefined).pipe(Effect.ignore)))
+    }),
+  )
+
   // --- shell semantics ---
 
   it.live(

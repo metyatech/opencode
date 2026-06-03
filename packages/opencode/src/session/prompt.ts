@@ -1453,6 +1453,38 @@ export const layer = Layer.effect(
       throw new Error("Impossible")
     })
 
+    const lastAssistantAfterInterrupt = Effect.fnUntraced(function* (sessionID: SessionID) {
+      return yield* Effect.scoped(
+        Effect.gen(function* () {
+          const updates = yield* bus.subscribe(MessageV2.Event.Updated)
+          const current = yield* lastAssistant(sessionID)
+          if (
+            current.info.role !== "assistant" ||
+            current.info.time.completed !== undefined ||
+            current.info.finish !== undefined ||
+            current.info.error !== undefined
+          ) {
+            return current
+          }
+
+          yield* updates.pipe(
+            Stream.filter((event) => {
+              if (event.properties.sessionID !== sessionID) return false
+              const info = event.properties.info
+              return (
+                info.role === "assistant" &&
+                (info.time.completed !== undefined || info.finish !== undefined || info.error !== undefined)
+              )
+            }),
+            Stream.take(1),
+            Stream.runDrain,
+            Effect.timeoutOption("2 seconds"),
+          )
+          return yield* lastAssistant(sessionID)
+        }),
+      )
+    })
+
     const runLoop: (sessionID: SessionID) => Effect.Effect<MessageV2.WithParts> = Effect.fn("SessionPrompt.run")(
       function* (sessionID: SessionID) {
         const ctx = yield* InstanceState.context
@@ -1811,14 +1843,23 @@ export const layer = Layer.effect(
     const loop: (input: LoopInput) => Effect.Effect<MessageV2.WithParts> = Effect.fn("SessionPrompt.loop")(function* (
       input: LoopInput,
     ) {
-      return yield* state.ensureRunning(input.sessionID, lastAssistant(input.sessionID), runLoop(input.sessionID))
+      return yield* state.ensureRunning(
+        input.sessionID,
+        lastAssistantAfterInterrupt(input.sessionID),
+        runLoop(input.sessionID),
+      )
     })
 
     const shell: (input: ShellInput) => Effect.Effect<MessageV2.WithParts, Session.BusyError> = Effect.fn(
       "SessionPrompt.shell",
     )(function* (input: ShellInput) {
       const ready = yield* Latch.make()
-      return yield* state.startShell(input.sessionID, lastAssistant(input.sessionID), shellImpl(input, ready), ready)
+      return yield* state.startShell(
+        input.sessionID,
+        lastAssistantAfterInterrupt(input.sessionID),
+        shellImpl(input, ready),
+        ready,
+      )
     })
 
     const command = Effect.fn("SessionPrompt.command")(function* (input: CommandInput) {

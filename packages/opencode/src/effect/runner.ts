@@ -112,6 +112,9 @@ export const make = <A, E = never>(
       yield* Fiber.interrupt(shell.fiber)
     })
 
+  const interruptRun = (fiber: Fiber.Fiber<A, E>) =>
+    Fiber.interrupt(fiber).pipe(Effect.ignore, Effect.forkIn(scope, { startImmediately: true }), Effect.asVoid)
+
   const ensureRunning = (work: Effect.Effect<A, E>) =>
     SynchronizedRef.modifyEffect(
       ref,
@@ -175,8 +178,8 @@ export const make = <A, E = never>(
       case "Running":
         return [
           Effect.gen(function* () {
-            yield* Fiber.interrupt(st.run.fiber)
             yield* Deferred.fail(st.run.done, new Cancelled()).pipe(Effect.asVoid)
+            yield* interruptRun(st.run.fiber)
             yield* idleIfCurrent()
           }),
           { _tag: "Idle" } as const,
@@ -192,8 +195,8 @@ export const make = <A, E = never>(
       case "ShellThenRun":
         return [
           Effect.gen(function* () {
-            yield* stopShell(st.shell)
             yield* Deferred.fail(st.run.done, new Cancelled()).pipe(Effect.asVoid)
+            yield* stopShell(st.shell)
             yield* idleIfCurrent()
           }),
           { _tag: "Idle" } as const,

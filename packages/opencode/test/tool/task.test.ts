@@ -1,5 +1,5 @@
 import { afterEach, describe, expect } from "bun:test"
-import { Effect, Exit, Fiber, Layer } from "effect"
+import { Deferred, Effect, Exit, Fiber, Layer } from "effect"
 import { Agent } from "../../src/agent/agent"
 import { BackgroundJob } from "@/background/job"
 import { Bus } from "@/bus"
@@ -360,6 +360,110 @@ describe("tool.task", () => {
 
       const exit = yield* Fiber.await(fiber)
       expect(Exit.isSuccess(exit)).toBe(true)
+    }),
+  )
+
+  it.instance("execute uses later child terminal text after an empty cancelled prompt result", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const childReady = yield* Deferred.make<SessionID>()
+      const childParent = yield* Deferred.make<MessageID>()
+
+      const promptOps: TaskPromptOps = {
+        cancel: () => Effect.void,
+        loop: (input) =>
+          Effect.succeed(
+            reply(
+              {
+                sessionID: input.sessionID,
+                messageID: MessageID.ascending(),
+                agent: "build",
+                model: ref,
+                parts: [],
+              },
+              "looped",
+            ),
+          ),
+        resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
+        prompt: (input) =>
+          Effect.gen(function* () {
+            const parentID = input.messageID ?? MessageID.ascending()
+            const failed: MessageV2.Assistant = {
+              id: MessageID.ascending(),
+              role: "assistant",
+              parentID,
+              sessionID: input.sessionID,
+              mode: input.agent ?? "general",
+              agent: input.agent ?? "general",
+              cost: 0,
+              path: { cwd: "/tmp", root: "/tmp" },
+              tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+              modelID: input.model?.modelID ?? ref.modelID,
+              providerID: input.model?.providerID ?? ref.providerID,
+              time: { created: Date.now(), completed: Date.now() },
+              error: new MessageV2.AbortedError({
+                message: "cancelled before fallback",
+              }).toObject(),
+            }
+            yield* sessions.updateMessage(failed)
+            yield* Deferred.succeed(childParent, parentID)
+            yield* Deferred.succeed(childReady, input.sessionID)
+            return { info: failed, parts: [] }
+          }),
+      }
+
+      const fiber = yield* def
+        .execute(
+          {
+            description: "inspect bug",
+            prompt: "look into the cache key path",
+            subagent_type: "general",
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+        .pipe(Effect.forkChild)
+
+      const childID = yield* Deferred.await(childReady)
+      const parentID = yield* Deferred.await(childParent)
+      const fallback: MessageV2.Assistant = {
+        id: MessageID.ascending(),
+        role: "assistant",
+        parentID,
+        sessionID: childID,
+        mode: "general",
+        agent: "general",
+        cost: 0,
+        path: { cwd: "/tmp", root: "/tmp" },
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        modelID: ref.modelID,
+        providerID: ref.providerID,
+        time: { created: Date.now(), completed: Date.now() },
+        finish: "stop",
+      }
+      yield* sessions.updateMessage(fallback)
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: fallback.id,
+        sessionID: childID,
+        type: "text",
+        text: "fallback completed",
+      })
+
+      const result = yield* Fiber.join(fiber).pipe(Effect.timeout("2 seconds"))
+      expect(result.output).toContain(`<task id="${childID}" state="completed">`)
+      expect(result.output).toContain("fallback completed")
     }),
   )
 

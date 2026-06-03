@@ -11,9 +11,10 @@ import { Agent } from "../agent/agent"
 import { deriveSubagentSessionPermission } from "../agent/subagent-permissions"
 import type { SessionPrompt } from "../session/prompt"
 import { Config } from "@/config/config"
-import { Cause, Effect, Exit, Option, Schema, Scope, Stream } from "effect"
+import { Cause, Duration, Effect, Exit, Option, Schema, Scope, Stream } from "effect"
 import { EffectBridge } from "@/effect/bridge"
 import { RuntimeFlags } from "@/effect/runtime-flags"
+import { isRecord } from "@/util/record"
 
 export interface TaskPromptOps {
   cancel(sessionID: SessionID): Effect.Effect<void>
@@ -74,6 +75,20 @@ function isNonEmptyTextPart(part: MessageV2.Part): part is MessageV2.TextPart {
   return part.type === "text" && part.text.trim().length > 0
 }
 
+function textResult(parts: MessageV2.Part[]) {
+  return parts.findLast(isNonEmptyTextPart)?.text
+}
+
+function isTerminalAssistant(msg: MessageV2.WithParts): msg is MessageV2.WithParts & { info: MessageV2.Assistant } {
+  return (
+    msg.info.role === "assistant" &&
+    (msg.info.time.completed !== undefined || msg.info.finish !== undefined || msg.info.error !== undefined)
+  )
+}
+
+const CHILD_RESULT_SETTLE_ATTEMPTS = 4
+const CHILD_RESULT_SETTLE_WAIT: Duration.Input = "500 millis"
+
 function backgroundMessage(input: {
   sessionID: SessionID
   description: string
@@ -97,6 +112,19 @@ function backgroundMessage(input: {
 
 function errorText(error: unknown) {
   if (error instanceof Error) return error.message
+  if (isRecord(error)) {
+    const data = error.data
+    if (isRecord(data)) {
+      const message = data.message
+      if (typeof message === "string") return message
+    }
+    if (typeof error.message === "string") return error.message
+    try {
+      return JSON.stringify(error)
+    } catch {
+      return "Unknown object error"
+    }
+  }
   return String(error)
 }
 
@@ -193,6 +221,84 @@ export const TaskTool = Tool.define(
       const ops = ctx.extra?.promptOps as TaskPromptOps
       if (!ops) return yield* Effect.fail(new Error("TaskTool requires promptOps in ctx.extra"))
 
+      const latestChildResult = Effect.fn("TaskTool.latestChildResult")(function* () {
+        const latest = yield* sessions
+          .findMessage(nextSession.id, (item) => item.info.role === "assistant")
+          .pipe(Effect.catchCause(() => Effect.succeed(Option.none<MessageV2.WithParts>())))
+        if (Option.isNone(latest)) return { status: "pending" as const }
+
+        const msg = latest.value
+        if (!isTerminalAssistant(msg)) return { status: "pending" as const }
+
+        const text = textResult(msg.parts)
+        if (text) return { status: "completed" as const, text }
+
+        if (msg.info.error) {
+          return {
+            status: "error" as const,
+            error: new Error(`Subagent ${nextSession.id} failed: ${errorText(msg.info.error)}`),
+          }
+        }
+
+        return {
+          status: "error" as const,
+          error: new Error(`Subagent ${nextSession.id} completed without a text result.`),
+        }
+      })
+
+      const waitForChildEvent = Effect.fn("TaskTool.waitForChildEvent")(function* (input?: {
+        timeout?: Duration.Input
+        onlyIfActive?: boolean
+      }) {
+        return yield* Effect.scoped(
+          Effect.gen(function* () {
+            const stream = yield* bus.subscribeAll()
+            if (input?.onlyIfActive) {
+              const current = yield* status.get(nextSession.id)
+              if (current.type === "idle") return false
+            }
+            const wait = stream.pipe(
+              Stream.filter((event) => {
+                if (!isRecord(event.properties) || event.properties.sessionID !== nextSession.id) return false
+                return (
+                  event.type === SessionStatus.Event.Status.type ||
+                  event.type === SessionStatus.Event.Idle.type ||
+                  event.type === MessageV2.Event.Updated.type ||
+                  event.type === MessageV2.Event.PartUpdated.type
+                )
+              }),
+              Stream.take(1),
+              Stream.runDrain,
+            )
+            if (!input?.timeout) {
+              yield* wait
+              return true
+            }
+            return Option.isSome(yield* wait.pipe(Effect.timeoutOption(input.timeout)))
+          }),
+        )
+      })
+
+      const awaitChildResult: (attempts?: number) => Effect.Effect<string, Error> = Effect.fn(
+        "TaskTool.awaitChildResult",
+      )(function* (attempts = 0) {
+        const result = yield* latestChildResult()
+        if (result.status === "completed") return result.text
+
+        if (yield* waitForChildEvent({ onlyIfActive: true })) {
+          return yield* awaitChildResult(0)
+        }
+
+        if (attempts < CHILD_RESULT_SETTLE_ATTEMPTS) {
+          if (yield* waitForChildEvent({ timeout: CHILD_RESULT_SETTLE_WAIT })) {
+            return yield* awaitChildResult(attempts + 1)
+          }
+        }
+
+        if (result.status === "error") return yield* Effect.fail(result.error)
+        return yield* Effect.fail(new Error(`Subagent ${nextSession.id} completed without a text result.`))
+      })
+
       const runTask = Effect.fn("TaskTool.runTask")(function* () {
         const parts = yield* ops.resolvePromptParts(params.prompt)
         const result = yield* ops.prompt({
@@ -210,11 +316,7 @@ export const TaskTool = Tool.define(
           },
           parts,
         })
-        const text = result.parts.findLast(isNonEmptyTextPart)?.text
-        if (!text) {
-          return yield* Effect.fail(new Error(`Subagent ${nextSession.id} completed without a text result.`))
-        }
-        return text
+        return textResult(result.parts) ?? (yield* awaitChildResult())
       })
 
       const resumeParent: (input: { userID: MessageID; attempts?: number }) => Effect.Effect<void> = Effect.fn(
