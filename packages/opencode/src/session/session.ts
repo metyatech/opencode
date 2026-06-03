@@ -361,6 +361,16 @@ export const Event = {
     "session.error",
     Schema.Struct({
       sessionID: Schema.optional(SessionID),
+      messageID: Schema.optional(MessageID),
+      parentID: Schema.optional(MessageID),
+      agent: Schema.optional(Schema.String),
+      model: Schema.optional(
+        Schema.Struct({
+          providerID: ProviderID,
+          modelID: ModelID,
+          variant: Schema.optional(Schema.String),
+        }),
+      ),
       // Reuses MessageV2.Assistant.fields.error (already Schema.optional) so
       // the derived zod keeps the same discriminated-union shape on the bus.
       error: MessageV2.Assistant.fields.error,

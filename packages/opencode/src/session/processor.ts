@@ -769,6 +769,19 @@ export const layer = Layer.effect(
       const errorText = (error: ReturnType<typeof parse>, fallback: unknown) =>
         isRecord(error.data) && typeof error.data.message === "string" ? error.data.message : errorMessage(fallback)
 
+      const sessionError = (error: ReturnType<typeof parse>) => ({
+        sessionID: ctx.assistantMessage.sessionID,
+        messageID: ctx.assistantMessage.id,
+        parentID: ctx.assistantMessage.parentID,
+        agent: ctx.assistantMessage.agent,
+        model: {
+          providerID: ctx.assistantMessage.providerID,
+          modelID: ctx.assistantMessage.modelID,
+          ...(ctx.assistantMessage.variant ? { variant: ctx.assistantMessage.variant } : {}),
+        },
+        error,
+      })
+
       const haltParsed = Effect.fn("SessionProcessor.haltParsed")(function* (
         error: ReturnType<typeof parse>,
         e: unknown,
@@ -776,7 +789,7 @@ export const layer = Layer.effect(
         if (MessageV2.ContextOverflowError.isInstance(error)) {
           ctx.needsCompaction = true
           if (!ctx.assistantMessage.summary)
-            yield* bus.publish(Session.Event.Error, { sessionID: ctx.sessionID, error })
+            yield* bus.publish(Session.Event.Error, sessionError(error))
           return
         }
         if (!ctx.assistantMessage.summary) {
@@ -794,10 +807,7 @@ export const layer = Layer.effect(
         }
         ctx.assistantMessage.error = error
         if (!ctx.assistantMessage.summary) {
-          yield* bus.publish(Session.Event.Error, {
-            sessionID: ctx.assistantMessage.sessionID,
-            error: ctx.assistantMessage.error,
-          })
+          yield* bus.publish(Session.Event.Error, sessionError(ctx.assistantMessage.error))
         }
         yield* status.set(ctx.sessionID, { type: "idle" })
       })

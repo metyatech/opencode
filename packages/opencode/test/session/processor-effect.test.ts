@@ -483,6 +483,7 @@ it.live("session.processor effect tests do not retry unknown json errors", () =>
     ({ dir, llm }) =>
       Effect.gen(function* () {
         const { processors, session, provider } = yield* boot()
+        const bus = yield* Bus.Service
 
         yield* llm.error(400, { error: { message: "no_kv_space" } })
 
@@ -490,6 +491,10 @@ it.live("session.processor effect tests do not retry unknown json errors", () =>
         const parent = yield* user(chat.id, "json")
         const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
         const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const errors: Array<Record<string, unknown>> = []
+        const off = yield* bus.subscribeCallback(Session.Event.Error, (evt) => {
+          if (evt.properties.sessionID === chat.id) errors.push(evt.properties as Record<string, unknown>)
+        })
         const handle = yield* processors.create({
           assistantMessage: msg,
           sessionID: chat.id,
@@ -513,9 +518,26 @@ it.live("session.processor effect tests do not retry unknown json errors", () =>
           tools: {},
         })
 
+        const errorEvent = yield* waitFor(
+          Effect.sync(() => errors[0]),
+          "timed out waiting for session error event",
+        )
+        off()
+
         expect(value).toBe("stop")
         expect(yield* llm.calls).toBe(1)
         expect(handle.message.error?.name).toBe("APIError")
+        expect(errorEvent).toMatchObject({
+          sessionID: chat.id,
+          messageID: msg.id,
+          parentID: parent.id,
+          agent: "build",
+          model: {
+            providerID: ref.providerID,
+            modelID: ref.modelID,
+          },
+        })
+        expect((errorEvent.error as { name?: string } | undefined)?.name).toBe("APIError")
       }),
     { config: (url) => providerCfg(url) },
   ),
