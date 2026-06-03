@@ -1127,6 +1127,16 @@ export function latest(msgs: WithParts[]) {
     if (finished && info.id <= finished.id && isTaskOnlyMessage(msg)) continue
     if (!user || info.id > user.id) user = info
   }
+  // If the primary scan filtered out all user messages (for example when only
+  // task-only compaction markers remain after a finished compaction summary),
+  // prefer the latest non-internal user message so the loop can recover.
+  if (!user) {
+    for (const msg of msgs) {
+      if (!isHumanUserMessage(msg)) continue
+      const info = msg.info
+      if (!user || info.id > user.id) user = info
+    }
+  }
   const tasks = msgs.flatMap((m) =>
     finished && m.info.id <= finished.id
       ? []

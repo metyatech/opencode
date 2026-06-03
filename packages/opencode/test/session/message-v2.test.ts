@@ -1723,6 +1723,13 @@ describe("session.message-v2.latest", () => {
     expect(state.internalContinuation?.id).toBe(CONTINUE_USER)
   })
 
+  test("falls back to a task-only user when no non-task user is available", () => {
+    const state = MessageV2.latest([compactionUser, summaryAssistant])
+
+    expect(state.user?.id).toBe(COMPACTION_USER)
+    expect(state.internalContinuation).toBeUndefined()
+  })
+
   test("a fresh compaction-user newer than the latest summary surfaces in tasks", () => {
     const newCompactionUser: MessageV2.WithParts = {
       info: userInfo(NEW_COMPACTION_USER),

@@ -1507,7 +1507,13 @@ export const layer = Layer.effect(
             internalContinuation,
           } = MessageV2.latest(msgs)
 
-          if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
+          if (!lastUser) {
+            const error = new NamedError.Unknown({
+              message: "No user message found in stream. This should never happen.",
+            })
+            yield* bus.publish(Session.Event.Error, { sessionID, error: error.toObject() })
+            throw error
+          }
           const pendingInternalContinuation =
             internalContinuation !== undefined &&
             (!lastAssistant || internalContinuation.id > lastAssistant.id) &&

@@ -1150,6 +1150,24 @@ it.instance("compaction continuation is sent to the model as internal resume sta
   }),
 )
 
+it.instance("compaction loop recovers when only task-only user metadata remains after summary", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({ title: "Compaction summary-only fallback" })
+
+    const compaction = yield* compactionMarker(session.id)
+    yield* erroredCompactionAssistant(session.id, compaction.id)
+    yield* compactionContinueUser(session.id)
+    yield* llm.text("continued after fallback")
+
+    const result = yield* prompt.loop({ sessionID: session.id })
+    expect(result.info.role).toBe("assistant")
+    expect(result.parts.some((part) => part.type === "text" && part.text === "continued after fallback")).toBe(true)
+  }),
+)
+
 it.instance("compaction fallback continuation runs on the fallback model after a summary error", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(providerWithFallbackCfg)
