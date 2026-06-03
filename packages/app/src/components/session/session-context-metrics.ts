@@ -1,4 +1,4 @@
-import type { AssistantMessage, Message } from "@opencode-ai/sdk/v2/client"
+import type { AssistantMessage, Message, Part } from "@opencode-ai/sdk/v2/client"
 
 type Provider = {
   id: string
@@ -36,8 +36,21 @@ type Metrics = {
   context: Context | undefined
 }
 
-const tokenTotal = (msg: AssistantMessage) => {
-  return msg.tokens.input + msg.tokens.output + msg.tokens.reasoning + msg.tokens.cache.read + msg.tokens.cache.write
+type PartMap = Record<string, readonly Part[] | undefined>
+type StepFinishPart = Extract<Part, { type: "step-finish" }>
+type TokenUsage = AssistantMessage["tokens"]
+
+const tokenTotal = (tokens: TokenUsage) => {
+  return tokens.total || tokens.input + tokens.output + tokens.cache.read + tokens.cache.write
+}
+
+const isStepFinishPart = (part: Part): part is StepFinishPart => {
+  return part.type === "step-finish"
+}
+
+const currentContextTokens = (msg: AssistantMessage, parts: PartMap = {}) => {
+  const step = parts[msg.id]?.filter(isStepFinishPart).at(-1)
+  return step?.tokens ?? msg.tokens
 }
 
 const OUTPUT_TOKEN_MAX = 32_000
@@ -51,24 +64,25 @@ const effectiveLimit = (model?: Model) => {
   return model?.limit.input ? Math.max(0, model.limit.input - reserved) : Math.max(0, context - output)
 }
 
-const lastAssistantWithTokens = (messages: Message[]) => {
+const lastAssistantWithTokens = (messages: Message[], parts: PartMap) => {
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i]
     if (msg.role !== "assistant") continue
-    if (tokenTotal(msg) <= 0) continue
+    if (tokenTotal(currentContextTokens(msg, parts)) <= 0) continue
     return msg
   }
 }
 
-const build = (messages: Message[] = [], providers: Provider[] = []): Metrics => {
+const build = (messages: Message[] = [], providers: Provider[] = [], parts: PartMap = {}): Metrics => {
   const totalCost = messages.reduce((sum, msg) => sum + (msg.role === "assistant" ? msg.cost : 0), 0)
-  const message = lastAssistantWithTokens(messages)
+  const message = lastAssistantWithTokens(messages, parts)
   if (!message) return { totalCost, context: undefined }
 
   const provider = providers.find((item) => item.id === message.providerID)
   const model = provider?.models[message.modelID]
   const limit = effectiveLimit(model)
-  const total = tokenTotal(message)
+  const tokens = currentContextTokens(message, parts)
+  const total = tokenTotal(tokens)
 
   return {
     totalCost,
@@ -79,17 +93,17 @@ const build = (messages: Message[] = [], providers: Provider[] = []): Metrics =>
       providerLabel: provider?.name ?? message.providerID,
       modelLabel: model?.name ?? message.modelID,
       limit,
-      input: message.tokens.input,
-      output: message.tokens.output,
-      reasoning: message.tokens.reasoning,
-      cacheRead: message.tokens.cache.read,
-      cacheWrite: message.tokens.cache.write,
+      input: tokens.input,
+      output: tokens.output,
+      reasoning: tokens.reasoning,
+      cacheRead: tokens.cache.read,
+      cacheWrite: tokens.cache.write,
       total,
       usage: limit ? Math.round((total / limit) * 100) : null,
     },
   }
 }
 
-export function getSessionContextMetrics(messages: Message[] = [], providers: Provider[] = []) {
-  return build(messages, providers)
+export function getSessionContextMetrics(messages: Message[] = [], providers: Provider[] = [], parts: PartMap = {}) {
+  return build(messages, providers, parts)
 }

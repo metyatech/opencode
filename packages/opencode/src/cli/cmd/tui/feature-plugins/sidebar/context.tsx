@@ -5,6 +5,7 @@ import { createMemo } from "solid-js"
 import type { Config } from "@/config/config"
 import type { Provider } from "@/provider/provider"
 import { usage as contextUsage } from "@/session/overflow"
+import { hasAssistantContextTokens, latestAssistantRequestTokens } from "./context-usage"
 
 const id = "internal:sidebar-context"
 
@@ -20,7 +21,10 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
   const cost = createMemo(() => session()?.cost ?? 0)
 
   const state = createMemo(() => {
-    const last = msg().findLast((item): item is AssistantMessage => item.role === "assistant" && item.tokens.output > 0)
+    const last = msg().findLast(
+      (item): item is AssistantMessage =>
+        item.role === "assistant" && hasAssistantContextTokens({ message: item, parts: props.api.state.part(item.id) }),
+    )
     if (!last) {
       return {
         tokens: 0,
@@ -29,13 +33,14 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
     }
 
     const model = props.api.state.provider.find((item) => item.id === last.providerID)?.models[last.modelID]
-    if (!model) return {
-      tokens: 0,
-      percent: null,
-    }
+    if (!model)
+      return {
+        tokens: 0,
+        percent: null,
+      }
     const { total, percent } = contextUsage({
       cfg: props.api.state.config as Config.Info,
-      tokens: last.tokens,
+      tokens: latestAssistantRequestTokens({ message: last, parts: props.api.state.part(last.id) }),
       model: model as Provider.Model,
     })
     return {

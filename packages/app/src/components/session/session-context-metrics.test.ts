@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import type { Message } from "@opencode-ai/sdk/v2/client"
+import type { Message, Part } from "@opencode-ai/sdk/v2/client"
 import { getSessionContextMetrics } from "./session-context-metrics"
 
 const assistant = (
@@ -37,6 +37,30 @@ const user = (id: string) => {
   } as unknown as Message
 }
 
+const stepFinish = (
+  id: string,
+  messageID: string,
+  tokens: { input: number; output: number; reasoning: number; read: number; write: number },
+) => {
+  return {
+    id,
+    sessionID: "ses_test",
+    messageID,
+    type: "step-finish",
+    reason: "stop",
+    cost: 0,
+    tokens: {
+      input: tokens.input,
+      output: tokens.output,
+      reasoning: tokens.reasoning,
+      cache: {
+        read: tokens.read,
+        write: tokens.write,
+      },
+    },
+  } as unknown as Part
+}
+
 describe("getSessionContextMetrics", () => {
   test("computes totals and usage from latest assistant with tokens", () => {
     const messages = [
@@ -61,11 +85,45 @@ describe("getSessionContextMetrics", () => {
 
     expect(metrics.totalCost).toBe(1.75)
     expect(metrics.context?.message.id).toBe("a2")
-    expect(metrics.context?.total).toBe(500)
+    expect(metrics.context?.total).toBe(450)
     expect(metrics.context?.limit).toBe(900)
-    expect(metrics.context?.usage).toBe(56)
+    expect(metrics.context?.usage).toBe(50)
     expect(metrics.context?.providerLabel).toBe("OpenAI")
     expect(metrics.context?.modelLabel).toBe("GPT-4.1")
+  })
+
+  test("uses latest step-finish tokens for current context while keeping cost cumulative", () => {
+    const messages = [
+      assistant("a1", { input: 20, output: 10, reasoning: 0, read: 0, write: 0 }, 0.25),
+      assistant("a2", { input: 3_000_000, output: 500_000, reasoning: 10_000, read: 100_000, write: 0 }, 10),
+    ]
+    const parts = {
+      a2: [
+        stepFinish("step_old", "a2", { input: 800, output: 60, reasoning: 0, read: 80, write: 0 }),
+        stepFinish("step_new", "a2", { input: 200, output: 10, reasoning: 5, read: 20, write: 0 }),
+      ],
+    }
+    const providers = [
+      {
+        id: "openai",
+        models: {
+          "gpt-4.1": {
+            limit: { context: 1000, output: 100 },
+          },
+        },
+      },
+    ]
+
+    const metrics = getSessionContextMetrics(messages, providers, parts)
+
+    expect(metrics.totalCost).toBe(10.25)
+    expect(metrics.context?.message.id).toBe("a2")
+    expect(metrics.context?.input).toBe(200)
+    expect(metrics.context?.output).toBe(10)
+    expect(metrics.context?.reasoning).toBe(5)
+    expect(metrics.context?.cacheRead).toBe(20)
+    expect(metrics.context?.total).toBe(230)
+    expect(metrics.context?.usage).toBe(26)
   })
 
   test("uses input budget when the model has a dedicated prompt limit", () => {

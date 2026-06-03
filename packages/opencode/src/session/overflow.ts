@@ -23,13 +23,16 @@ export function usage(input: {
   model: Provider.Model
   outputTokenMax?: number
 }) {
-  const total =
-    input.tokens.total || input.tokens.input + input.tokens.output + input.tokens.cache.read + input.tokens.cache.write
+  const total = tokenTotal(input.tokens)
   const limit = usable(input)
   return {
     total,
     percent: limit === 0 ? undefined : Math.min(100, Math.round((total / limit) * 100)),
   }
+}
+
+export function tokenTotal(tokens: MessageV2.Assistant["tokens"]) {
+  return tokens.total || tokens.input + tokens.output + tokens.cache.read + tokens.cache.write
 }
 
 export function isOverflow(input: {
@@ -41,7 +44,6 @@ export function isOverflow(input: {
   if (input.cfg.compaction?.auto === false) return false
   if (input.model.limit.context === 0) return false
 
-  const count =
-    input.tokens.total || input.tokens.input + input.tokens.output + input.tokens.cache.read + input.tokens.cache.write
+  const count = tokenTotal(input.tokens)
   return count >= usable(input)
 }
