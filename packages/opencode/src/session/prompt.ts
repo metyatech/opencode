@@ -114,6 +114,13 @@ const NO_PROGRESS_LOOP_MESSAGE =
 const INTERNAL_CONTINUATION_SYSTEM_PROMPT =
   "The latest user-role message is an internal continuation marker generated after session compaction, not a new human request. Continue the in-progress request from retained state; do not restart request-intake, intent-routing, or turn-start procedures because of that marker."
 
+function appendUserSystem(existing: string | undefined, next: string | undefined) {
+  if (!next) return existing
+  if (!existing) return next
+  if (existing.includes(next)) return existing
+  return [existing, next].join("\n\n")
+}
+
 function stableJson(value: unknown): string {
   return JSON.stringify(sortJsonValue(value))
 }
@@ -1408,6 +1415,7 @@ export const layer = Layer.effect(
         ...retryMessage.info,
         time: { created: retryCreatedAt },
         agent: ag.name,
+        system: appendUserSystem(retryMessage.info.system, input.system),
         model: {
           providerID: input.model.providerID,
           modelID: input.model.modelID,
@@ -2072,6 +2080,7 @@ export const RetryInput = Schema.Struct({
   model: ModelRef,
   agent: Schema.optional(Schema.String),
   variant: Schema.optional(Schema.String),
+  system: Schema.optional(Schema.String),
 })
 export type RetryInput = Schema.Schema.Type<typeof RetryInput>
 

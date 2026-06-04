@@ -1307,6 +1307,65 @@ it.instance("retry runs after an errored assistant when retry updates the latest
   }),
 )
 
+it.instance("retry preserves request scope while adding continuation system state", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerWithFallbackCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({ title: "Fallback retry continuation system" })
+    const originalSystem = "Original per-turn system"
+    const continuationSystem =
+      "Runtime fallback continuation: same external user request; do not restart request-intake or one-shot turn-start procedures."
+    const original = yield* prompt.prompt({
+      sessionID: session.id,
+      agent: "build",
+      model: ref,
+      system: originalSystem,
+      parts: [{ type: "text", text: "continue the current work" }],
+      noReply: true,
+    })
+    yield* erroredAssistant(session.id, original.info.id)
+    yield* llm.textMatch((hit) => hit.body.model === "fallback-model", "fallback retry reply")
+
+    const result = yield* prompt.retry({
+      sessionID: session.id,
+      messageID: original.info.id,
+      agent: "build",
+      model: {
+        providerID: ref.providerID,
+        modelID: ModelID.make("fallback-model"),
+      },
+      system: continuationSystem,
+    })
+
+    expect(result.info.role).toBe("assistant")
+    const messages = yield* sessions.messages({ sessionID: session.id })
+    const users = messages.filter((msg) => msg.info.role === "user")
+    expect(users).toHaveLength(1)
+    const retryUser = users[0]
+    if (!retryUser || retryUser.info.role !== "user")
+      throw new Error("expected retry to reuse the original user message")
+    expect(retryUser.info.system).toContain(originalSystem)
+    expect(retryUser.info.system).toContain(continuationSystem)
+
+    const inputs = yield* llm.inputs
+    const latestMessages = Array.isArray(inputs.at(-1)?.messages)
+      ? (inputs.at(-1)?.messages as Array<{ role?: string }>)
+      : []
+    const systemMessages = latestMessages.filter(
+      (msg) => typeof msg === "object" && msg !== null && "role" in msg && msg.role === "system",
+    )
+    const userMessages = latestMessages.filter(
+      (msg) => typeof msg === "object" && msg !== null && "role" in msg && msg.role === "user",
+    )
+    expect(JSON.stringify(systemMessages)).toContain(originalSystem)
+    expect(JSON.stringify(systemMessages)).toContain(continuationSystem)
+    expect(userMessages).toHaveLength(1)
+    expect(JSON.stringify(userMessages)).toContain("continue the current work")
+    expect(JSON.stringify(userMessages)).not.toContain("Runtime fallback continuation")
+  }),
+)
+
 it.instance("retry rejects internal compaction continuations", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(providerCfg)
@@ -1350,6 +1409,8 @@ it.instance("retryAsync materializes a fallback assistant after an errored lates
     const original = yield* user(session.id, "continue the current work")
     yield* erroredAssistant(session.id, original.id)
     yield* llm.textMatch((hit) => hit.body.model === "fallback-model", "async fallback retry reply")
+    const continuationSystem =
+      "Runtime fallback continuation: same external user request; do not restart one-shot turn-start procedures."
 
     const retryMessage = yield* prompt.retryAsync({
       sessionID: session.id,
@@ -1360,9 +1421,13 @@ it.instance("retryAsync materializes a fallback assistant after an errored lates
         modelID: ModelID.make("fallback-model"),
       },
       variant: "high",
+      system: continuationSystem,
     })
 
     expect(retryMessage.info.id).toBe(original.id)
+    if (retryMessage.info.role === "user") {
+      expect(retryMessage.info.system).toContain(continuationSystem)
+    }
     const fallbackAssistant = yield* pollWithTimeout(
       Effect.gen(function* () {
         const messages = yield* sessions.messages({ sessionID: session.id })
