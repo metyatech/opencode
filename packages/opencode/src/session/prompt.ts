@@ -266,6 +266,10 @@ export const layer = Layer.effect(
       yield* state.cancel(sessionID)
     })
 
+    const compactedMessages = Effect.fn("SessionPrompt.compactedMessages")(function* (sessionID: SessionID) {
+      return MessageV2.filterCompacted(yield* sessions.messages({ sessionID }).pipe(Effect.orDie))
+    })
+
     const resolvePromptParts = Effect.fn("SessionPrompt.resolvePromptParts")(function* (template: string) {
       const ctx = yield* InstanceState.context
       const parts: Types.DeepMutable<PromptInput["parts"]> = [{ type: "text", text: template }]
@@ -1358,7 +1362,7 @@ export const layer = Layer.effect(
     })
 
     const latestUserMessage = Effect.fnUntraced(function* (sessionID: SessionID) {
-      const messages = yield* MessageV2.filterCompactedEffect(sessionID)
+      const messages = yield* compactedMessages(sessionID)
       return messages.findLast(MessageV2.isHumanUserMessage)
     })
 
@@ -1497,7 +1501,7 @@ export const layer = Layer.effect(
           yield* status.set(sessionID, { type: "busy" })
           yield* slog.info("loop", { step })
 
-          let msgs = yield* MessageV2.filterCompactedEffect(sessionID)
+          let msgs = yield* compactedMessages(sessionID)
 
           const {
             user: lastUser,
@@ -1822,7 +1826,7 @@ export const layer = Layer.effect(
               return "continue" as const
             }
             const responseHasToolFollowUp = latestStepHasToolFollowUp(MessageV2.parts(handle.message.id))
-            const latestAfterSampling = MessageV2.latest(yield* MessageV2.filterCompactedEffect(sessionID))
+            const latestAfterSampling = MessageV2.latest(yield* compactedMessages(sessionID))
             const hasPendingInput =
               (latestAfterSampling.user !== undefined && latestAfterSampling.user.id > handle.message.id) ||
               (latestAfterSampling.internalContinuation !== undefined &&

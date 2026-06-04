@@ -1454,6 +1454,94 @@ it.instance("loop continues when finish is stop but assistant has tool parts", (
   }),
 )
 
+it.instance("loop continues after reconciling a completed child task from a running parent tool", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({
+      title: "Pinned",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    const original = yield* user(session.id, "continue the current work")
+    const now = Date.now()
+    const assistant = yield* sessions.updateMessage({
+      id: MessageID.ascending(),
+      role: "assistant",
+      parentID: original.id,
+      sessionID: session.id,
+      mode: "build",
+      agent: "build",
+      cost: 0,
+      path: { cwd: "/tmp", root: "/tmp" },
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      modelID: ref.modelID,
+      providerID: ref.providerID,
+      time: { created: now },
+    } satisfies MessageV2.Assistant)
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: assistant.id,
+      sessionID: session.id,
+      type: "tool",
+      callID: "call-reconcile-task",
+      tool: "task",
+      state: {
+        status: "running",
+        input: {
+          description: "Plan next exercise page",
+          prompt: "Plan the page but do not edit files.",
+          subagent_type: "general",
+        },
+        time: { start: now },
+      },
+    } satisfies MessageV2.ToolPart)
+
+    const child = yield* sessions.create({
+      parentID: session.id,
+      title: "Plan next exercise page (@general subagent)",
+    })
+    const childUser = yield* user(child.id, "child prompt")
+    const childAssistant = yield* sessions.updateMessage({
+      id: MessageID.ascending(),
+      role: "assistant",
+      parentID: childUser.id,
+      sessionID: child.id,
+      mode: "general",
+      agent: "general",
+      cost: 0,
+      path: { cwd: "/tmp", root: "/tmp" },
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      modelID: ref.modelID,
+      providerID: ref.providerID,
+      time: { created: now, completed: now },
+      finish: "stop",
+    } satisfies MessageV2.Assistant)
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: childAssistant.id,
+      sessionID: child.id,
+      type: "text",
+      text: "child completed",
+    } satisfies MessageV2.TextPart)
+    yield* llm.textMatch((hit) => JSON.stringify(hit.body.messages).includes("child completed"), "parent continued")
+
+    const result = yield* prompt.loop({ sessionID: session.id })
+    const reconciled = (yield* sessions.messages({ sessionID: session.id }))
+      .flatMap((msg) => msg.parts)
+      .find((part): part is MessageV2.ToolPart => part.type === "tool" && part.callID === "call-reconcile-task")
+
+    expect(yield* llm.calls).toBe(1)
+    expect(reconciled?.state.status).toBe("completed")
+    if (reconciled?.state.status === "completed") {
+      expect(reconciled.state.metadata.sessionId).toBe(child.id)
+      expect(reconciled.state.output).toContain("child completed")
+    }
+    expect(result.info.role).toBe("assistant")
+    expect(result.parts.some((part) => part.type === "text" && part.text === "parent continued")).toBe(true)
+  }),
+)
+
 it.instance("failed subtask preserves metadata on error tool state", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig((url) => ({

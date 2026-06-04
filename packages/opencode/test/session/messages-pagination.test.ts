@@ -571,6 +571,64 @@ describe("Session.messages", () => {
     ),
   )
 
+  it.instance("reconciles running task tool parts from completed child sessions", () =>
+    withSession(({ session, sessionID }) =>
+      Effect.gen(function* () {
+        const userID = yield* addUser(sessionID, "plan")
+        const assistantID = yield* addAssistant(sessionID, userID)
+        const start = Date.now()
+        yield* session.updatePart({
+          id: PartID.ascending(),
+          sessionID,
+          messageID: assistantID,
+          type: "tool",
+          callID: "call_task",
+          tool: "task",
+          state: {
+            status: "running",
+            input: {
+              description: "Plan next exercise page",
+              prompt: "Plan the page but do not edit files.",
+              subagent_type: "general",
+            },
+            time: { start },
+          },
+        })
+
+        const child = yield* session.create({
+          parentID: sessionID,
+          title: "Plan next exercise page (@general subagent)",
+        })
+        const childUserID = yield* addUser(child.id, "child prompt")
+        const childAssistantID = yield* addAssistant(child.id, childUserID, { finish: "stop" })
+        yield* session.updatePart({
+          id: PartID.ascending(),
+          sessionID: child.id,
+          messageID: childAssistantID,
+          type: "text",
+          text: "child completed",
+        })
+
+        const messages = yield* session.messages({ sessionID })
+        const parent = messages.find((msg) => msg.info.id === assistantID)
+        const task = parent?.parts.find((part): part is MessageV2.ToolPart => part.type === "tool")
+        const stored = yield* MessageV2.get({ sessionID, messageID: assistantID })
+
+        expect(task?.state.status).toBe("completed")
+        if (task?.state.status === "completed") {
+          expect(task.state.metadata.sessionId).toBe(child.id)
+          expect(task.state.output).toContain(`<task id="${child.id}" state="completed">`)
+          expect(task.state.output).toContain("child completed")
+        }
+        expect(stored.info.role).toBe("assistant")
+        if (stored.info.role === "assistant") {
+          expect(stored.info.finish).toBe("tool-calls")
+          expect(stored.info.time.completed).toBeDefined()
+        }
+      }),
+    ),
+  )
+
   it.instance("fails with NotFoundError for non-existent session", () =>
     Effect.gen(function* () {
       const session = yield* SessionNs.Service

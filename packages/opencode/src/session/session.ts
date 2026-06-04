@@ -33,6 +33,7 @@ import { ProjectID } from "../project/schema"
 import { WorkspaceID } from "../control-plane/schema"
 import { SessionID, MessageID, PartID } from "./schema"
 import { ModelID, ProviderID } from "@/provider/schema"
+import { reconcileTaskToolParts } from "./task-reconciliation"
 
 import type { Provider } from "@/provider/provider"
 import { Permission } from "@/permission"
@@ -775,9 +776,12 @@ export const layer: Layer.Layer<
     })
 
     const messages: Interface["messages"] = Effect.fn("Session.messages")(function* (input) {
-      if (input.limit) {
-        return (yield* MessageV2.page({ sessionID: input.sessionID, limit: input.limit })).items
-      }
+      if (input.limit)
+        return yield* reconcileTaskToolParts({
+          sessionID: input.sessionID,
+          messages: (yield* MessageV2.page({ sessionID: input.sessionID, limit: input.limit })).items,
+          ops: { children, findMessage, updatePart, updateMessage },
+        })
 
       const size = 50
       const result = [] as MessageV2.WithParts[]
@@ -792,7 +796,11 @@ export const layer: Layer.Layer<
         if (!page.more || !page.cursor) break
         before = page.cursor
       }
-      return result.reverse()
+      return yield* reconcileTaskToolParts({
+        sessionID: input.sessionID,
+        messages: result.reverse(),
+        ops: { children, findMessage, updatePart, updateMessage },
+      })
     })
 
     const removeMessage = Effect.fn("Session.removeMessage")(function* (input: {
