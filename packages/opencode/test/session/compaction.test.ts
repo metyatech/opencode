@@ -1173,6 +1173,69 @@ describe("session.compaction.process", () => {
   )
 
   itCompaction.instance(
+    "does not preserve a split tail during overflow recovery",
+    Effect.gen(function* () {
+      const ssn = yield* SessionNs.Service
+      const test = yield* TestInstance
+      const session = yield* ssn.create({})
+      yield* createCompactionMarker(session.id)
+      const previousCompaction = (yield* ssn.messages({ sessionID: session.id })).at(-1)?.info.id
+      expect(previousCompaction).toBeTruthy()
+      yield* createSummaryAssistantMessage(session.id, previousCompaction!, test.directory, "previous summary")
+
+      const turn = yield* createUserMessage(session.id, "current turn")
+      const large = yield* createAssistantMessage(session.id, turn.id, test.directory)
+      yield* ssn.updatePart({
+        id: PartID.ascending(),
+        messageID: large.id,
+        sessionID: session.id,
+        type: "text",
+        text: "z".repeat(2_000),
+      })
+      const keep = yield* createAssistantMessage(session.id, turn.id, test.directory)
+      yield* ssn.updatePart({
+        id: PartID.ascending(),
+        messageID: keep.id,
+        sessionID: session.id,
+        type: "text",
+        text: "keep tail",
+      })
+      yield* SessionCompaction.use.create({
+        sessionID: session.id,
+        agent: "build",
+        model: ref,
+        auto: false,
+        overflow: true,
+      })
+
+      const msgs = yield* ssn.messages({ sessionID: session.id })
+      const parent = msgs.at(-1)?.info.id
+      expect(parent).toBeTruthy()
+      const stalePart = msgs
+        .at(-1)
+        ?.parts.find((item): item is MessageV2.CompactionPart => item.type === "compaction")
+      expect(stalePart?.type).toBe("compaction")
+      yield* ssn.updatePart({ ...stalePart!, tail_start_id: keep.id })
+      const staleMsgs = yield* ssn.messages({ sessionID: session.id })
+      yield* SessionCompaction.use.process({
+        parentID: parent!,
+        messages: staleMsgs,
+        sessionID: session.id,
+        auto: false,
+        overflow: true,
+      })
+
+      const all = yield* ssn.messages({ sessionID: session.id })
+      const part = all
+        .find((msg) => msg.info.id === parent)
+        ?.parts.find((item): item is MessageV2.CompactionPart => item.type === "compaction")
+
+      expect(part?.type).toBe("compaction")
+      expect(part?.tail_start_id).toBeUndefined()
+    }).pipe(withCompaction({ config: cfg({ tail_turns: 1, preserve_recent_tokens: 100 }) })),
+  )
+
+  itCompaction.instance(
     "stops quickly when aborted during retry backoff",
     () => {
       const stub = llm()

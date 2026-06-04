@@ -404,11 +404,19 @@ export const layer = Layer.effect(
       const prior = completedCompactions(history)
       const hidden = new Set(prior.flatMap((item) => [item.userIndex, item.assistantIndex]))
       const previousSummary = prior.at(-1)?.summary
-      const selected = yield* select({
-        messages: history.filter((_, index) => !hidden.has(index)),
-        cfg,
-        model,
-      })
+      const visibleHistory = history.filter((_, index) => !hidden.has(index))
+      // Overflow recovery needs a full-summary cutover. Reusing retained tail
+      // can replay the same oversized suffix and trigger another compaction.
+      const selected = input.overflow
+        ? {
+            head: visibleHistory,
+            tail_start_id: undefined,
+          }
+        : yield* select({
+            messages: visibleHistory,
+            cfg,
+            model,
+          })
       // Allow plugins to inject context or replace compaction prompt.
       const compacting = yield* plugin.trigger(
         "experimental.session.compacting",
@@ -482,11 +490,11 @@ export const layer = Layer.effect(
         return "stop"
       }
 
-      if (compactionPart && selected.tail_start_id && compactionPart.tail_start_id !== selected.tail_start_id) {
-        yield* session.updatePart({
-          ...compactionPart,
-          tail_start_id: selected.tail_start_id,
-        })
+      if (compactionPart && compactionPart.tail_start_id !== selected.tail_start_id) {
+        const nextPart = { ...compactionPart }
+        if (selected.tail_start_id) nextPart.tail_start_id = selected.tail_start_id
+        else delete nextPart.tail_start_id
+        yield* session.updatePart(nextPart)
       }
 
       if (result === "continue" && input.auto) {
