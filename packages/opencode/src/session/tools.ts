@@ -25,7 +25,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   agent: Agent.Info
   model: Provider.Model
   session: Session.Info
-  processor: Pick<SessionProcessor.Handle, "message" | "updateToolCall" | "completeToolCall">
+  processor: Pick<SessionProcessor.Handle, "message" | "startToolCall" | "updateToolCall" | "completeToolCall">
   bypassAgentCheck: boolean
   messages: MessageV2.WithParts[]
   promptOps: TaskPromptOps
@@ -85,6 +85,11 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
         return run.promise(
           Effect.gen(function* () {
             const ctx = context(args, options)
+            yield* input.processor.startToolCall({
+              id: options.toolCallId,
+              name: item.id,
+              input: args,
+            })
             yield* plugin.trigger(
               "tool.execute.before",
               { tool: item.id, sessionID: ctx.sessionID, callID: ctx.callID },
@@ -105,9 +110,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
               { tool: item.id, sessionID: ctx.sessionID, callID: ctx.callID, args },
               output,
             )
-            if (options.abortSignal?.aborted) {
-              yield* input.processor.completeToolCall(options.toolCallId, output)
-            }
+            yield* input.processor.completeToolCall(options.toolCallId, output)
             return output
           }),
         )
@@ -126,6 +129,11 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
       run.promise(
         Effect.gen(function* () {
           const ctx = context(args, opts)
+          yield* input.processor.startToolCall({
+            id: opts.toolCallId,
+            name: key,
+            input: args,
+          })
           yield* plugin.trigger(
             "tool.execute.before",
             { tool: key, sessionID: ctx.sessionID, callID: opts.toolCallId },
@@ -193,9 +201,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
             })),
             content: result.content,
           }
-          if (opts.abortSignal?.aborted) {
-            yield* input.processor.completeToolCall(opts.toolCallId, output)
-          }
+          yield* input.processor.completeToolCall(opts.toolCallId, output)
           return output
         }),
       )

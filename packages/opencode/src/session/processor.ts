@@ -53,6 +53,12 @@ function addTokens(
 
 export interface Handle {
   readonly message: MessageV2.Assistant
+  readonly startToolCall: (input: {
+    id: string
+    name: string
+    input: Record<string, any>
+    providerExecuted?: boolean
+  }) => Effect.Effect<MessageV2.ToolPart>
   readonly updateToolCall: (
     toolCallID: string,
     update: (part: MessageV2.ToolPart) => MessageV2.ToolPart,
@@ -89,6 +95,7 @@ type ToolCall = {
 
 interface ProcessorContext extends Input {
   toolcalls: Record<string, ToolCall>
+  settledToolcalls: Record<string, ToolCall>
   shouldBreak: boolean
   snapshot: string | undefined
   blocked: boolean
@@ -129,6 +136,7 @@ export const layer = Layer.effect(
         sessionID: input.sessionID,
         model: input.model,
         toolcalls: {},
+        settledToolcalls: {},
         shouldBreak: false,
         snapshot: initialSnapshot,
         blocked: false,
@@ -146,14 +154,21 @@ export const layer = Layer.effect(
         })
       let retryError: ReturnType<typeof parse> | undefined
 
+      const storeToolCall = (toolCallID: string, call: ToolCall, settled: boolean) => {
+        if (settled) ctx.settledToolcalls[toolCallID] = call
+        else ctx.toolcalls[toolCallID] = call
+      }
+
       const settleToolCall = Effect.fn("SessionProcessor.settleToolCall")(function* (toolCallID: string) {
-        const done = ctx.toolcalls[toolCallID]?.done
+        const call = ctx.toolcalls[toolCallID]
+        const done = call?.done
+        if (call) ctx.settledToolcalls[toolCallID] = call
         delete ctx.toolcalls[toolCallID]
         if (done) yield* Deferred.succeed(done, undefined).pipe(Effect.ignore)
       })
 
       const readToolCall = Effect.fn("SessionProcessor.readToolCall")(function* (toolCallID: string) {
-        const call = ctx.toolcalls[toolCallID]
+        const call = ctx.toolcalls[toolCallID] ?? ctx.settledToolcalls[toolCallID]
         if (!call) return undefined
         const part = yield* session.getPart({
           partID: call.partID,
@@ -162,10 +177,43 @@ export const layer = Layer.effect(
         })
         if (!part || part.type !== "tool") {
           delete ctx.toolcalls[toolCallID]
+          delete ctx.settledToolcalls[toolCallID]
           return undefined
         }
-        return { call, part }
+        return { call, part, settled: ctx.toolcalls[toolCallID] === undefined }
       })
+
+      const providerMetadata = (
+        current: MessageV2.ToolPart["metadata"],
+        next?: MessageV2.ToolPart["metadata"],
+      ): MessageV2.ToolPart["metadata"] => {
+        if (current?.providerExecuted) return { ...(next ?? current), providerExecuted: true }
+        return next ?? current
+      }
+
+      const markToolCallRunning = (input: {
+        part: MessageV2.ToolPart
+        name: string
+        args: Record<string, any>
+        providerMetadata?: MessageV2.ToolPart["metadata"]
+      }): MessageV2.ToolPart => {
+        const state =
+          input.part.state.status === "pending"
+            ? {
+                status: "running" as const,
+                input: input.args,
+                time: { start: Date.now() },
+              }
+            : input.part.state.status === "running"
+              ? { ...input.part.state, input: input.args }
+              : input.part.state
+        return {
+          ...input.part,
+          tool: input.name,
+          state,
+          metadata: providerMetadata(input.part.metadata, input.providerMetadata),
+        }
+      }
 
       const updateToolCall = Effect.fn("SessionProcessor.updateToolCall")(function* (
         toolCallID: string,
@@ -174,12 +222,16 @@ export const layer = Layer.effect(
         const match = yield* readToolCall(toolCallID)
         if (!match) return undefined
         const part = yield* session.updatePart(update(match.part))
-        ctx.toolcalls[toolCallID] = {
-          ...match.call,
-          partID: part.id,
-          messageID: part.messageID,
-          sessionID: part.sessionID,
-        }
+        storeToolCall(
+          toolCallID,
+          {
+            ...match.call,
+            partID: part.id,
+            messageID: part.messageID,
+            sessionID: part.sessionID,
+          },
+          match.settled,
+        )
         return part
       })
 
@@ -194,7 +246,7 @@ export const layer = Layer.effect(
       ) {
         const match = yield* readToolCall(toolCallID)
         if (!match || match.part.state.status !== "running") return
-        yield* session.updatePart({
+        const part = yield* session.updatePart({
           ...match.part,
           state: {
             status: "completed",
@@ -206,6 +258,16 @@ export const layer = Layer.effect(
             attachments: output.attachments,
           },
         })
+        storeToolCall(
+          toolCallID,
+          {
+            ...match.call,
+            partID: part.id,
+            messageID: part.messageID,
+            sessionID: part.sessionID,
+          },
+          match.settled,
+        )
         yield* settleToolCall(toolCallID)
       })
 
@@ -258,13 +320,14 @@ export const layer = Layer.effect(
             ...existing.part,
             metadata: { ...existing.part.metadata, providerExecuted: true },
           })
-          ctx.toolcalls[input.id] = {
+          const call = {
             ...existing.call,
             partID: part.id,
             messageID: part.messageID,
             sessionID: part.sessionID,
           }
-          return { call: ctx.toolcalls[input.id], part }
+          storeToolCall(input.id, call, existing.settled)
+          return { call, part, settled: existing.settled }
         }
         // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
         if (flags.experimentalEventSystem) {
@@ -292,7 +355,25 @@ export const layer = Layer.effect(
           sessionID: part.sessionID,
           inputEnded: false,
         }
-        return { call: ctx.toolcalls[input.id], part }
+        return { call: ctx.toolcalls[input.id], part, settled: false }
+      })
+
+      const startToolCall = Effect.fn("SessionProcessor.startToolCall")(function* (input: {
+        id: string
+        name: string
+        input: Record<string, any>
+        providerExecuted?: boolean
+      }) {
+        yield* ensureToolCall(input)
+        const part = yield* updateToolCall(input.id, (match) =>
+          markToolCallRunning({
+            part: match,
+            name: input.name,
+            args: input.input,
+          }),
+        )
+        if (!part) return yield* Effect.die(`Tool call ${input.id} was not created`)
+        return part
       })
 
       const isFilePart = (value: unknown): value is MessageV2.FilePart => Schema.is(MessageV2.FilePart)(value)
@@ -388,7 +469,7 @@ export const layer = Layer.effect(
                 timestamp: DateTime.makeUnsafe(Date.now()),
               })
             }
-            ctx.toolcalls[value.id] = { ...toolCall.call, inputEnded: true }
+            storeToolCall(value.id, { ...toolCall.call, inputEnded: true }, toolCall.settled)
             return
           }
 
@@ -423,21 +504,14 @@ export const layer = Layer.effect(
                 timestamp: DateTime.makeUnsafe(Date.now()),
               })
             }
-            yield* updateToolCall(value.id, (match) => ({
-              ...match,
-              tool: value.name,
-              state:
-                match.state.status === "running"
-                  ? { ...match.state, input }
-                  : {
-                      status: "running",
-                      input,
-                      time: { start: Date.now() },
-                    },
-              metadata: match.metadata?.providerExecuted
-                ? { ...value.providerMetadata, providerExecuted: true }
-                : value.providerMetadata,
-            }))
+            yield* updateToolCall(value.id, (match) =>
+              markToolCallRunning({
+                part: match,
+                name: value.name,
+                args: input,
+                providerMetadata: value.providerMetadata,
+              }),
+            )
 
             const parts = MessageV2.parts(ctx.assistantMessage.id)
             const recentParts = parts.slice(-DOOM_LOOP_THRESHOLD)
@@ -479,7 +553,7 @@ export const layer = Layer.effect(
                     ),
                     Effect.exit,
                   )
-                : Effect.succeed(Exit.succeed<MessageV2.FilePart>(attachment)),
+                : Effect.succeed(Exit.succeed(attachment)),
             )
             const omitted = normalized.filter(Exit.isFailure).length
             const attachments = normalized.filter(Exit.isSuccess).map((item) => item.value)
@@ -788,8 +862,7 @@ export const layer = Layer.effect(
       ) {
         if (MessageV2.ContextOverflowError.isInstance(error)) {
           ctx.needsCompaction = true
-          if (!ctx.assistantMessage.summary)
-            yield* bus.publish(Session.Event.Error, sessionError(error))
+          if (!ctx.assistantMessage.summary) yield* bus.publish(Session.Event.Error, sessionError(error))
           return
         }
         if (!ctx.assistantMessage.summary) {
@@ -900,6 +973,7 @@ export const layer = Layer.effect(
         get message() {
           return ctx.assistantMessage
         },
+        startToolCall,
         updateToolCall,
         completeToolCall,
         process,
