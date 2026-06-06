@@ -12,6 +12,7 @@ import { Effect, Record } from "effect"
 import { jsonSchema, tool as aiTool, type ModelMessage, type Tool } from "ai"
 import type { Plugin } from "@/plugin"
 import { mergeDeep } from "remeda"
+import { stripRuntimeFallbackContinuationSystem } from "../runtime-fallback-system"
 
 const USER_AGENT = `opencode/${InstallationVersion}`
 
@@ -53,11 +54,12 @@ const mergeOptions = (target: Record<string, any>, source: Record<string, any> |
 
 export const prepare = Effect.fn("LLMRequestPrep.prepare")(function* (input: PrepareInput) {
   const isOpenaiOauth = input.provider.id === "openai" && input.auth?.type === "oauth"
+  const userSystem = stripRuntimeFallbackContinuationSystem(input.user.system)
   const system = [
     [
       ...(input.agent.prompt ? [input.agent.prompt] : SystemPrompt.provider(input.model)),
       ...input.system,
-      ...(input.user.system ? [input.user.system] : []),
+      ...(userSystem ? [userSystem] : []),
     ]
       .filter((x) => x)
       .join("\n"),

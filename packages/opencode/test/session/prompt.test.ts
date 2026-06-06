@@ -94,6 +94,14 @@ function toolPart(parts: MessageV2.Part[]) {
   return parts.find((part): part is MessageV2.ToolPart => part.type === "tool")
 }
 
+function unknownArray(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : []
+}
+
+function hasRole(value: unknown, role: string) {
+  return typeof value === "object" && value !== null && "role" in value && value.role === role
+}
+
 type CompletedToolPart = MessageV2.ToolPart & { state: MessageV2.ToolStateCompleted }
 type ErrorToolPart = MessageV2.ToolPart & { state: MessageV2.ToolStateError }
 
@@ -1307,7 +1315,7 @@ it.instance("retry runs after an errored assistant when retry updates the latest
   }),
 )
 
-it.instance("retry preserves request scope while adding continuation system state", () =>
+it.instance("retry uses continuation system state without persisting it on the user turn", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(providerWithFallbackCfg)
     const prompt = yield* SessionPrompt.Service
@@ -1346,23 +1354,51 @@ it.instance("retry preserves request scope while adding continuation system stat
     if (!retryUser || retryUser.info.role !== "user")
       throw new Error("expected retry to reuse the original user message")
     expect(retryUser.info.system).toContain(originalSystem)
-    expect(retryUser.info.system).toContain(continuationSystem)
+    expect(retryUser.info.system).not.toContain(continuationSystem)
 
     const inputs = yield* llm.inputs
-    const latestMessages = Array.isArray(inputs.at(-1)?.messages)
-      ? (inputs.at(-1)?.messages as Array<{ role?: string }>)
-      : []
-    const systemMessages = latestMessages.filter(
-      (msg) => typeof msg === "object" && msg !== null && "role" in msg && msg.role === "system",
-    )
-    const userMessages = latestMessages.filter(
-      (msg) => typeof msg === "object" && msg !== null && "role" in msg && msg.role === "user",
-    )
+    const latestMessages = unknownArray(inputs.at(-1)?.messages)
+    const systemMessages = latestMessages.filter((msg) => hasRole(msg, "system"))
+    const userMessages = latestMessages.filter((msg) => hasRole(msg, "user"))
     expect(JSON.stringify(systemMessages)).toContain(originalSystem)
     expect(JSON.stringify(systemMessages)).toContain(continuationSystem)
     expect(userMessages).toHaveLength(1)
     expect(JSON.stringify(userMessages)).toContain("continue the current work")
     expect(JSON.stringify(userMessages)).not.toContain("Runtime fallback continuation")
+  }),
+)
+
+it.instance("prompt splits runtime fallback continuation system into transient state", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({ title: "Prompt transient fallback system" })
+    const originalSystem = "Existing request-scoped system"
+    const continuationSystem = [
+      "[runtime-fallback-continuation]",
+      "This dispatch is an internal runtime fallback retry.",
+    ].join("\n")
+    yield* llm.text("fallback prompt reply")
+
+    yield* prompt.prompt({
+      sessionID: session.id,
+      agent: "build",
+      model: ref,
+      system: [originalSystem, continuationSystem].join("\n\n"),
+      parts: [{ type: "text", text: "continue the latest request" }],
+    })
+
+    const messages = yield* sessions.messages({ sessionID: session.id })
+    const promptUser = messages.find((msg) => msg.info.role === "user")
+    if (!promptUser || promptUser.info.role !== "user") throw new Error("expected user message")
+    expect(promptUser.info.system).toBe(originalSystem)
+
+    const inputs = yield* llm.inputs
+    const latestMessages = unknownArray(inputs.at(-1)?.messages)
+    const systemMessages = latestMessages.filter((msg) => hasRole(msg, "system"))
+    expect(JSON.stringify(systemMessages)).toContain(originalSystem)
+    expect(JSON.stringify(systemMessages)).toContain("[runtime-fallback-continuation]")
   }),
 )
 
@@ -1426,7 +1462,7 @@ it.instance("retryAsync materializes a fallback assistant after an errored lates
 
     expect(retryMessage.info.id).toBe(original.id)
     if (retryMessage.info.role === "user") {
-      expect(retryMessage.info.system).toContain(continuationSystem)
+      expect(retryMessage.info.system).toBeUndefined()
     }
     const fallbackAssistant = yield* pollWithTimeout(
       Effect.gen(function* () {
@@ -1449,6 +1485,52 @@ it.instance("retryAsync materializes a fallback assistant after an errored lates
     expect(
       fallbackAssistant.parts.some((part) => part.type === "text" && part.text === "async fallback retry reply"),
     ).toBe(true)
+    const inputs = yield* llm.inputs
+    const latestMessages = unknownArray(inputs.at(-1)?.messages)
+    const systemMessages = latestMessages.filter((msg) => hasRole(msg, "system"))
+    expect(JSON.stringify(systemMessages)).toContain(continuationSystem)
+    expect(JSON.stringify(latestMessages.filter((msg) => hasRole(msg, "user")))).not.toContain(continuationSystem)
+  }),
+)
+
+it.instance("loop strips persisted runtime fallback continuation from user system", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({ title: "Dirty runtime fallback system" })
+    const msg = yield* sessions.updateMessage({
+      id: MessageID.ascending(),
+      role: "user",
+      sessionID: session.id,
+      agent: "build",
+      model: ref,
+      system: [
+        "Existing request-scoped system",
+        "",
+        "[runtime-fallback-continuation]",
+        "This dispatch is an internal runtime fallback retry.",
+      ].join("\n"),
+      time: { created: Date.now() },
+    })
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: msg.id,
+      sessionID: session.id,
+      type: "text",
+      text: "latest user request",
+    })
+    yield* llm.text("clean reply")
+
+    yield* prompt.loop({ sessionID: session.id })
+
+    const inputs = yield* llm.inputs
+    const latestMessages = unknownArray(inputs.at(-1)?.messages)
+    const systemMessages = latestMessages.filter((message) => hasRole(message, "system"))
+    const serializedSystem = JSON.stringify(systemMessages)
+    expect(serializedSystem).toContain("Existing request-scoped system")
+    expect(serializedSystem).not.toContain("[runtime-fallback-continuation]")
+    expect(serializedSystem).not.toContain("internal runtime fallback retry")
   }),
 )
 

@@ -61,6 +61,10 @@ import { referencePromptMetadata, referenceTextPart } from "./prompt/reference"
 import { SessionReminders } from "./reminders"
 import { SessionTools } from "./tools"
 import { LLMEvent } from "@opencode-ai/llm"
+import {
+  extractRuntimeFallbackContinuationSystem,
+  stripRuntimeFallbackContinuationSystem,
+} from "./runtime-fallback-system"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -113,13 +117,6 @@ const NO_PROGRESS_LOOP_MESSAGE =
 
 const INTERNAL_CONTINUATION_SYSTEM_PROMPT =
   "The latest user-role message is an internal continuation marker generated after session compaction, not a new human request. Continue the in-progress request from retained state; do not restart request-intake, intent-routing, or turn-start procedures because of that marker."
-
-function appendUserSystem(existing: string | undefined, next: string | undefined) {
-  if (!next) return existing
-  if (!existing) return next
-  if (existing.includes(next)) return existing
-  return [existing, next].join("\n\n")
-}
 
 function stableJson(value: unknown): string {
   return JSON.stringify(sortJsonValue(value))
@@ -865,7 +862,7 @@ export const layer = Layer.effect(
           modelID: model.modelID,
           variant,
         },
-        system: input.system,
+        system: stripRuntimeFallbackContinuationSystem(input.system),
         format: input.format,
       }
 
@@ -1352,6 +1349,8 @@ export const layer = Layer.effect(
     )(function* (input: PromptInput) {
       const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
       yield* revert.cleanup(session)
+      const transientSystem =
+        input.transientSystem ?? extractRuntimeFallbackContinuationSystem(input.system)
       const message = yield* createUserMessage(input)
       yield* sessions.touch(input.sessionID)
 
@@ -1365,7 +1364,7 @@ export const layer = Layer.effect(
       }
 
       if (input.noReply === true) return message
-      return yield* loop({ sessionID: input.sessionID })
+      return yield* loopWithTransientSystem({ sessionID: input.sessionID }, transientSystem)
     })
 
     const latestUserMessage = Effect.fnUntraced(function* (sessionID: SessionID) {
@@ -1415,7 +1414,7 @@ export const layer = Layer.effect(
         ...retryMessage.info,
         time: { created: retryCreatedAt },
         agent: ag.name,
-        system: appendUserSystem(retryMessage.info.system, input.system),
+        system: stripRuntimeFallbackContinuationSystem(retryMessage.info.system),
         model: {
           providerID: input.model.providerID,
           modelID: input.model.modelID,
@@ -1431,7 +1430,10 @@ export const layer = Layer.effect(
     const retry: (input: RetryInput) => Effect.Effect<MessageV2.WithParts> = Effect.fn("SessionPrompt.retry")(
       function* (input: RetryInput) {
         yield* prepareRetryMessage(input)
-        return yield* loop({ sessionID: input.sessionID })
+        return yield* loopWithTransientSystem(
+          { sessionID: input.sessionID },
+          input.transientSystem ?? extractRuntimeFallbackContinuationSystem(input.system) ?? input.system,
+        )
       },
     )
 
@@ -1439,7 +1441,10 @@ export const layer = Layer.effect(
       function* (input: RetryInput) {
         const message = yield* prepareRetryMessage(input)
 
-        yield* loop({ sessionID: input.sessionID }).pipe(
+        yield* loopWithTransientSystem(
+          { sessionID: input.sessionID },
+          input.transientSystem ?? extractRuntimeFallbackContinuationSystem(input.system) ?? input.system,
+        ).pipe(
           Effect.catchCause((cause) =>
             Effect.gen(function* () {
               const message = Cause.pretty(cause)
@@ -1497,8 +1502,11 @@ export const layer = Layer.effect(
       )
     })
 
-    const runLoop: (sessionID: SessionID) => Effect.Effect<MessageV2.WithParts> = Effect.fn("SessionPrompt.run")(
-      function* (sessionID: SessionID) {
+    const runLoop: (
+      sessionID: SessionID,
+      transientSystem?: string,
+    ) => Effect.Effect<MessageV2.WithParts> = Effect.fn("SessionPrompt.run")(
+      function* (sessionID: SessionID, transientSystem?: string) {
         const ctx = yield* InstanceState.context
         const slog = elog.with({ sessionID })
         let structured: unknown
@@ -1785,6 +1793,9 @@ export const layer = Layer.effect(
               MessageV2.toModelMessagesEffect(modelInputMessages, model),
             ])
             const system = [...env, ...instructions, ...(skills ? [skills] : [])]
+            if (transientSystem) {
+              system.push(transientSystem)
+            }
             if (pendingInternalContinuation) {
               system.push(INTERNAL_CONTINUATION_SYSTEM_PROMPT)
             }
@@ -1858,14 +1869,20 @@ export const layer = Layer.effect(
       },
     )
 
-    const loop: (input: LoopInput) => Effect.Effect<MessageV2.WithParts> = Effect.fn("SessionPrompt.loop")(function* (
+    const loopWithTransientSystem = Effect.fn("SessionPrompt.loopWithTransientSystem")(function* (
       input: LoopInput,
+      transientSystem?: string,
     ) {
       return yield* state.ensureRunning(
         input.sessionID,
         lastAssistantAfterInterrupt(input.sessionID),
-        runLoop(input.sessionID),
+        runLoop(input.sessionID, transientSystem),
       )
+    })
+    const loop: (input: LoopInput) => Effect.Effect<MessageV2.WithParts> = Effect.fn("SessionPrompt.loop")(function* (
+      input: LoopInput,
+    ) {
+      return yield* loopWithTransientSystem(input)
     })
 
     const shell: (input: ShellInput) => Effect.Effect<MessageV2.WithParts, Session.BusyError> = Effect.fn(
@@ -2062,6 +2079,7 @@ export const PromptInput = Schema.Struct({
   }),
   format: Schema.optional(MessageV2.Format),
   system: Schema.optional(Schema.String),
+  transientSystem: Schema.optional(Schema.String),
   variant: Schema.optional(Schema.String),
   parts: Schema.Array(
     Schema.Union([
@@ -2081,6 +2099,7 @@ export const RetryInput = Schema.Struct({
   agent: Schema.optional(Schema.String),
   variant: Schema.optional(Schema.String),
   system: Schema.optional(Schema.String),
+  transientSystem: Schema.optional(Schema.String),
 })
 export type RetryInput = Schema.Schema.Type<typeof RetryInput>
 
