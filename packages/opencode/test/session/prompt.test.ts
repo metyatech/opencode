@@ -102,6 +102,25 @@ function hasRole(value: unknown, role: string) {
   return typeof value === "object" && value !== null && "role" in value && value.role === role
 }
 
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null ? (value as Record<string, unknown>) : undefined
+}
+
+function contentText(value: unknown): string {
+  if (typeof value === "string") return value
+  if (Array.isArray(value)) return value.map(contentText).filter(Boolean).join("\n")
+  const record = asRecord(value)
+  if (!record) return ""
+  return ["text", "content", "value"]
+    .map((key) => contentText(record[key]))
+    .filter(Boolean)
+    .join("\n")
+}
+
+function modelMessageText(value: unknown): string {
+  return contentText(asRecord(value)?.content)
+}
+
 type CompletedToolPart = MessageV2.ToolPart & { state: MessageV2.ToolStateCompleted }
 type ErrorToolPart = MessageV2.ToolPart & { state: MessageV2.ToolStateError }
 
@@ -2193,6 +2212,41 @@ it.instance(
       expect(JSON.stringify(inputs.at(-1)?.messages)).toContain("second")
     }),
   3_000,
+)
+
+it.instance("sends multi-turn prompt history to the LLM in chronological user order", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Chronological History" })
+
+    yield* llm.text("first reply")
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      model: ref,
+      parts: [{ type: "text", text: "first user request" }],
+    })
+
+    yield* llm.text("second reply")
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      model: ref,
+      parts: [{ type: "text", text: "second user request" }],
+    })
+
+    const inputs = yield* llm.inputs
+    const latestMessages = unknownArray(inputs.at(-1)?.messages)
+    const userTexts = latestMessages.filter((msg) => hasRole(msg, "user")).map(modelMessageText)
+    const firstIndex = userTexts.findIndex((text) => text.includes("first user request"))
+    const secondIndex = userTexts.findIndex((text) => text.includes("second user request"))
+
+    expect(firstIndex).toBeGreaterThanOrEqual(0)
+    expect(secondIndex).toBeGreaterThan(firstIndex)
+    expect(userTexts.at(-1)).toContain("second user request")
+  }),
 )
 
 it.instance(

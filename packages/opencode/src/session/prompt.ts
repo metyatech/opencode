@@ -271,7 +271,8 @@ export const layer = Layer.effect(
     })
 
     const compactedMessages = Effect.fn("SessionPrompt.compactedMessages")(function* (sessionID: SessionID) {
-      return MessageV2.filterCompacted(yield* sessions.messages({ sessionID }).pipe(Effect.orDie))
+      const messages = yield* sessions.messages({ sessionID }).pipe(Effect.orDie)
+      return MessageV2.filterCompacted(messages.slice().reverse())
     })
 
     const resolvePromptParts = Effect.fn("SessionPrompt.resolvePromptParts")(function* (template: string) {
