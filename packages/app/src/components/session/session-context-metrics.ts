@@ -41,7 +41,7 @@ type StepFinishPart = Extract<Part, { type: "step-finish" }>
 type TokenUsage = AssistantMessage["tokens"]
 
 const tokenTotal = (tokens: TokenUsage) => {
-  return tokens.total || tokens.input + tokens.output + tokens.cache.read + tokens.cache.write
+  return tokens.total || tokens.input + tokens.output + tokens.reasoning + tokens.cache.read + tokens.cache.write
 }
 
 const isStepFinishPart = (part: Part): part is StepFinishPart => {

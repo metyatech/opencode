@@ -61,4 +61,40 @@ describe("sidebar context usage", () => {
     expect(latestAssistantRequestTokens({ message, parts: [] })).toEqual(message.tokens)
     expect(hasAssistantContextTokens({ message, parts: [] })).toBe(true)
   })
+
+  test("treats reasoning-only and cache-write-only latest step-finish tokens as context usage", () => {
+    const message = assistant({
+      input: 0,
+      output: 0,
+      reasoning: 0,
+      cache: { read: 0, write: 0 },
+    })
+
+    expect(
+      hasAssistantContextTokens({
+        message,
+        parts: [
+          stepFinish("step_reasoning", {
+            input: 0,
+            output: 0,
+            reasoning: 5,
+            cache: { read: 0, write: 0 },
+          }),
+        ],
+      }),
+    ).toBe(true)
+    expect(
+      hasAssistantContextTokens({
+        message,
+        parts: [
+          stepFinish("step_cache_write", {
+            input: 0,
+            output: 0,
+            reasoning: 0,
+            cache: { read: 0, write: 5 },
+          }),
+        ],
+      }),
+    ).toBe(true)
+  })
 })

@@ -85,14 +85,14 @@ describe("getSessionContextMetrics", () => {
 
     expect(metrics.totalCost).toBe(1.75)
     expect(metrics.context?.message.id).toBe("a2")
-    expect(metrics.context?.total).toBe(450)
+    expect(metrics.context?.total).toBe(500)
     expect(metrics.context?.limit).toBe(900)
-    expect(metrics.context?.usage).toBe(50)
+    expect(metrics.context?.usage).toBe(56)
     expect(metrics.context?.providerLabel).toBe("OpenAI")
     expect(metrics.context?.modelLabel).toBe("GPT-4.1")
   })
 
-  test("uses latest step-finish tokens for current context while keeping cost cumulative", () => {
+  test("uses latest step-finish tokens including reasoning and cache writes while keeping cost cumulative", () => {
     const messages = [
       assistant("a1", { input: 20, output: 10, reasoning: 0, read: 0, write: 0 }, 0.25),
       assistant("a2", { input: 3_000_000, output: 500_000, reasoning: 10_000, read: 100_000, write: 0 }, 10),
@@ -100,7 +100,7 @@ describe("getSessionContextMetrics", () => {
     const parts = {
       a2: [
         stepFinish("step_old", "a2", { input: 800, output: 60, reasoning: 0, read: 80, write: 0 }),
-        stepFinish("step_new", "a2", { input: 200, output: 10, reasoning: 5, read: 20, write: 0 }),
+        stepFinish("step_new", "a2", { input: 200, output: 10, reasoning: 5, read: 20, write: 7 }),
       ],
     }
     const providers = [
@@ -122,8 +122,9 @@ describe("getSessionContextMetrics", () => {
     expect(metrics.context?.output).toBe(10)
     expect(metrics.context?.reasoning).toBe(5)
     expect(metrics.context?.cacheRead).toBe(20)
-    expect(metrics.context?.total).toBe(230)
-    expect(metrics.context?.usage).toBe(26)
+    expect(metrics.context?.cacheWrite).toBe(7)
+    expect(metrics.context?.total).toBe(242)
+    expect(metrics.context?.usage).toBe(27)
   })
 
   test("uses input budget when the model has a dedicated prompt limit", () => {

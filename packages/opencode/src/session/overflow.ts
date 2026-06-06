@@ -32,7 +32,7 @@ export function usage(input: {
 }
 
 export function tokenTotal(tokens: MessageV2.Assistant["tokens"]) {
-  return tokens.total || tokens.input + tokens.output + tokens.cache.read + tokens.cache.write
+  return tokens.total || tokens.input + tokens.output + tokens.reasoning + tokens.cache.read + tokens.cache.write
 }
 
 export function isOverflow(input: {

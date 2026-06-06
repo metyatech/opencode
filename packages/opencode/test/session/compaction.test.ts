@@ -31,6 +31,11 @@ import { SyncEvent } from "@/sync"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { LLMEvent, Usage } from "@opencode-ai/llm"
+import {
+  isOverflow as rawIsOverflow,
+  tokenTotal as rawTokenTotal,
+  usage as rawUsage,
+} from "../../src/session/overflow"
 
 void Log.init({ print: false })
 
@@ -376,6 +381,33 @@ function autocontinue(enabled: boolean) {
 }
 
 describe("session.compaction.isOverflow", () => {
+  test("raw overflow helpers include reasoning and cache.write when total is unavailable", () => {
+    const cfg = {} as Config.Info
+    const model = createModel({ context: 100_000, output: 32_000 })
+    const tokens = { input: 60_000, output: 3_000, reasoning: 3_000, cache: { read: 1_000, write: 2_000 } }
+
+    expect(rawTokenTotal(tokens)).toBe(69_000)
+    expect(rawUsage({ cfg, tokens, model }).total).toBe(69_000)
+    expect(rawUsage({ cfg, tokens, model }).percent).toBe(100)
+    expect(rawIsOverflow({ cfg, tokens, model })).toBe(true)
+  })
+
+  test("raw overflow helpers prefer non-zero tokens.total over component sums", () => {
+    const cfg = {} as Config.Info
+    const model = createModel({ context: 100_000, output: 32_000 })
+    const tokens = {
+      total: 1,
+      input: 100_000,
+      output: 100_000,
+      reasoning: 100_000,
+      cache: { read: 100_000, write: 100_000 },
+    }
+
+    expect(rawTokenTotal(tokens)).toBe(1)
+    expect(rawUsage({ cfg, tokens, model }).total).toBe(1)
+    expect(rawIsOverflow({ cfg, tokens, model })).toBe(false)
+  })
+
   it.live(
     "returns true when token count exceeds usable context",
     provideTmpdirInstance(() =>

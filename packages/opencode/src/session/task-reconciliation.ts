@@ -65,9 +65,10 @@ function childForPart(part: MessageV2.ToolPart, children: Info[], used: Set<Sess
 
   const title = taskTitle(part)
   const minCreated = taskStart(part) - TITLE_MATCH_SKEW_MS
-  return children
+  const candidates = children
     .filter((child) => !used.has(child.id) && child.time.created >= minCreated && matchesTaskTitle(child, title))
-    .sort((a, b) => a.time.created - b.time.created || a.id.localeCompare(b.id))[0]
+    .sort((a, b) => a.time.created - b.time.created || a.id.localeCompare(b.id))
+  return candidates.length === 1 ? candidates[0] : undefined
 }
 
 const childResult = Effect.fn("SessionTaskReconciliation.childResult")(function* (ops: SessionOps, child: Info) {
