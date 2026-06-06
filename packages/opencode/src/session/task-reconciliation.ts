@@ -59,16 +59,22 @@ function matchesTaskTitle(child: Info, title: string) {
   return child.title === title || child.title.startsWith(`${title} (@`)
 }
 
-function childForPart(part: MessageV2.ToolPart, children: Info[], used: Set<SessionID>) {
+function childForPart(part: MessageV2.ToolPart, children: Info[], used: Set<SessionID>, childSessionID?: SessionID) {
   const sessionID = metadataSessionID(part)
-  if (sessionID) return children.find((child) => child.id === sessionID && !used.has(child.id))
+  if (sessionID) {
+    const child = children.find((child) => child.id === sessionID && !used.has(child.id))
+    if (childSessionID && child?.id !== childSessionID) return undefined
+    return child
+  }
 
   const title = taskTitle(part)
   const minCreated = taskStart(part) - TITLE_MATCH_SKEW_MS
   const candidates = children
     .filter((child) => !used.has(child.id) && child.time.created >= minCreated && matchesTaskTitle(child, title))
     .sort((a, b) => a.time.created - b.time.created || a.id.localeCompare(b.id))
-  return candidates.length === 1 ? candidates[0] : undefined
+  if (candidates.length !== 1) return undefined
+  if (childSessionID && candidates[0]?.id !== childSessionID) return undefined
+  return candidates[0]
 }
 
 const childResult = Effect.fn("SessionTaskReconciliation.childResult")(function* (ops: SessionOps, child: Info) {
@@ -90,6 +96,7 @@ const childResult = Effect.fn("SessionTaskReconciliation.childResult")(function*
 export const reconcileTaskToolParts = Effect.fn("SessionTaskReconciliation.reconcileTaskToolParts")(function* (input: {
   sessionID: SessionID
   messages: MessageV2.WithParts[]
+  childSessionID?: SessionID
   ops: SessionOps
 }) {
   if (
@@ -119,7 +126,7 @@ export const reconcileTaskToolParts = Effect.fn("SessionTaskReconciliation.recon
       if (part.type !== "tool" || part.tool !== "task") continue
       if (part.state.status !== "pending" && part.state.status !== "running") continue
 
-      const child = childForPart(part, children, used)
+      const child = childForPart(part, children, used, input.childSessionID)
       if (!child) continue
 
       const result: ChildResult = yield* childResult(input.ops, child)

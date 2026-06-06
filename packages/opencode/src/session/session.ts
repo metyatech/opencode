@@ -34,11 +34,12 @@ import { WorkspaceID } from "../control-plane/schema"
 import { SessionID, MessageID, PartID } from "./schema"
 import { ModelID, ProviderID } from "@/provider/schema"
 import { reconcileTaskToolParts } from "./task-reconciliation"
+import { SessionStatus } from "./status"
 
 import type { Provider } from "@/provider/provider"
 import { Permission } from "@/permission"
 import { Global } from "@opencode-ai/core/global"
-import { Effect, Layer, Option, Context, Schema, Types } from "effect"
+import { Effect, Layer, Option, Context, Schema, Stream, Types } from "effect"
 import { NonNegativeInt, optionalOmitUndefined } from "@opencode-ai/core/schema"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 
@@ -531,6 +532,11 @@ export const layer: Layer.Layer<
     const sync = yield* SyncEvent.Service
     const flags = yield* RuntimeFlags.Service
 
+    let taskReconciliationWatcher: InstanceState.InstanceState<boolean> | undefined
+    const ensureTaskReconciliationWatcher: Effect.Effect<void> = Effect.gen(function* () {
+      if (taskReconciliationWatcher) yield* InstanceState.get(taskReconciliationWatcher)
+    })
+
     const createNext = Effect.fn("Session.createNext")(function* (input: {
       id?: SessionID
       title?: string
@@ -565,6 +571,7 @@ export const layer: Layer.Layer<
       }
       log.info("created", result)
 
+      yield* ensureTaskReconciliationWatcher
       yield* sync.run(Event.Created, { sessionID: result.id, info: result })
 
       if (!flags.experimentalWorkspaces) {
@@ -628,12 +635,14 @@ export const layer: Layer.Layer<
 
     const updateMessage = <T extends MessageV2.Info>(msg: T): Effect.Effect<T> =>
       Effect.gen(function* () {
+        yield* ensureTaskReconciliationWatcher
         yield* sync.run(MessageV2.Event.Updated, { sessionID: msg.sessionID, info: msg })
         return msg
       }).pipe(Effect.withSpan("Session.updateMessage"))
 
     const updatePart = <T extends MessageV2.Part>(part: T): Effect.Effect<T> =>
       Effect.gen(function* () {
+        yield* ensureTaskReconciliationWatcher
         yield* sync.run(MessageV2.Event.PartUpdated, {
           sessionID: part.sessionID,
           part: structuredClone(part),
@@ -775,13 +784,12 @@ export const layer: Layer.Layer<
         .pipe(Effect.orElseSucceed((): Snapshot.FileDiff[] => []))
     })
 
-    const messages: Interface["messages"] = Effect.fn("Session.messages")(function* (input) {
-      if (input.limit)
-        return yield* reconcileTaskToolParts({
-          sessionID: input.sessionID,
-          messages: (yield* MessageV2.page({ sessionID: input.sessionID, limit: input.limit })).items,
-          ops: { children, findMessage, updatePart, updateMessage },
-        })
+    const loadMessages: (input: {
+      sessionID: SessionID
+      limit?: number
+    }) => Effect.Effect<MessageV2.WithParts[], NotFoundError> = Effect.fn("Session.loadMessages")(function* (input) {
+      yield* ensureTaskReconciliationWatcher
+      if (input.limit) return (yield* MessageV2.page({ sessionID: input.sessionID, limit: input.limit })).items
 
       const size = 50
       const result = [] as MessageV2.WithParts[]
@@ -796,9 +804,13 @@ export const layer: Layer.Layer<
         if (!page.more || !page.cursor) break
         before = page.cursor
       }
+      return result.reverse()
+    })
+
+    const messages: Interface["messages"] = Effect.fn("Session.messages")(function* (input) {
       return yield* reconcileTaskToolParts({
         sessionID: input.sessionID,
-        messages: result.reverse(),
+        messages: yield* loadMessages(input),
         ops: { children, findMessage, updatePart, updateMessage },
       })
     })
@@ -853,6 +865,35 @@ export const layer: Layer.Layer<
       }
       return Option.none<MessageV2.WithParts>()
     })
+
+    const reconcileParentTaskPartsForChild: (childSessionID: SessionID) => Effect.Effect<void> = Effect.fn(
+      "Session.reconcileParentTaskPartsForChild",
+    )(function* (childSessionID) {
+      const child = yield* get(childSessionID).pipe(Effect.option)
+      if (Option.isNone(child) || !child.value.parentID) return
+
+      const parentMessages = yield* loadMessages({ sessionID: child.value.parentID }).pipe(Effect.option)
+      if (Option.isNone(parentMessages)) return
+
+      yield* reconcileTaskToolParts({
+        sessionID: child.value.parentID,
+        messages: parentMessages.value,
+        childSessionID: child.value.id,
+        ops: { children, findMessage, updatePart, updateMessage },
+      })
+    })
+
+    taskReconciliationWatcher = yield* InstanceState.make(
+      Effect.fn("Session.taskReconciliationWatcher")(function* () {
+        yield* (yield* bus.subscribe(SessionStatus.Event.Idle)).pipe(
+          Stream.runForEach((event) =>
+            reconcileParentTaskPartsForChild(event.properties.sessionID).pipe(Effect.catchCause(() => Effect.void)),
+          ),
+          Effect.forkScoped,
+        )
+        return true
+      }),
+    )
 
     return Service.of({
       list,
