@@ -245,7 +245,13 @@ export const layer = Layer.effect(
         },
       ) {
         const match = yield* readToolCall(toolCallID)
-        if (!match || match.part.state.status !== "running") return
+        if (!match) return
+        if (match.part.state.status !== "running") {
+          if (match.part.state.status === "completed" || match.part.state.status === "error") {
+            yield* settleToolCall(toolCallID)
+          }
+          return
+        }
         const part = yield* session.updatePart({
           ...match.part,
           state: {
@@ -273,7 +279,13 @@ export const layer = Layer.effect(
 
       const failToolCall = Effect.fn("SessionProcessor.failToolCall")(function* (toolCallID: string, error: unknown) {
         const match = yield* readToolCall(toolCallID)
-        if (!match || match.part.state.status !== "running") return false
+        if (!match) return false
+        if (match.part.state.status !== "running") {
+          if (match.part.state.status === "completed" || match.part.state.status === "error") {
+            yield* settleToolCall(toolCallID)
+          }
+          return false
+        }
         yield* session.updatePart({
           ...match.part,
           state: {
@@ -822,6 +834,10 @@ export const layer = Layer.effect(
           const match = yield* readToolCall(toolCallID)
           if (!match) continue
           const part = match.part
+          if (part.state.status === "completed" || part.state.status === "error") {
+            yield* settleToolCall(toolCallID)
+            continue
+          }
           const end = Date.now()
           const metadata = "metadata" in part.state && isRecord(part.state.metadata) ? part.state.metadata : {}
           yield* session.updatePart({

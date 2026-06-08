@@ -845,6 +845,93 @@ it.live("session.processor effect tests preserve early tool completion when the 
   ),
 )
 
+it.live("session.processor effect tests settle externally completed tool calls when the stream result arrives", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        const input = {
+          description: "inspect bug",
+          prompt: "look into the cache key path",
+          subagent_type: "general",
+        }
+
+        yield* llm.tool("task", input)
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "tool")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+        })
+
+        const early = yield* handle.startToolCall({
+          id: "call_1",
+          name: "task",
+          input,
+        })
+        if (early.state.status !== "running") throw new Error("expected running tool call")
+        yield* session.updatePart({
+          ...early,
+          state: {
+            status: "completed",
+            input,
+            title: "inspect bug",
+            metadata: { sessionId: "ses_child" },
+            output: "externally reconciled child done",
+            time: { start: early.state.time.start, end: Date.now() },
+          },
+        })
+
+        const value = yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies MessageV2.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "tool" }],
+          tools: {
+            task: tool({
+              description: "Run a task",
+              inputSchema: z.object({
+                description: z.string(),
+                prompt: z.string(),
+                subagent_type: z.string(),
+              }),
+              execute: async () => ({
+                title: "late task result",
+                output: "late child done",
+                metadata: { sessionId: "ses_late" },
+              }),
+            }),
+          },
+        })
+
+        const calls = MessageV2.parts(msg.id).filter((part): part is MessageV2.ToolPart => part.type === "tool")
+        expect(value).toBe("continue")
+        expect(calls).toHaveLength(1)
+        expect(calls[0]?.callID).toBe("call_1")
+        expect(calls[0]?.state.status).toBe("completed")
+        if (calls[0]?.state.status !== "completed") return
+        expect(calls[0].state.input).toEqual(input)
+        expect(calls[0].state.output).toBe("externally reconciled child done")
+        expect(calls[0].state.title).toBe("inspect bug")
+        expect(calls[0].state.metadata).toEqual({ sessionId: "ses_child" })
+      }),
+    { config: (url) => providerCfg(url) },
+  ),
+)
+
 it.live("session.processor effect tests mark pending tools as aborted on cleanup", () =>
   provideTmpdirServer(
     ({ dir, llm }) =>
