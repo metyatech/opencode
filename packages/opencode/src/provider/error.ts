@@ -46,8 +46,39 @@ const OVERFLOW_PATTERNS = [
 function isOpenAiErrorRetryable(e: APICallError) {
   const status = e.statusCode
   if (!status) return e.isRetryable
-  // openai sometimes returns 404 for models that are actually available
-  return status === 404 || e.isRetryable
+  if (status === 404) {
+    // 404 can mean two very different things for OpenAI-compatible
+    // providers (notably github-copilot):
+    //
+    //   (a) a transient 404 where the upstream momentarily cannot resolve
+    //       the resource. The original comment noted "openai sometimes
+    //       returns 404 for models that are actually available"; that case
+    //       remains retryable.
+    //
+    //   (b) a hard "model not found" lookup failure — typically because
+    //       the session has been idle long enough to lose server-side
+    //       state. The provider returns `error.code: "model_not_found"`
+    //       (Copilot: "Requested entity was not found."). Retrying this
+    //       does not help; it just walks the runtime-fallback chain all
+    //       the way to the terminal model while the user is still
+    //       thinking about their reply.
+    //
+    // Decision rule:
+    //   - If the body explicitly says "model not found" (in any
+    //     whitespace/hyphen/underscore variant), the error is a hard
+    //     lookup failure and is NOT retryable, regardless of what the
+    //     provider SDK reported in `e.isRetryable`.
+    //   - Otherwise the original "404 → retryable" fallback applies so
+    //     that genuine transient 404s (which the OpenAI SDK often
+    //     reports as `isRetryable: false`) still get retried, matching
+    //     the pre-existing behaviour.
+    const body = e.responseBody
+    if (typeof body === "string" && /model[\s_-]*not[\s_-]*found/i.test(body)) {
+      return false
+    }
+    return true
+  }
+  return e.isRetryable
 }
 
 // Providers not reliably handled in this function:
@@ -210,11 +241,33 @@ export function parseAPICallError(input: { providerID: ProviderID; error: APICal
     type: "api_error",
     message: m,
     statusCode: input.error.statusCode,
-    isRetryable: input.providerID.startsWith("openai") ? isOpenAiErrorRetryable(input.error) : input.error.isRetryable,
+    isRetryable: classifyIsRetryable(input.providerID, input.error),
     responseHeaders: input.error.responseHeaders,
     responseBody: input.error.responseBody,
     metadata,
   }
+}
+
+/**
+ * Decide whether an APICallError should be treated as retryable by the
+ * session-retry policy. Pure routing layer; no I/O.
+ *
+ * - OpenAI and OpenAI-compatible providers (providerID starting with
+ *   "openai") consult `isOpenAiErrorRetryable` for the nuanced 404
+ *   treatment described there.
+ * - GitHub Copilot (providerID "github-copilot") goes through the same
+ *   404 body check, because Copilot sessions also lose server-side state
+ *   after long idles and return `error.code: "model_not_found"` on the
+ *   subsequent request. Without this branch, those 404s fall through to
+ *   the raw `e.isRetryable` (often true) and walk the runtime-fallback
+ *   chain all the way to the terminal model.
+ * - Other providers preserve the SDK's `e.isRetryable` as-is.
+ */
+function classifyIsRetryable(providerID: ProviderID, e: APICallError): boolean {
+  if (providerID.startsWith("openai") || providerID === "github-copilot") {
+    return isOpenAiErrorRetryable(e)
+  }
+  return e.isRetryable
 }
 
 export * as ProviderError from "./error"
