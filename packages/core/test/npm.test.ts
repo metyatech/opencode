@@ -43,25 +43,29 @@ describe("Npm.sanitize", () => {
 })
 
 describe("Npm.add", () => {
-  test("reifies when package cache directory exists without the package installed", async () => {
-    await using tmp = await tmpdir()
-    await fs.mkdir(path.join(tmp.path, "fixture-provider"))
-    await writePackage(path.join(tmp.path, "fixture-provider"), {
-      name: "fixture-provider",
-      main: "index.js",
-    })
-    await Bun.write(path.join(tmp.path, "fixture-provider", "index.js"), "export const fixture = true\n")
+  test(
+    "reifies when package cache directory exists without the package installed",
+    async () => {
+      await using tmp = await tmpdir()
+      await fs.mkdir(path.join(tmp.path, "fixture-provider"))
+      await writePackage(path.join(tmp.path, "fixture-provider"), {
+        name: "fixture-provider",
+        main: "index.js",
+      })
+      await Bun.write(path.join(tmp.path, "fixture-provider", "index.js"), "export const fixture = true\n")
 
-    const spec = `fixture-provider@file:${path.join(tmp.path, "fixture-provider")}`
-    await fs.mkdir(path.join(tmp.path, "cache", "packages", Npm.sanitize(spec)), { recursive: true })
+      const spec = `fixture-provider@file:${path.join(tmp.path, "fixture-provider")}`
+      await fs.mkdir(path.join(tmp.path, "cache", "packages", Npm.sanitize(spec)), { recursive: true })
 
-    const entry = await Effect.gen(function* () {
-      const npm = yield* Npm.Service
-      return yield* npm.add(spec)
-    }).pipe(Effect.scoped, Effect.provide(npmLayer(path.join(tmp.path, "cache"))), Effect.runPromise)
+      const entry = await Effect.gen(function* () {
+        const npm = yield* Npm.Service
+        return yield* npm.add(spec)
+      }).pipe(Effect.scoped, Effect.provide(npmLayer(path.join(tmp.path, "cache"))), Effect.runPromise)
 
-    expect(Option.isSome(entry.entrypoint)).toBe(true)
-  })
+      expect(Option.isSome(entry.entrypoint)).toBe(true)
+    },
+    process.platform === "win32" ? 15_000 : 5_000,
+  )
 })
 
 describe("Npm.install", () => {

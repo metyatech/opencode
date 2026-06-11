@@ -1,9 +1,10 @@
 import { chmod, mkdir, readFile, stat as statFile, writeFile } from "fs/promises"
 import { createWriteStream, existsSync, statSync } from "fs"
 import { realpathSync } from "fs"
-import { dirname, isAbsolute, join, relative, resolve as pathResolve, win32 } from "path"
+import { dirname, isAbsolute, join, resolve as pathResolve, win32 } from "path"
 import { Readable } from "stream"
 import { pipeline } from "stream/promises"
+import { AppFileSystem } from "@opencode-ai/core/filesystem"
 import { Glob } from "@opencode-ai/core/util/glob"
 import { fileURLToPath } from "url"
 
@@ -162,15 +163,8 @@ export function windowsPath(p: string): string {
       .replace(/^\/mnt\/([a-zA-Z])(?:\/|$)/, (_, drive) => `${drive.toUpperCase()}:/`)
   )
 }
-export function overlaps(a: string, b: string) {
-  const relA = relative(a, b)
-  const relB = relative(b, a)
-  return !relA || !relA.startsWith("..") || !relB || !relB.startsWith("..")
-}
-
-export function contains(parent: string, child: string) {
-  return !relative(parent, child).startsWith("..")
-}
+export const overlaps = AppFileSystem.overlaps
+export const contains = AppFileSystem.contains
 
 export async function findUp(
   target: string,

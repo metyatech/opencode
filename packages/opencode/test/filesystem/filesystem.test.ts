@@ -308,6 +308,10 @@ describe("AppFileSystem", () => {
     test("contains checks path containment", () => {
       expect(AppFileSystem.contains("/a/b", "/a/b/c")).toBe(true)
       expect(AppFileSystem.contains("/a/b", "/a/c")).toBe(false)
+      expect(AppFileSystem.contains("/a/b", "/a/b-other")).toBe(false)
+      if (process.platform === "win32") {
+        expect(AppFileSystem.contains("C:\\project", "D:\\outside")).toBe(false)
+      }
     })
 
     test("overlaps detects overlapping paths", () => {

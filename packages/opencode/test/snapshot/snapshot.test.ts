@@ -6,6 +6,7 @@ import fs from "fs/promises"
 import path from "path"
 import { Effect, Fiber, Layer } from "effect"
 import { Snapshot } from "../../src/snapshot"
+import { fileSymlinksAvailable, directorySymlinkType } from "../lib/symlink"
 import { disposeAllInstances, provideInstance, TestInstance, tmpdirScoped } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
 
@@ -176,7 +177,9 @@ it.instance(
   { git: true },
 )
 
-it.instance(
+const fileSymlinkIt = fileSymlinksAvailable ? it.instance : it.instance.skip
+
+fileSymlinkIt(
   "symlink handling",
   withTrackedSnapshot(({ tmp, snapshot, before }) =>
     Effect.gen(function* () {
@@ -369,14 +372,14 @@ it.instance(
   { git: true },
 )
 
-it.instance(
+fileSymlinkIt(
   "nested symlinks",
   withTrackedSnapshot(({ tmp, snapshot, before }) =>
     Effect.gen(function* () {
       yield* mkdirp(`${tmp.path}/sub/dir`)
       yield* write(`${tmp.path}/sub/dir/target.txt`, "target content")
       yield* Effect.promise(() => fs.symlink(`${tmp.path}/sub/dir/target.txt`, `${tmp.path}/sub/dir/link.txt`, "file"))
-      yield* Effect.promise(() => fs.symlink(`${tmp.path}/sub`, `${tmp.path}/sub-link`, "dir"))
+      yield* Effect.promise(() => fs.symlink(`${tmp.path}/sub`, `${tmp.path}/sub-link`, directorySymlinkType))
       const patch = yield* snapshot.patch(before)
       expect(patch.files).toContain(fwd(tmp.path, "sub", "dir", "link.txt"))
       expect(patch.files).toContain(fwd(tmp.path, "sub-link"))

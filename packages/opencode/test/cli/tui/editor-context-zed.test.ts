@@ -10,6 +10,7 @@ import {
   resolveZedSelection,
 } from "../../../src/cli/cmd/tui/context/editor-zed"
 import { tmpdir } from "../../fixture/fixture"
+import { directorySymlinkType } from "../../lib/symlink"
 
 const originalZedTerm = process.env.ZED_TERM
 const originalTermProgram = process.env.TERM_PROGRAM
@@ -86,7 +87,7 @@ test("offsetToPosition converts Zed offsets to 1-based editor positions", () => 
 test("resolveZedDbPath skips candidates that cannot be stated", async () => {
   await using tmp = await tmpdir()
   const loop = path.join(tmp.path, "loop")
-  await symlink(loop, loop)
+  await symlink(loop, loop, directorySymlinkType)
   const home = spyOn(os, "homedir").mockImplementation(() => tmp.path)
   const previous = process.env.OPENCODE_ZED_DB
   process.env.OPENCODE_ZED_DB = loop

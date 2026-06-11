@@ -3,6 +3,7 @@ import path from "path"
 import fs from "fs/promises"
 import { Glob } from "@opencode-ai/core/util/glob"
 import { tmpdir } from "../fixture/fixture"
+import { directorySymlinkType } from "../lib/symlink"
 
 describe("Glob", () => {
   describe("scan()", () => {
@@ -78,7 +79,7 @@ describe("Glob", () => {
       await using tmp = await tmpdir()
       await fs.mkdir(path.join(tmp.path, "realdir"))
       await fs.writeFile(path.join(tmp.path, "realdir", "file.txt"), "", "utf-8")
-      await fs.symlink(path.join(tmp.path, "realdir"), path.join(tmp.path, "linkdir"))
+      await fs.symlink(path.join(tmp.path, "realdir"), path.join(tmp.path, "linkdir"), directorySymlinkType)
 
       const results = await Glob.scan("**/*.txt", { cwd: tmp.path })
 
@@ -89,7 +90,7 @@ describe("Glob", () => {
       await using tmp = await tmpdir()
       await fs.mkdir(path.join(tmp.path, "realdir"))
       await fs.writeFile(path.join(tmp.path, "realdir", "file.txt"), "", "utf-8")
-      await fs.symlink(path.join(tmp.path, "realdir"), path.join(tmp.path, "linkdir"))
+      await fs.symlink(path.join(tmp.path, "realdir"), path.join(tmp.path, "linkdir"), directorySymlinkType)
 
       const results = await Glob.scan("**/*.txt", { cwd: tmp.path, symlink: true })
 

@@ -3,6 +3,7 @@ import path from "path"
 import fs from "fs/promises"
 import { Filesystem } from "@/util/filesystem"
 import { tmpdir } from "../fixture/fixture"
+import { directorySymlinkType } from "../lib/symlink"
 
 describe("filesystem", () => {
   describe("exists()", () => {
@@ -597,7 +598,7 @@ describe("filesystem", () => {
       const target = path.join(tmp.path, "real")
       await fs.mkdir(target)
       const link = path.join(tmp.path, "link")
-      await fs.symlink(target, link)
+      await fs.symlink(target, link, directorySymlinkType)
       expect(Filesystem.resolve(link)).toBe(Filesystem.resolve(target))
     })
 
@@ -612,8 +613,8 @@ describe("filesystem", () => {
       await using tmp = await tmpdir()
       const a = path.join(tmp.path, "a")
       const b = path.join(tmp.path, "b")
-      await fs.symlink(b, a)
-      await fs.symlink(a, b)
+      await fs.symlink(b, a, directorySymlinkType)
+      await fs.symlink(a, b, directorySymlinkType)
       expect(() => Filesystem.resolve(a)).toThrow()
     })
 

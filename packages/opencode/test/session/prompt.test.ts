@@ -2524,7 +2524,7 @@ it.instance(
       expect(yield* llm.calls).toBe(1)
     }),
   { git: true },
-  3_000,
+  process.platform === "win32" ? 10_000 : 3_000,
 )
 
 it.instance(
@@ -2563,7 +2563,7 @@ it.instance(
       expect(yield* llm.calls).toBe(1)
     }),
   { git: true },
-  3_000,
+  process.platform === "win32" ? 10_000 : 3_000,
 )
 
 unix(
