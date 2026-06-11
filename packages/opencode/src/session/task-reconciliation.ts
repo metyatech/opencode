@@ -55,6 +55,10 @@ function taskStart(part: MessageV2.ToolPart) {
   return part.state.status === "running" ? part.state.time.start : 0
 }
 
+function isTerminalToolPart(part: MessageV2.Part) {
+  return part.type !== "tool" || part.state.status === "completed" || part.state.status === "error"
+}
+
 function matchesTaskTitle(child: Info, title: string) {
   return child.title === title || child.title.startsWith(`${title} (@`)
 }
@@ -118,6 +122,7 @@ export const reconcileTaskToolParts = Effect.fn("SessionTaskReconciliation.recon
   const used = new Set<SessionID>()
   const parts = new Map<string, MessageV2.ToolPart>()
   const messages = new Map<string, MessageV2.Assistant>()
+  const messageCompletionCandidates = new Map<string, number>()
 
   for (const msg of input.messages) {
     if (msg.info.role !== "assistant") continue
@@ -160,18 +165,25 @@ export const reconcileTaskToolParts = Effect.fn("SessionTaskReconciliation.recon
               },
             } satisfies MessageV2.ToolPart)
       parts.set(part.id, updated)
-
-      if (!msg.info.finish && !msg.info.error) {
-        messages.set(
-          msg.info.id,
-          yield* input.ops.updateMessage({
-            ...msg.info,
-            finish: "tool-calls",
-            time: { ...msg.info.time, completed: msg.info.time.completed ?? now },
-          }),
-        )
-      }
+      messageCompletionCandidates.set(msg.info.id, now)
     }
+  }
+
+  for (const msg of input.messages) {
+    if (msg.info.role !== "assistant" || msg.info.finish || msg.info.error) continue
+    const completed = messageCompletionCandidates.get(msg.info.id)
+    if (!completed) continue
+    const reconciledParts = msg.parts.map((part) => parts.get(part.id) ?? part)
+    if (!reconciledParts.every(isTerminalToolPart)) continue
+
+    messages.set(
+      msg.info.id,
+      yield* input.ops.updateMessage({
+        ...msg.info,
+        finish: "tool-calls",
+        time: { ...msg.info.time, completed: msg.info.time.completed ?? completed },
+      }),
+    )
   }
 
   if (parts.size === 0 && messages.size === 0) return input.messages

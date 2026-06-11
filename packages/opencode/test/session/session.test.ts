@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { Deferred, Effect, Exit, Layer, Option } from "effect"
+import { Deferred, Effect, Exit, Layer, Option, Schema } from "effect"
 import { Session as SessionNs } from "@/session/session"
 import { GlobalBus, type GlobalEvent } from "../../src/bus/global"
 import * as Log from "@opencode-ai/core/util/log"
@@ -58,7 +58,9 @@ describe("session.created event", () => {
       const received = yield* Deferred.make<SessionNs.Info>()
 
       const unsub = subscribeGlobal(SessionNs.Event.Created.type, (event) => {
-        Deferred.doneUnsafe(received, Effect.succeed(event.properties.info as SessionNs.Info))
+        const info = event.properties.info
+        if (!Schema.is(SessionNs.Info)(info)) return
+        Deferred.doneUnsafe(received, Effect.succeed(info))
       })
       yield* Effect.addFinalizer(() => Effect.sync(unsub))
 
@@ -124,17 +126,16 @@ describe("step-finish token propagation via Bus event", () => {
           role: "user",
           time: { created: Date.now() },
           agent: "user",
-          model: { providerID: "test", modelID: "test" },
+          model: { providerID: ProviderID.make("test"), modelID: ModelID.make("test") },
           tools: {},
-          mode: "",
-        } as unknown as MessageV2.Info)
+        } satisfies MessageV2.User)
 
-        // Bus subscribers receive readonly Schema.Type payloads; `MessageV2.Part`
-        // is the mutable domain type. Cast bridges the two — safe because the
-        // test only reads the value afterwards.
+        // Validate the bus payload before storing it as a domain part.
         const received = yield* Deferred.make<MessageV2.Part>()
         const unsub = subscribeGlobal(MessageV2.Event.PartUpdated.type, (event) => {
-          Deferred.doneUnsafe(received, Effect.succeed(event.properties.part as MessageV2.Part))
+          const part = event.properties.part
+          if (!Schema.is(MessageV2.Part)(part)) return
+          Deferred.doneUnsafe(received, Effect.succeed(part))
         })
         yield* Effect.addFinalizer(() => Effect.sync(unsub))
 
@@ -160,7 +161,8 @@ describe("step-finish token propagation via Bus event", () => {
         const receivedPart = yield* awaitDeferred(received, "timed out waiting for message.part.updated")
 
         expect(receivedPart.type).toBe("step-finish")
-        const finish = receivedPart as MessageV2.StepFinishPart
+        if (receivedPart.type !== "step-finish") throw new Error("Expected step-finish part")
+        const finish = receivedPart
         expect(finish.tokens.input).toBe(500)
         expect(finish.tokens.output).toBe(800)
         expect(finish.tokens.reasoning).toBe(200)
@@ -267,6 +269,30 @@ describe("task tool reconciliation", () => {
       ],
     }
   }
+
+  const runningTaskPart = (input: {
+    messageID: MessageID
+    description: string
+    start: number
+    sessionID: SessionIDType
+  }): MessageV2.ToolPart => ({
+    id: PartID.ascending(),
+    messageID: input.messageID,
+    sessionID: parentID,
+    type: "tool",
+    callID: `call_${input.sessionID}`,
+    tool: "task",
+    state: {
+      status: "running",
+      input: {
+        description: input.description,
+        prompt: "do the task",
+        subagent_type: "general",
+      },
+      metadata: { sessionId: input.sessionID },
+      time: { start: input.start },
+    },
+  })
 
   const runReconcile = (input: {
     messages: MessageV2.WithParts[]
@@ -407,6 +433,119 @@ describe("task tool reconciliation", () => {
     expect(secondEnd).toBe(firstEnd)
   })
 
+  test("does not complete the parent message while a sibling task is still running", async () => {
+    const first = child("ses_first_parallel", "First task (@general subagent)", 1_050)
+    const second = child("ses_second_parallel", "Second task (@general subagent)", 1_060)
+    const message = runningTaskMessage({
+      description: "First task",
+      start: 1_000,
+      metadata: { sessionId: first.id },
+    })
+    message.parts.push(
+      runningTaskPart({
+        messageID: message.info.id,
+        description: "Second task",
+        start: 1_010,
+        sessionID: second.id,
+      }),
+    )
+    const updatedMessages: MessageV2.Info[] = []
+
+    const result = await Effect.runPromise(
+      runReconcile({
+        messages: [message],
+        children: [first, second],
+        childMessages: new Map([[first.id, completedChildMessage(first.id, "first completed")]]),
+        updatedMessages,
+      }),
+    )
+
+    expect(taskPart(result[0]?.parts[0])?.state.status).toBe("completed")
+    expect(taskPart(result[0]?.parts[1])?.state.status).toBe("running")
+    expect(result[0]?.info.role).toBe("assistant")
+    if (result[0]?.info.role === "assistant") {
+      expect(result[0].info.finish).toBeUndefined()
+      expect(result[0].info.time.completed).toBeUndefined()
+    }
+    expect(updatedMessages).toHaveLength(0)
+  })
+
+  test("does not complete the parent message while a non-task tool is still running", async () => {
+    const only = child("ses_task_with_shell", "Task with shell (@general subagent)", 1_050)
+    const message = runningTaskMessage({
+      description: "Task with shell",
+      start: 1_000,
+      metadata: { sessionId: only.id },
+    })
+    message.parts.push({
+      id: PartID.ascending(),
+      messageID: message.info.id,
+      sessionID: parentID,
+      type: "tool",
+      callID: "call_shell",
+      tool: "shell",
+      state: {
+        status: "running",
+        input: { command: "build" },
+        time: { start: 1_010 },
+      },
+    })
+    const updatedMessages: MessageV2.Info[] = []
+
+    const result = await Effect.runPromise(
+      runReconcile({
+        messages: [message],
+        children: [only],
+        childMessages: new Map([[only.id, completedChildMessage(only.id, "task completed")]]),
+        updatedMessages,
+      }),
+    )
+
+    expect(taskPart(result[0]?.parts[0])?.state.status).toBe("completed")
+    expect(taskPart(result[0]?.parts[1])?.state.status).toBe("running")
+    expect(updatedMessages).toHaveLength(0)
+  })
+
+  test("completes the parent message once after every sibling task settles", async () => {
+    const first = child("ses_first_settled", "First settled task (@general subagent)", 1_050)
+    const second = child("ses_second_settled", "Second settled task (@general subagent)", 1_060)
+    const message = runningTaskMessage({
+      description: "First settled task",
+      start: 1_000,
+      metadata: { sessionId: first.id },
+    })
+    message.parts.push(
+      runningTaskPart({
+        messageID: message.info.id,
+        description: "Second settled task",
+        start: 1_010,
+        sessionID: second.id,
+      }),
+    )
+    const updatedMessages: MessageV2.Info[] = []
+
+    const result = await Effect.runPromise(
+      runReconcile({
+        messages: [message],
+        children: [first, second],
+        childMessages: new Map([
+          [first.id, completedChildMessage(first.id, "first completed")],
+          [second.id, completedChildMessage(second.id, "second completed")],
+        ]),
+        updatedMessages,
+      }),
+    )
+
+    expect(taskPart(result[0]?.parts[0])?.state.status).toBe("completed")
+    expect(taskPart(result[0]?.parts[1])?.state.status).toBe("completed")
+    expect(updatedMessages).toHaveLength(1)
+    expect(result[0]?.info.role).toBe("assistant")
+    if (result[0]?.info.role === "assistant") {
+      expect(result[0].info.finish).toBe("tool-calls")
+      expect(result[0].info.time.completed).toBeDefined()
+    }
+  })
+
   it.instance("reconciles a parent task part when a child session becomes idle without reading parent messages", () =>
     Effect.gen(function* () {
       const session = yield* SessionNs.Service
@@ -504,7 +643,8 @@ describe("task tool reconciliation", () => {
       const received = yield* Deferred.make<MessageV2.ToolPart>()
       const receivedMessage = yield* Deferred.make<MessageV2.Assistant>()
       const unsubPart = subscribeGlobal(MessageV2.Event.PartUpdated.type, (event) => {
-        const part = event.properties.part as MessageV2.Part
+        const part = event.properties.part
+        if (!Schema.is(MessageV2.Part)(part)) return
         if (
           part.type === "tool" &&
           part.sessionID === parent.id &&
@@ -515,7 +655,8 @@ describe("task tool reconciliation", () => {
         }
       })
       const unsubMessage = subscribeGlobal(MessageV2.Event.Updated.type, (event) => {
-        const info = event.properties.info as MessageV2.Info
+        const info = event.properties.info
+        if (!Schema.is(MessageV2.Info)(info)) return
         if (
           info.role === "assistant" &&
           info.sessionID === parent.id &&
@@ -547,6 +688,183 @@ describe("task tool reconciliation", () => {
         expect(stored.info.finish).toBe("tool-calls")
         expect(stored.info.time.completed).toBeDefined()
       }
+
+      yield* session.remove(parent.id)
+    }),
+  )
+
+  it.instance("waits for every sibling task idle event before completing the parent message", () =>
+    Effect.gen(function* () {
+      const session = yield* SessionNs.Service
+      const bus = yield* Bus.Service
+      const parent = yield* session.create({})
+      const firstChild = yield* session.create({
+        parentID: parent.id,
+        title: "First parallel task (@general subagent)",
+      })
+      const secondChild = yield* session.create({
+        parentID: parent.id,
+        title: "Second parallel task (@general subagent)",
+      })
+      const parentUserID = MessageID.ascending()
+      const parentAssistantID = MessageID.ascending()
+      const firstPartID = PartID.ascending()
+      const secondPartID = PartID.ascending()
+
+      yield* session.updateMessage({
+        id: parentUserID,
+        sessionID: parent.id,
+        role: "user",
+        time: { created: Date.now() },
+        agent: "test",
+        model: { providerID, modelID },
+        tools: {},
+      } satisfies MessageV2.User)
+      yield* session.updateMessage({
+        id: parentAssistantID,
+        sessionID: parent.id,
+        role: "assistant",
+        time: { created: Date.now() },
+        parentID: parentUserID,
+        modelID,
+        providerID,
+        mode: "build",
+        agent: "build",
+        path: { cwd: "/tmp", root: "/tmp" },
+        cost: 0,
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      } satisfies MessageV2.Assistant)
+
+      const addParentTask = (input: { partID: PartID; callID: string; description: string; childID: SessionIDType }) =>
+        session.updatePart({
+          id: input.partID,
+          sessionID: parent.id,
+          messageID: parentAssistantID,
+          type: "tool",
+          callID: input.callID,
+          tool: "task",
+          state: {
+            status: "running",
+            input: {
+              description: input.description,
+              prompt: "Plan the page but do not edit files.",
+              subagent_type: "general",
+            },
+            metadata: { sessionId: input.childID },
+            time: { start: Date.now() },
+          },
+        } satisfies MessageV2.ToolPart)
+
+      yield* addParentTask({
+        partID: firstPartID,
+        callID: "call_first_parallel",
+        description: "First parallel task",
+        childID: firstChild.id,
+      })
+      yield* addParentTask({
+        partID: secondPartID,
+        callID: "call_second_parallel",
+        description: "Second parallel task",
+        childID: secondChild.id,
+      })
+
+      const completeChild = (childID: SessionIDType, text: string) =>
+        Effect.gen(function* () {
+          const userID = MessageID.ascending()
+          const assistantID = MessageID.ascending()
+          yield* session.updateMessage({
+            id: userID,
+            sessionID: childID,
+            role: "user",
+            time: { created: Date.now() },
+            agent: "test",
+            model: { providerID, modelID },
+            tools: {},
+          } satisfies MessageV2.User)
+          const assistant: MessageV2.Assistant = {
+            id: assistantID,
+            sessionID: childID,
+            role: "assistant",
+            time: { created: Date.now() },
+            parentID: userID,
+            modelID,
+            providerID,
+            mode: "build",
+            agent: "build",
+            path: { cwd: "/tmp", root: "/tmp" },
+            cost: 0,
+            tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+          }
+          yield* session.updateMessage(assistant)
+          yield* session.updatePart({
+            id: PartID.ascending(),
+            sessionID: childID,
+            messageID: assistantID,
+            type: "text",
+            text,
+          } satisfies MessageV2.TextPart)
+          yield* session.updateMessage({
+            ...assistant,
+            finish: "stop",
+            time: { ...assistant.time, completed: Date.now() },
+          })
+        })
+
+      const firstReconciled = yield* Deferred.make<void>()
+      const secondReconciled = yield* Deferred.make<void>()
+      const parentCompleted = yield* Deferred.make<void>()
+      const unsubscribePart = subscribeGlobal(MessageV2.Event.PartUpdated.type, (event) => {
+        const part = event.properties.part
+        if (!Schema.is(MessageV2.Part)(part)) return
+        if (part.type !== "tool" || part.sessionID !== parent.id || part.state.status !== "completed") return
+        if (part.id === firstPartID) Deferred.doneUnsafe(firstReconciled, Effect.void)
+        if (part.id === secondPartID) Deferred.doneUnsafe(secondReconciled, Effect.void)
+      })
+      const unsubscribeMessage = subscribeGlobal(MessageV2.Event.Updated.type, (event) => {
+        const info = event.properties.info
+        if (!Schema.is(MessageV2.Info)(info)) return
+        if (
+          info.role === "assistant" &&
+          info.sessionID === parent.id &&
+          info.id === parentAssistantID &&
+          info.finish === "tool-calls"
+        ) {
+          Deferred.doneUnsafe(parentCompleted, Effect.void)
+        }
+      })
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          unsubscribePart()
+          unsubscribeMessage()
+        }),
+      )
+
+      yield* completeChild(firstChild.id, "first child completed")
+      yield* bus.publish(SessionStatus.Event.Idle, { sessionID: firstChild.id })
+      yield* awaitDeferred(firstReconciled, "timed out waiting for first sibling reconciliation")
+
+      const afterFirst = yield* MessageV2.get({ sessionID: parent.id, messageID: parentAssistantID })
+      expect(afterFirst.info.role).toBe("assistant")
+      if (afterFirst.info.role === "assistant") {
+        expect(afterFirst.info.finish).toBeUndefined()
+        expect(afterFirst.info.time.completed).toBeUndefined()
+      }
+      expect(taskPart(afterFirst.parts.find((part) => part.id === firstPartID))?.state.status).toBe("completed")
+      expect(taskPart(afterFirst.parts.find((part) => part.id === secondPartID))?.state.status).toBe("running")
+
+      yield* completeChild(secondChild.id, "second child completed")
+      yield* bus.publish(SessionStatus.Event.Idle, { sessionID: secondChild.id })
+      yield* awaitDeferred(secondReconciled, "timed out waiting for second sibling reconciliation")
+      yield* awaitDeferred(parentCompleted, "timed out waiting for parent completion")
+
+      const afterSecond = yield* MessageV2.get({ sessionID: parent.id, messageID: parentAssistantID })
+      expect(afterSecond.info.role).toBe("assistant")
+      if (afterSecond.info.role === "assistant") {
+        expect(afterSecond.info.finish).toBe("tool-calls")
+        expect(afterSecond.info.time.completed).toBeDefined()
+      }
+      expect(taskPart(afterSecond.parts.find((part) => part.id === firstPartID))?.state.status).toBe("completed")
+      expect(taskPart(afterSecond.parts.find((part) => part.id === secondPartID))?.state.status).toBe("completed")
 
       yield* session.remove(parent.id)
     }),
