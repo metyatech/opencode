@@ -212,6 +212,14 @@ function assistantTerminalTime(info: MessageV2.Assistant) {
   return info.time.completed ?? info.time.created
 }
 
+function managedAgentModel(agent: Agent.Info) {
+  if (agent.modelSelection !== "managed") return undefined
+  if (agent.model) return agent.model
+  throw new NamedError.Unknown({
+    message: `Managed agent "${agent.name}" has no configured model. Configure the agent's 'model' field in opencode config.`,
+  })
+}
+
 export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
   readonly prompt: (input: PromptInput) => Effect.Effect<MessageV2.WithParts, Image.Error>
@@ -644,7 +652,8 @@ export const layer = Layer.effect(
               yield* bus.publish(Session.Event.Error, { sessionID: input.sessionID, error: error.toObject() })
               throw error
             }
-            const model = input.model ?? agent.model ?? (yield* currentModel(input.sessionID))
+            const managedModel = managedAgentModel(agent)
+            const model = (managedModel ?? input.model) ?? agent.model ?? (yield* currentModel(input.sessionID))
             const userMsg: MessageV2.User = {
               id: input.messageID ?? MessageID.ascending(),
               sessionID: input.sessionID,
@@ -841,15 +850,18 @@ export const layer = Layer.effect(
           .where(eq(SessionTable.id, input.sessionID))
           .get(),
       )
-      const model = input.model ?? ag.model ?? (yield* currentModel(input.sessionID))
+      const managedModel = managedAgentModel(ag)
+      const clientModel = managedModel ? undefined : input.model
+      const clientVariant = managedModel ? undefined : input.variant
+      const model = clientModel ?? managedModel ?? ag.model ?? (yield* currentModel(input.sessionID))
       const same = ag.model && model.providerID === ag.model.providerID && model.modelID === ag.model.modelID
       const full =
-        !input.variant && ag.variant && same
+        !clientVariant && ag.variant && same
           ? yield* provider
               .getModel(model.providerID, model.modelID)
               .pipe(Effect.catchIf(Provider.ModelNotFoundError.isInstance, () => Effect.succeed(undefined)))
           : undefined
-      const variant = input.variant ?? (ag.variant && full?.variants?.[ag.variant] ? ag.variant : undefined)
+      const variant = clientVariant ?? (ag.variant && full?.variants?.[ag.variant] ? ag.variant : undefined)
 
       const info: MessageV2.User = {
         id: input.messageID ?? MessageID.ascending(),
@@ -1401,6 +1413,8 @@ export const layer = Layer.effect(
         throw error
       }
 
+      const managedModel = managedAgentModel(ag)
+
       const terminalReply = yield* sessions
         .findMessage(
           input.sessionID,
@@ -1417,9 +1431,9 @@ export const layer = Layer.effect(
         agent: ag.name,
         system: stripRuntimeFallbackContinuationSystem(retryMessage.info.system),
         model: {
-          providerID: input.model.providerID,
-          modelID: input.model.modelID,
-          variant: input.variant,
+          providerID: managedModel?.providerID ?? input.model.providerID,
+          modelID: managedModel?.modelID ?? input.model.modelID,
+          variant: managedModel ? ag.variant : input.variant,
         },
       }
 
@@ -1949,7 +1963,19 @@ export const layer = Layer.effect(
       }
       template = template.trim()
 
+      const agent = agentName ? yield* agents.get(agentName) : yield* agents.defaultInfo()
+      if (!agent) {
+        const available = (yield* agents.list()).filter((a) => !a.hidden).map((a) => a.name)
+        const hint = available.length ? ` Available agents: ${available.join(", ")}` : ""
+        const error = new NamedError.Unknown({ message: `Agent not found: "${agentName}".${hint}` })
+        yield* bus.publish(Session.Event.Error, { sessionID: input.sessionID, error: error.toObject() })
+        throw error
+      }
+
+      const managedModel = managedAgentModel(agent)
+
       const taskModel = yield* Effect.gen(function* () {
+        if (managedModel) return managedModel
         if (cmd.model) return Provider.parseModel(cmd.model)
         if (cmd.agent) {
           const cmdAgent = yield* agents.get(cmd.agent)
@@ -1960,15 +1986,6 @@ export const layer = Layer.effect(
       })
 
       yield* getModel(taskModel.providerID, taskModel.modelID, input.sessionID)
-
-      const agent = agentName ? yield* agents.get(agentName) : yield* agents.defaultInfo()
-      if (!agent) {
-        const available = (yield* agents.list()).filter((a) => !a.hidden).map((a) => a.name)
-        const hint = available.length ? ` Available agents: ${available.join(", ")}` : ""
-        const error = new NamedError.Unknown({ message: `Agent not found: "${agentName}".${hint}` })
-        yield* bus.publish(Session.Event.Error, { sessionID: input.sessionID, error: error.toObject() })
-        throw error
-      }
 
       const templateParts = yield* resolvePromptParts(template)
       const isSubtask = (agent.mode === "subagent" && cmd.subtask !== false) || cmd.subtask === true
@@ -1991,6 +2008,7 @@ export const layer = Layer.effect(
           ? Provider.parseModel(input.model)
           : yield* currentModel(input.sessionID)
         : taskModel
+      const userVariant = managedModel ? agent.variant : input.variant
 
       yield* plugin.trigger(
         "command.execute.before",
@@ -2004,7 +2022,7 @@ export const layer = Layer.effect(
         model: userModel,
         agent: userAgent,
         parts,
-        variant: input.variant,
+        variant: userVariant,
       })
       yield* bus.publish(Command.Event.Executed, {
         name: input.command,

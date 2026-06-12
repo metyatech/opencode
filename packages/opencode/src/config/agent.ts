@@ -45,6 +45,10 @@ const AgentSchema = Schema.StructWithRest(
     }),
     maxSteps: Schema.optional(PositiveInt).annotate({ description: "@deprecated Use 'steps' field instead." }),
     permission: Schema.optional(ConfigPermission.Info),
+    model_selection: Schema.optional(Schema.Literals(["user", "managed"])).annotate({
+      description:
+        "How the model is selected for this agent. 'managed' means the agent controls its own model and ignores client-supplied model/variant (Adaptive-style).",
+    }),
   }),
   [Schema.Record(Schema.String, Schema.Any)],
 )
@@ -66,6 +70,7 @@ const KNOWN_KEYS = new Set([
   "permission",
   "disable",
   "tools",
+  "model_selection",
 ])
 
 // Post-parse normalisation:
