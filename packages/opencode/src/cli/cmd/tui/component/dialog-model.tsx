@@ -1,18 +1,31 @@
-import { createMemo, createSignal } from "solid-js"
+import { createEffect, createMemo, createSignal } from "solid-js"
 import { useLocal } from "@tui/context/local"
 import { useSync } from "@tui/context/sync"
 import { map, pipe, flatMap, entries, filter, sortBy, take } from "remeda"
 import { DialogSelect } from "@tui/ui/dialog-select"
 import { useDialog } from "@tui/ui/dialog"
+import { useToast } from "../ui/toast"
 import { createDialogProviderOptions, DialogProvider } from "./dialog-provider"
 import { DialogVariant } from "./dialog-variant"
 import * as fuzzysort from "fuzzysort"
 import { useConnected } from "./use-connected"
+import { MANAGED_AGENT_NOTICE } from "@tui/context/managed-agent"
 
 export function DialogModel(props: { providerID?: string }) {
   const local = useLocal()
   const sync = useSync()
   const dialog = useDialog()
+  const toast = useToast()
+
+  createEffect(() => {
+    if (!local.agentIsManaged()) return
+    toast.show({
+      variant: "info",
+      message: MANAGED_AGENT_NOTICE,
+      duration: 3000,
+    })
+    dialog.clear()
+  })
   const [query, setQuery] = createSignal("")
 
   const connected = useConnected()

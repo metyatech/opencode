@@ -394,7 +394,9 @@ export function Prompt(props: PromptProps) {
       if (msg.agent && isPrimaryAgent) {
         // Keep command line --agent if specified.
         if (!args.agent) local.agent.set(msg.agent)
-        if (msg.model) {
+        // For managed (Adaptive) agents, do not restore the historical
+        // user-selected model — the server's current managed config wins.
+        if (msg.model && !local.agentIsManaged()) {
           local.model.set(msg.model)
           local.model.variant.set(msg.model.variant)
         }
@@ -1569,9 +1571,13 @@ export function Prompt(props: PromptProps) {
                   {(agent) => (
                     <>
                       <text fg={fadeColor(highlight(), agentMetaAlpha())}>
-                        {store.mode === "shell" ? "Shell" : Locale.titlecase(agent().name)}
+                        {store.mode === "shell"
+                          ? "Shell"
+                          : local.agentIsManaged()
+                            ? "Adaptive"
+                            : Locale.titlecase(agent().name)}
                       </text>
-                      <Show when={store.mode === "normal"}>
+                      <Show when={store.mode === "normal" && !local.agentIsManaged()}>
                         <box flexDirection="row" gap={1}>
                           <text fg={fadeColor(theme.textMuted, modelMetaAlpha())}>·</text>
                           <text
@@ -1590,6 +1596,15 @@ export function Prompt(props: PromptProps) {
                             </text>
                           </Show>
                         </box>
+                      </Show>
+                      <Show when={store.mode === "normal" && local.agentIsManaged()}>
+                        <text fg={fadeColor(theme.textMuted, modelMetaAlpha())}>·</text>
+                        <text
+                          flexShrink={0}
+                          fg={fadeColor(leader() ? theme.textMuted : theme.text, modelMetaAlpha())}
+                        >
+                          Auto
+                        </text>
                       </Show>
                     </>
                   )}

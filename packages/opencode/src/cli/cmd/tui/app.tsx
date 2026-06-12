@@ -33,6 +33,7 @@ import { StartupLoading } from "@tui/component/startup-loading"
 import { SyncProvider, useSync } from "@tui/context/sync"
 import { SyncProviderV2 } from "@tui/context/sync-v2"
 import { LocalProvider, useLocal } from "@tui/context/local"
+import { MANAGED_AGENT_NOTICE } from "@tui/context/managed-agent"
 import { DialogModel } from "@tui/component/dialog-model"
 import { useConnected } from "@tui/component/use-connected"
 import { DialogMcp } from "@tui/component/dialog-mcp"
@@ -379,6 +380,12 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
   const event = useEvent()
   const sdk = useSDK()
   const toast = useToast()
+  const notifyManagedAgentLocked = () =>
+    toast.show({
+      variant: "info",
+      message: MANAGED_AGENT_NOTICE,
+      duration: 3000,
+    })
   const themeState = useTheme()
   const { theme, mode, setMode, locked, lock, unlock } = themeState
   const sync = useSync()
@@ -634,6 +641,10 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
         category: "Agent",
         slashName: "models",
         run: () => {
+          if (local.agentIsManaged()) {
+            notifyManagedAgentLocked()
+            return
+          }
           dialog.replace(() => <DialogModel />)
         },
       },
@@ -643,6 +654,10 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
         category: "Agent",
         hidden: true,
         run: () => {
+          if (local.agentIsManaged()) {
+            notifyManagedAgentLocked()
+            return
+          }
           local.model.cycle(1)
         },
       },
@@ -652,6 +667,10 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
         category: "Agent",
         hidden: true,
         run: () => {
+          if (local.agentIsManaged()) {
+            notifyManagedAgentLocked()
+            return
+          }
           local.model.cycle(-1)
         },
       },
@@ -661,6 +680,10 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
         category: "Agent",
         hidden: true,
         run: () => {
+          if (local.agentIsManaged()) {
+            notifyManagedAgentLocked()
+            return
+          }
           local.model.cycleFavorite(1)
         },
       },
@@ -670,6 +693,10 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
         category: "Agent",
         hidden: true,
         run: () => {
+          if (local.agentIsManaged()) {
+            notifyManagedAgentLocked()
+            return
+          }
           local.model.cycleFavorite(-1)
         },
       },
@@ -705,6 +732,10 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
         title: "Variant cycle",
         category: "Agent",
         run: () => {
+          if (local.agentIsManaged()) {
+            notifyManagedAgentLocked()
+            return
+          }
           local.model.variant.cycle()
         },
       },
@@ -712,9 +743,13 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
         name: "variant.list",
         title: "Switch model variant",
         category: "Agent",
-        hidden: local.model.variant.list().length === 0,
+        hidden: local.agentIsManaged() || local.model.variant.list().length === 0,
         slashName: "variants",
         run: () => {
+          if (local.agentIsManaged()) {
+            notifyManagedAgentLocked()
+            return
+          }
           dialog.replace(() => <DialogVariant />)
         },
       },

@@ -14,6 +14,7 @@ import { useArgs } from "./args"
 import { useSDK } from "./sdk"
 import { RGBA } from "@opentui/core"
 import { Filesystem } from "@/util/filesystem"
+import { isManagedAgent, MANAGED_AGENT_NOTICE } from "./managed-agent"
 
 export function parseModel(model: string) {
   const [providerID, ...rest] = model.split("/")
@@ -33,6 +34,14 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
     function isModelValid(model: { providerID: string; modelID: string }) {
       const provider = sync.data.provider.find((x) => x.id === model.providerID)
       return !!provider?.models[model.modelID]
+    }
+
+    function notifyManagedAgentLocked() {
+      toast.show({
+        variant: "info",
+        message: MANAGED_AGENT_NOTICE,
+        duration: 3000,
+      })
     }
 
     function getFirstValidModel(...modelFns: (() => { providerID: string; modelID: string } | undefined)[]) {
@@ -239,6 +248,10 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
           }
         }),
         cycle(direction: 1 | -1) {
+          if (isManagedAgent(agent.current())) {
+            notifyManagedAgentLocked()
+            return
+          }
           const current = currentModel()
           if (!current) return
           const recent = modelStore.recent
@@ -254,6 +267,10 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
           setModelStore("model", a.name, { ...val })
         },
         cycleFavorite(direction: 1 | -1) {
+          if (isManagedAgent(agent.current())) {
+            notifyManagedAgentLocked()
+            return
+          }
           const favorites = modelStore.favorite.filter((item) => isModelValid(item))
           if (!favorites.length) {
             toast.show({
@@ -290,6 +307,10 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
         },
         set(model: { providerID: string; modelID: string }, options?: { recent?: boolean }) {
           batch(() => {
+            if (isManagedAgent(agent.current())) {
+              notifyManagedAgentLocked()
+              return
+            }
             if (!isModelValid(model)) {
               toast.show({
                 message: `Model ${model.providerID}/${model.modelID} is not valid`,
@@ -314,6 +335,10 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
         },
         toggleFavorite(model: { providerID: string; modelID: string }) {
           batch(() => {
+            if (isManagedAgent(agent.current())) {
+              notifyManagedAgentLocked()
+              return
+            }
             if (!isModelValid(model)) {
               toast.show({
                 message: `Model ${model.providerID}/${model.modelID} is not valid`,
@@ -357,6 +382,10 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
             return Object.keys(info.variants)
           },
           set(value: string | undefined) {
+            if (isManagedAgent(agent.current())) {
+              notifyManagedAgentLocked()
+              return
+            }
             const m = currentModel()
             if (!m) return
             const key = `${m.providerID}/${m.modelID}`
@@ -364,6 +393,10 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
             save()
           },
           cycle() {
+            if (isManagedAgent(agent.current())) {
+              notifyManagedAgentLocked()
+              return
+            }
             const variants = this.list()
             if (variants.length === 0) return
             const current = this.current()
@@ -504,6 +537,12 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
       agent,
       mcp,
       session,
+      agentIsManaged() {
+        return isManagedAgent(agent.current())
+      },
+      currentModelIsManaged() {
+        return isManagedAgent(agent.current())
+      },
     }
     return result
   },
