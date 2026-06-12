@@ -10,6 +10,8 @@ import { useLocal } from "@/context/local"
 import { popularProviders, useProviders } from "@/hooks/use-providers"
 import { ModelTooltip } from "./model-tooltip"
 import { useLanguage } from "@/context/language"
+import { isManagedAgent, MANAGED_AGENT_NOTICE } from "@/lib/managed-agent"
+import { showToast } from "@opencode-ai/ui/toast"
 
 type ModelState = ReturnType<typeof useLocal>["model"]
 
@@ -67,6 +69,10 @@ export const DialogSelectModelUnpaid: Component<{ model?: ModelState }> = (props
             </Tooltip>
           )}
           onSelect={(x) => {
+            if (isManagedAgent(useLocal().agent.current() as Record<string, unknown> | undefined)) {
+              showToast({ description: MANAGED_AGENT_NOTICE })
+              return
+            }
             model.set(x ? { modelID: x.id, providerID: x.provider.id } : undefined, {
               recent: true,
             })

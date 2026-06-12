@@ -19,6 +19,7 @@ import { createSessionTabs } from "@/pages/session/helpers"
 import { extractPromptFromParts } from "@/utils/prompt"
 import { UserMessage } from "@opencode-ai/sdk/v2"
 import { useSessionLayout } from "@/pages/session/session-layout"
+import { MANAGED_AGENT_NOTICE } from "@/lib/managed-agent"
 
 export type SessionCommandContext = {
   navigateMessageByOffset: (offset: number) => void
@@ -253,6 +254,10 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
   }
 
   const chooseModel = () => {
+    if (local.agentIsManaged()) {
+      showToast({ description: MANAGED_AGENT_NOTICE })
+      return
+    }
     void import("@/components/dialog-select-model").then((x) => {
       dialog.show(() => <x.DialogSelectModel model={local.model} />)
     })
@@ -522,7 +527,13 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
       title: language.t("command.model.variant.cycle"),
       description: language.t("command.model.variant.cycle.description"),
       keybind: "shift+mod+d",
-      onSelect: () => local.model.variant.cycle(),
+      onSelect: () => {
+        if (local.agentIsManaged()) {
+          showToast({ description: MANAGED_AGENT_NOTICE })
+          return
+        }
+        local.model.variant.cycle()
+      },
     }),
   ]
 

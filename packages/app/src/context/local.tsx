@@ -6,6 +6,8 @@ import { createStore } from "solid-js/store"
 import { useModels } from "@/context/models"
 import { useProviders } from "@/hooks/use-providers"
 import { Persist, persisted } from "@/utils/persist"
+import { isManagedAgent, MANAGED_AGENT_NOTICE } from "@/lib/managed-agent"
+import { showToast } from "@opencode-ai/ui/toast"
 import { cycleModelVariant, getConfiguredAgentVariant, resolveModelVariant } from "./model-variant"
 import { useSDK } from "./sdk"
 import { useSync } from "./sync"
@@ -231,6 +233,12 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
       return models.find(item)
     }
 
+    const agentIsManaged = createMemo(() => isManagedAgent(agent.current() as Record<string, unknown> | undefined))
+
+    const notifyManagedAgentLocked = () => {
+      showToast({ description: MANAGED_AGENT_NOTICE })
+    }
+
     const configured = () => {
       const item = agent.current()
       const model = current()
@@ -274,6 +282,10 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
       recent,
       list: models.list,
       cycle(direction: 1 | -1) {
+        if (agentIsManaged()) {
+          notifyManagedAgentLocked()
+          return
+        }
         const items = recent()
         const item = current()
         if (!item) return
@@ -290,6 +302,10 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
         model.set({ providerID: entry.provider.id, modelID: entry.id })
       },
       set(item: ModelKey | undefined, options?: { recent?: boolean }) {
+        if (agentIsManaged()) {
+          notifyManagedAgentLocked()
+          return
+        }
         batch(() => {
           setStore("last", {
             type: "model",
@@ -331,6 +347,10 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
           return Object.keys(item.variants)
         },
         set(value: string | undefined) {
+          if (agentIsManaged()) {
+            notifyManagedAgentLocked()
+            return
+          }
           batch(() => {
             const model = current()
             setStore("last", {
@@ -346,6 +366,10 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
           })
         },
         cycle() {
+          if (agentIsManaged()) {
+            notifyManagedAgentLocked()
+            return
+          }
           const items = this.list()
           if (items.length === 0) return
           this.set(
@@ -363,6 +387,7 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
       slug: createMemo(() => base64Encode(sdk.directory)),
       model,
       agent,
+      agentIsManaged,
       session: {
         reset() {
           setStore("draft", undefined)
@@ -387,10 +412,15 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
           if (saved.session[session] !== undefined) return
           if (handoff.has(handoffKey(sdk.directory, session))) return
 
+          const restoredAgent = list().find((item) => item.name === msg.agent)
+          const model = isManagedAgent(restoredAgent as Record<string, unknown> | undefined)
+            ? undefined
+            : msg.model
+
           setSaved("session", session, {
             agent: msg.agent,
-            model: msg.model,
-            variant: msg.model?.variant ?? null,
+            model,
+            variant: model?.variant ?? null,
           })
         },
       },

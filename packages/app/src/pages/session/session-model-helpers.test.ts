@@ -18,6 +18,9 @@ describe("syncSessionModel", () => {
 
     syncSessionModel(
       {
+        agent: {
+          list: () => [],
+        },
         session: {
           restore(value) {
             calls.push(value)
@@ -39,6 +42,9 @@ describe("resetSessionModel", () => {
     const calls: string[] = []
 
     resetSessionModel({
+      agent: {
+        list: () => [],
+      },
       session: {
         reset() {
           calls.push("reset")

@@ -48,6 +48,8 @@ import { ModelSelectorPopover } from "@/components/dialog-select-model"
 import { useProviders } from "@/hooks/use-providers"
 import { useCommand } from "@/context/command"
 import { Persist, persisted } from "@/utils/persist"
+import { MANAGED_AGENT_NOTICE } from "@/lib/managed-agent"
+import { showToast } from "@opencode-ai/ui/toast"
 import { usePermission } from "@/context/permission"
 import { useLanguage } from "@/context/language"
 import { usePlatform } from "@/context/platform"
@@ -1819,26 +1821,76 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
                           style={providersShouldFadeIn() ? { animation: "fade-in 0.3s" } : undefined}
                         >
                           <Show
-                            when={providers.paid().length > 0}
+                            when={!local.agentIsManaged()}
                             fallback={
+                              <div
+                                data-action="prompt-model"
+                                class="min-w-0 max-w-[320px] h-7 flex items-center gap-1.5 px-2 text-13-regular text-text-base"
+                                style={control()}
+                                title={MANAGED_AGENT_NOTICE}
+                              >
+                                <span class="truncate">Adaptive · Auto</span>
+                              </div>
+                            }
+                          >
+                            <Show
+                              when={providers.paid().length > 0}
+                              fallback={
+                                <TooltipKeybind
+                                  placement="top"
+                                  gutter={4}
+                                  title={language.t("command.model.choose")}
+                                  keybind={command.keybind("model.choose")}
+                                >
+                                  <Button
+                                    data-action="prompt-model"
+                                    as="div"
+                                    variant="ghost"
+                                    size="normal"
+                                    class="min-w-0 max-w-[320px] text-13-regular text-text-base group"
+                                    style={control()}
+                                    onClick={() => {
+                                      if (local.agentIsManaged()) {
+                                        showToast({ description: MANAGED_AGENT_NOTICE })
+                                        return
+                                      }
+                                      void import("@/components/dialog-select-model-unpaid").then((x) => {
+                                        dialog.show(() => <x.DialogSelectModelUnpaid model={local.model} />)
+                                      })
+                                    }}
+                                  >
+                                    <Show when={local.model.current()?.provider?.id}>
+                                      <ProviderIcon
+                                        id={local.model.current()?.provider?.id ?? ""}
+                                        class="size-4 shrink-0 opacity-40 group-hover:opacity-100 transition-opacity duration-150"
+                                        style={{ "will-change": "opacity", transform: "translateZ(0)" }}
+                                      />
+                                    </Show>
+                                    <span class="truncate">
+                                      {local.model.current()?.name ?? language.t("dialog.model.select.title")}
+                                    </span>
+                                    <Icon name="chevron-down" size="small" class="shrink-0" />
+                                  </Button>
+                                </TooltipKeybind>
+                              }
+                            >
                               <TooltipKeybind
                                 placement="top"
                                 gutter={4}
                                 title={language.t("command.model.choose")}
                                 keybind={command.keybind("model.choose")}
                               >
-                                <Button
-                                  data-action="prompt-model"
-                                  as="div"
-                                  variant="ghost"
-                                  size="normal"
-                                  class="min-w-0 max-w-[320px] text-13-regular text-text-base group"
-                                  style={control()}
-                                  onClick={() => {
-                                    void import("@/components/dialog-select-model-unpaid").then((x) => {
-                                      dialog.show(() => <x.DialogSelectModelUnpaid model={local.model} />)
-                                    })
+                                <ModelSelectorPopover
+                                  model={local.model}
+                                  triggerAs={Button}
+                                  triggerProps={{
+                                    variant: "ghost",
+                                    size: "normal",
+                                    style: control(),
+                                    class: "min-w-0 max-w-[320px] text-13-regular text-text-base group",
+                                    "data-action": "prompt-model",
                                   }}
+                                  onClose={restoreFocus}
                                 >
                                   <Show when={local.model.current()?.provider?.id}>
                                     <ProviderIcon
@@ -1851,44 +1903,12 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
                                     {local.model.current()?.name ?? language.t("dialog.model.select.title")}
                                   </span>
                                   <Icon name="chevron-down" size="small" class="shrink-0" />
-                                </Button>
+                                </ModelSelectorPopover>
                               </TooltipKeybind>
-                            }
-                          >
-                            <TooltipKeybind
-                              placement="top"
-                              gutter={4}
-                              title={language.t("command.model.choose")}
-                              keybind={command.keybind("model.choose")}
-                            >
-                              <ModelSelectorPopover
-                                model={local.model}
-                                triggerAs={Button}
-                                triggerProps={{
-                                  variant: "ghost",
-                                  size: "normal",
-                                  style: control(),
-                                  class: "min-w-0 max-w-[320px] text-13-regular text-text-base group",
-                                  "data-action": "prompt-model",
-                                }}
-                                onClose={restoreFocus}
-                              >
-                                <Show when={local.model.current()?.provider?.id}>
-                                  <ProviderIcon
-                                    id={local.model.current()?.provider?.id ?? ""}
-                                    class="size-4 shrink-0 opacity-40 group-hover:opacity-100 transition-opacity duration-150"
-                                    style={{ "will-change": "opacity", transform: "translateZ(0)" }}
-                                  />
-                                </Show>
-                                <span class="truncate">
-                                  {local.model.current()?.name ?? language.t("dialog.model.select.title")}
-                                </span>
-                                <Icon name="chevron-down" size="small" class="shrink-0" />
-                              </ModelSelectorPopover>
-                            </TooltipKeybind>
+                            </Show>
                           </Show>
                         </div>
-                        <Show when={variants().length > 2}>
+                        <Show when={!local.agentIsManaged() && variants().length > 2}>
                           <div
                             data-component="prompt-variant-control"
                             style={providersShouldFadeIn() ? { animation: "fade-in 0.3s" } : undefined}
@@ -1905,6 +1925,10 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
                                 current={local.model.variant.current() ?? "default"}
                                 label={(x) => (x === "default" ? language.t("common.default") : x)}
                                 onSelect={(value) => {
+                                  if (local.agentIsManaged()) {
+                                    showToast({ description: MANAGED_AGENT_NOTICE })
+                                    return
+                                  }
                                   local.model.variant.set(value === "default" ? undefined : value)
                                   restoreFocus()
                                 }}

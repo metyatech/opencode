@@ -12,6 +12,8 @@ import { List } from "@opencode-ai/ui/list"
 import { Tooltip } from "@opencode-ai/ui/tooltip"
 import { ModelTooltip } from "./model-tooltip"
 import { useLanguage } from "@/context/language"
+import { MANAGED_AGENT_NOTICE, isManagedAgent } from "@/lib/managed-agent"
+import { showToast } from "@opencode-ai/ui/toast"
 
 const isFree = (provider: string, cost: { input: number } | undefined) =>
   provider === "opencode" && (!cost || cost.input === 0)
@@ -64,6 +66,10 @@ const ModelList: Component<{
         </Tooltip>
       )}
       onSelect={(x) => {
+        if (isManagedAgent(useLocal().agent.current() as Record<string, unknown> | undefined)) {
+          showToast({ description: MANAGED_AGENT_NOTICE })
+          return
+        }
         model.set(x ? { modelID: x.id, providerID: x.provider.id } : undefined, {
           recent: true,
         })
@@ -104,6 +110,7 @@ export function ModelSelectorPopover(props: {
     dismiss: null,
   })
   const dialog = useDialog()
+  const local = useLocal()
 
   const close = (dismiss: Dismiss) => {
     setStore("dismiss", dismiss)
@@ -129,6 +136,10 @@ export function ModelSelectorPopover(props: {
     <Kobalte
       open={store.open}
       onOpenChange={(next) => {
+        if (next && isManagedAgent(local.agent.current() as Record<string, unknown> | undefined)) {
+          showToast({ description: MANAGED_AGENT_NOTICE })
+          return
+        }
         if (next) setStore("dismiss", null)
         setStore("open", next)
       }}
