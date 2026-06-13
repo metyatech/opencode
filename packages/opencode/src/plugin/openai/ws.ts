@@ -232,8 +232,31 @@ export function streamResponsesWebSocket(options: StreamResponsesWebSocketOption
       return
     }
 
-    if (event.type === "response.failed" || event.type === "response.incomplete" || event.type === "error") {
+    if (event.type === "response.failed") {
+      invalidate(new ProviderError.ResponseStreamError(failureMessage(event, "WebSocket stream failed: response.failed")))
+      options.onTerminal?.(event)
+      return
+    }
+
+    if (event.type === "error") {
+      invalidate(new ProviderError.ResponseStreamError(failureMessage(event, "WebSocket stream failed: error")))
+      options.onTerminal?.(event)
+      return
+    }
+
+    if (event.type === "response.incomplete") {
+      const reason = incompleteReason(event)
+      if (reason) {
+        invalidate(
+          new ProviderError.ResponseStreamError(
+            `WebSocket stream failed: response.incomplete: ${reason}`,
+          ),
+        )
+        options.onTerminal?.(event)
+        return
+      }
       completed = true
+      options.onComplete?.(event)
       options.onTerminal?.(event)
       closeCompleted()
     }
@@ -348,6 +371,16 @@ function terminalFailureMessage(event: Record<string, unknown>) {
   const type = typeof event.type === "string" ? event.type : "unknown"
   const details = terminalFailureDetails(event)
   return `WebSocket terminal failure before first response event: ${type}${details ? `: ${details}` : ""}`
+}
+
+function failureMessage(event: Record<string, unknown>, fallback: string) {
+  const details = terminalFailureDetails(event)
+  return details ? `${fallback}: ${details}` : fallback
+}
+
+function incompleteReason(event: Record<string, unknown>): string | undefined {
+  const details = isRecord(event.incomplete_details) ? event.incomplete_details.reason : undefined
+  return typeof details === "string" && details.trim() ? details.trim() : undefined
 }
 
 function terminalFailureDetails(event: Record<string, unknown>): string | undefined {

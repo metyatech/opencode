@@ -170,8 +170,26 @@ export const TaskTool = Tool.define(
       }
 
       const session = params.task_id
-        ? yield* sessions.get(SessionID.make(params.task_id)).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
+        ? yield* sessions
+            .get(SessionID.make(params.task_id))
+            .pipe(Effect.catchTag("NotFoundError", () => Effect.fail(new Error(`Task not found: ${params.task_id}`))))
         : undefined
+      if (params.task_id && session) {
+        if (session.id === ctx.sessionID) {
+          return yield* Effect.fail(new Error("Cannot resume the current session as a task"))
+        }
+        if (session.parentID === undefined) {
+          return yield* Effect.fail(new Error("Cannot resume a top-level session as a task"))
+        }
+        if (session.parentID !== ctx.sessionID) {
+          return yield* Effect.fail(new Error("Cannot resume task from a different parent session"))
+        }
+        if (session.agent && session.agent !== params.subagent_type) {
+          return yield* Effect.fail(
+            new Error(`Session was created with agent '${session.agent}', not '${params.subagent_type}'`),
+          )
+        }
+      }
       const parent = yield* sessions.get(ctx.sessionID)
       const parentAgent = parent.agent
         ? yield* agent.get(parent.agent).pipe(Effect.catchCause(() => Effect.succeed(undefined)))

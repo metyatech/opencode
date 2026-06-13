@@ -15,6 +15,7 @@ import {
   InstallationBaseVersion,
   InstallationChannel,
   InstallationVersion,
+  InstallationVersionDetails,
   formatPreviewVersion,
 } from "@opencode-ai/core/installation/version"
 import { NpmConfig } from "@opencode-ai/core/npm-config"
@@ -122,6 +123,52 @@ function localForkVersion(repo: string, branch: string, revision: number, sha: s
     commit: sha,
     dirty: false,
   })
+}
+
+export interface LocalForkLatestInputs {
+  readonly repo: string
+  readonly branch: string
+  readonly fetchOk: boolean
+  readonly local: string
+  readonly remote: string
+  readonly revision: number
+  readonly binaryCommit: string
+}
+
+// Pure decision function for the local-fork branch of `latest()`.
+//
+// Compares the running binary's build-time commit (`binaryCommit`, sourced
+// from `InstallationVersionDetails.commit`) against the local repo HEAD
+// and the freshly-fetched remote HEAD. A binary whose build commit is
+// missing or empty is treated as legacy and falls back to the original
+// local-vs-remote comparison.
+//
+// Returns `InstallationVersion` when the binary is up to date, or a
+// preview version string with the relevant SHA so the user can pull or
+// rebuild. Exported under `__testing__` for unit tests.
+export function resolveLocalForkLatest(input: LocalForkLatestInputs): string {
+  const { repo, branch, fetchOk, local, remote, revision, binaryCommit } = input
+  if (!fetchOk) return InstallationVersion
+  const safeRevision = Number.isFinite(revision) ? revision : 0
+  const trimmedBinary = binaryCommit.trim()
+  if (!trimmedBinary) {
+    // Fallback: build-time commit metadata is missing (dirty build,
+    // detached build, or `OPENCODE_VERSION_INFO` not injected). Keep the
+    // original local-vs-remote comparison so the user at least sees the
+    // remote preview version when the local repo is behind.
+    if (!remote || remote === local) return InstallationVersion
+    return localForkVersion(repo, branch, safeRevision, remote)
+  }
+  if (trimmedBinary === local && (!remote || remote === local)) return InstallationVersion
+  if (trimmedBinary !== local) {
+    // Binary built from a different commit than the local working tree.
+    // Surface a stale marker using the local SHA so the user knows the
+    // running binary does not match the local source.
+    return localForkVersion(repo, branch, safeRevision, local || trimmedBinary)
+  }
+  // Binary commit matches local HEAD; if remote has advanced, prompt a pull.
+  if (remote && remote !== local) return localForkVersion(repo, branch, safeRevision, remote)
+  return InstallationVersion
 }
 
 // Response schemas for external version APIs
@@ -286,12 +333,19 @@ export const layer: Layer.Layer<Service, never, HttpClient.HttpClient | AppProce
           if (fetch.code !== 0) return InstallationVersion
           const local = (yield* text(["git", "rev-parse", "HEAD"], { cwd: repo })).trim()
           const remote = (yield* text(["git", "rev-parse", `origin/${branch}`], { cwd: repo })).trim()
-          if (!remote || remote === local) return InstallationVersion
           const revision = Number.parseInt(
             (yield* text(["git", "rev-list", "--count", `origin/${branch}`], { cwd: repo })).trim(),
             10,
           )
-          return localForkVersion(repo, branch, Number.isFinite(revision) ? revision : 0, remote)
+          return resolveLocalForkLatest({
+            repo,
+            branch,
+            fetchOk: fetch.code === 0,
+            local,
+            remote,
+            revision,
+            binaryCommit: InstallationVersionDetails.commit,
+          })
         }
 
         if (detectedMethod === "brew") {
@@ -465,6 +519,12 @@ export const layer: Layer.Layer<Service, never, HttpClient.HttpClient | AppProce
 export const defaultLayer = layer.pipe(Layer.provide(FetchHttpClient.layer), Layer.provide(AppProcess.defaultLayer))
 
 const { runPromise } = makeRuntime(Service, defaultLayer)
+
+// Test seam: exposes pure helpers used by `latest()`. Not part of the
+// public API; only intended for unit tests.
+export const __testing__ = {
+  resolveLocalForkLatest,
+}
 
 export const latest = (...args: Parameters<Interface["latest"]>) => runPromise((s) => s.latest(...args))
 export const method = () => runPromise((s) => s.method())

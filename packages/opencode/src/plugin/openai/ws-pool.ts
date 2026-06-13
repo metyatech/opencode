@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto"
 import WebSocket from "ws"
 import * as Log from "@opencode-ai/core/util/log"
 import { isRecord } from "@/util/record"
@@ -23,6 +24,17 @@ interface PoolEntry {
   busy: boolean
   fallback: boolean
   streamFailures: number
+  url?: string
+  authFingerprint?: string
+}
+
+const ANON_FINGERPRINT = "anon"
+
+function fingerprintAuth(value: string | undefined): string {
+  if (value == null) return ANON_FINGERPRINT
+  const normalized = value.trim().toLowerCase()
+  if (!normalized) return ANON_FINGERPRINT
+  return createHash("sha256").update(normalized).digest("hex").slice(0, 12)
 }
 
 const DEFAULT_CONNECT_TIMEOUT = 15_000
@@ -71,9 +83,13 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
       log.debug("http fallback", { reason: "missing_session" })
       return httpFetch(input, httpInit)
     }
-    const key = `${sessionID}:conversation`
+    const resolvedURL = options?.url ?? url
+    const authFingerprint = fingerprintAuth(internalHeaders.authorization)
+    const key = `${sessionID}:${authFingerprint}:${resolvedURL}`
 
     const entry = pool.get(key) ?? { lastUsedAt: Date.now(), busy: false, fallback: false, streamFailures: 0 }
+    entry.url = resolvedURL
+    entry.authFingerprint = authFingerprint
     pool.set(key, entry)
 
     if (entry.fallback) {
@@ -90,7 +106,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
     try {
       entry.socket = await socket(
         entry,
-        options?.url ?? url,
+        resolvedURL,
         OpenAIWebSocket.normalizeHeaders(httpInit?.headers),
         connectTimeout,
         maxConnectionAge,
@@ -236,7 +252,9 @@ async function socket(
   if (
     entry.socket?.readyState === WebSocket.OPEN &&
     entry.connectedAt &&
-    Date.now() - entry.connectedAt < maxConnectionAge
+    Date.now() - entry.connectedAt < maxConnectionAge &&
+    entry.url === url &&
+    entry.authFingerprint === fingerprintAuth(headers.authorization)
   ) {
     return entry.socket
   }

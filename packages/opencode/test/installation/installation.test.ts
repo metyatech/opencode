@@ -1,9 +1,13 @@
-import { describe, expect } from "bun:test"
+import { describe, expect, test } from "bun:test"
 import { Effect, Layer, Stream } from "effect"
 import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process"
 import { Installation } from "../../src/installation"
-import { InstallationChannel } from "@opencode-ai/core/installation/version"
+import {
+  InstallationChannel,
+  InstallationVersion,
+  formatPreviewVersion,
+} from "@opencode-ai/core/installation/version"
 import { AppProcess } from "@opencode-ai/core/process"
 import { testEffect } from "../lib/effect"
 
@@ -169,6 +173,122 @@ describe("installation", () => {
         expect(result).toBe("2.1.0")
       }),
     )
+  })
+
+  describe("latest local-fork resolution", () => {
+    const resolve = Installation.__testing__.resolveLocalForkLatest
+    // `repo` does not need to exist on disk: when the helper reads
+    // `repo/packages/opencode/package.json` and the file is missing, the
+    // fallback `InstallationBaseVersion` is used. In test runs that is
+    // `extractBaseVersion("local") === "local"`, which keeps the expected
+    // preview string deterministic.
+    const repo = "/tmp/fake-local-fork"
+    const branch = "dev"
+    const localSha = "aaaaaaa111111111111111111111111111111111"
+    const remoteSha = "bbbbbbb222222222222222222222222222222222"
+    const binarySha = "ccccccc333333333333333333333333333333333"
+
+    test("returns InstallationVersion when binary commit equals local HEAD and remote", () => {
+      const result = resolve({
+        repo,
+        branch,
+        fetchOk: true,
+        local: localSha,
+        remote: localSha,
+        revision: 0,
+        binaryCommit: localSha,
+      })
+      expect(result).toBe(InstallationVersion)
+    })
+
+    test("returns stale marker when binary commit differs from local HEAD", () => {
+      const result = resolve({
+        repo,
+        branch,
+        fetchOk: true,
+        local: localSha,
+        remote: localSha,
+        revision: 0,
+        binaryCommit: binarySha,
+      })
+      // The helper should fall back to the local SHA so the user can see
+      // the running binary is out of sync with the local working tree.
+      const expected = formatPreviewVersion({
+        baseVersion: "local",
+        channel: branch,
+        revision: 0,
+        commit: localSha,
+        dirty: false,
+      })
+      expect(result).toBe(expected)
+      expect(result).not.toBe(InstallationVersion)
+      expect(result).toContain("sha.aaaaaaa")
+    })
+
+    test("returns remote preview version when local HEAD is older than remote", () => {
+      const result = resolve({
+        repo,
+        branch,
+        fetchOk: true,
+        local: localSha,
+        remote: remoteSha,
+        revision: 7,
+        binaryCommit: localSha,
+      })
+      const expected = formatPreviewVersion({
+        baseVersion: "local",
+        channel: branch,
+        revision: 7,
+        commit: remoteSha,
+        dirty: false,
+      })
+      expect(result).toBe(expected)
+      expect(result).toContain("sha.bbbbbbb")
+    })
+
+    test("returns InstallationVersion when fetch fails", () => {
+      const result = resolve({
+        repo,
+        branch,
+        fetchOk: false,
+        local: localSha,
+        remote: "",
+        revision: 0,
+        binaryCommit: binarySha,
+      })
+      expect(result).toBe(InstallationVersion)
+    })
+
+    test("falls back to local-vs-remote comparison when binary commit is empty", () => {
+      const emptyResult = resolve({
+        repo,
+        branch,
+        fetchOk: true,
+        local: localSha,
+        remote: localSha,
+        revision: 0,
+        binaryCommit: "",
+      })
+      expect(emptyResult).toBe(InstallationVersion)
+
+      const staleResult = resolve({
+        repo,
+        branch,
+        fetchOk: true,
+        local: localSha,
+        remote: remoteSha,
+        revision: 0,
+        binaryCommit: "",
+      })
+      const expected = formatPreviewVersion({
+        baseVersion: "local",
+        channel: branch,
+        revision: 0,
+        commit: remoteSha,
+        dirty: false,
+      })
+      expect(staleResult).toBe(expected)
+    })
   })
 
   describe("upgrade", () => {

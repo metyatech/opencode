@@ -154,6 +154,89 @@ describe("plugin.openai.ws-pool", () => {
     fetch.close()
   })
 
+  test("reconnects when the URL changes for the same session", async () => {
+    let firstConnections = 0
+    let secondConnections = 0
+    await using first = await createWebSocketServer((socket) => {
+      firstConnections += 1
+      socket.on("message", () => {
+        socket.send(JSON.stringify({ type: "response.completed", response: { id: `resp_${firstConnections}` } }))
+      })
+    })
+    await using second = await createWebSocketServer((socket) => {
+      secondConnections += 1
+      socket.on("message", () => {
+        socket.send(JSON.stringify({ type: "response.completed", response: { id: `resp_${secondConnections}` } }))
+      })
+    })
+    const fetch = OpenAIWebSocketPool.createWebSocketFetch()
+
+    const a = await fetch(first.url, streamRequest())
+    expect(await a.text()).toContain("data: [DONE]")
+
+    const b = await fetch(second.url, streamRequest())
+    expect(await b.text()).toContain("data: [DONE]")
+
+    expect(firstConnections).toBe(1)
+    expect(secondConnections).toBe(1)
+    fetch.close()
+  })
+
+  test("reconnects when the Authorization header changes for the same session", async () => {
+    let connections = 0
+    await using server = await createWebSocketServer((socket) => {
+      connections += 1
+      socket.on("message", () => {
+        socket.send(JSON.stringify({ type: "response.completed", response: { id: `resp_${connections}` } }))
+      })
+    })
+    const fetch = OpenAIWebSocketPool.createWebSocketFetch({
+      url: server.url,
+    })
+
+    const a = await fetch(server.url, streamRequest({ authorization: "Bearer token-a" }))
+    expect(await a.text()).toContain("data: [DONE]")
+
+    const b = await fetch(server.url, streamRequest({ authorization: "Bearer token-b" }))
+    expect(await b.text()).toContain("data: [DONE]")
+
+    expect(connections).toBe(2)
+    fetch.close()
+  })
+
+  test("never stores or logs the raw Authorization value", async () => {
+    const secret = "super-secret-abc-12345"
+    const authValues: string[] = []
+    await using server = await createWebSocketServer((socket, request) => {
+      const header = request.headers.authorization
+      if (typeof header === "string") authValues.push(header)
+      socket.on("message", () => {
+        socket.send(JSON.stringify({ type: "response.completed", response: { id: "resp_secret" } }))
+      })
+    })
+    const fetch = OpenAIWebSocketPool.createWebSocketFetch({
+      url: server.url,
+    })
+
+    const a = await fetch(server.url, streamRequest({ authorization: `Bearer ${secret}` }))
+    expect(await a.text()).toContain("data: [DONE]")
+
+    // The WS upgrade observed the original auth value (sanity check).
+    expect(authValues).toEqual([`Bearer ${secret}`])
+
+    // Reusing the same auth + same URL + same session must NOT open a new
+    // socket (and must NOT re-send the auth on a second upgrade).
+    const b = await fetch(server.url, streamRequest({ authorization: `Bearer ${secret}` }))
+    expect(await b.text()).toContain("data: [DONE]")
+    expect(authValues).toEqual([`Bearer ${secret}`])
+
+    // No HTTP fallback should have been used on the happy path, so the
+    // secret cannot have leaked via an HTTP request body or URL.
+    expect(server.httpRequests).toEqual([])
+
+    fetch.close()
+  })
+
   test("rotates a socket that exceeds max connection age", async () => {
     let connections = 0
     await using server = await createWebSocketServer((socket) => {
@@ -266,15 +349,103 @@ describe("plugin.openai.ws-pool", () => {
     })
 
     const first = await fetch(server.url, streamRequest())
-    const firstText = await first.text()
-    expect(firstText).toContain('data: {"type":"response.output_text.delta","delta":"started"}')
-    expect(firstText).toContain('data: {"type":"response.failed"}')
+    const firstError = await readTextError(first.text())
+    expect(firstError.message).toContain("WebSocket stream failed: response.failed")
+    expect(firstError.message).not.toContain("data: [DONE]")
 
     const second = await fetch(server.url, streamRequest())
     expect(await second.text()).toContain('data: {"type":"response.completed"}')
     expect(connections).toBe(2)
     expect(server.httpRequests).toHaveLength(0)
     fetch.close()
+  })
+
+  test("errors the SSE stream when error frame arrives after partial output", async () => {
+    const invalid: string[] = []
+    await using server = await createWebSocketServer((socket) => {
+      socket.once("message", () => {
+        socket.send(JSON.stringify({ type: "response.output_text.delta", delta: "started" }))
+        socket.send(
+          JSON.stringify({
+            type: "error",
+            error: { code: "internal_error", message: "boom" },
+          }),
+        )
+      })
+    })
+
+    const socket = await OpenAIWebSocket.connectResponsesWebSocket({ url: server.wsUrl, headers: {} })
+    const response = OpenAIWebSocket.streamResponsesWebSocket({
+      socket,
+      body: { stream: true, input: "hi" },
+      onConnectionInvalid: (error) => invalid.push(error.message),
+    })
+
+    const error = await readTextError(response.text())
+    expect(error.message).toContain("WebSocket stream failed: error")
+    expect(error.message).toContain("internal_error: boom")
+    expect(invalid).toHaveLength(1)
+    expect(invalid[0]).toContain("internal_error: boom")
+  })
+
+  test("errors the SSE stream when response.incomplete arrives with a reason after partial output", async () => {
+    const invalid: string[] = []
+    await using server = await createWebSocketServer((socket) => {
+      socket.once("message", () => {
+        socket.send(JSON.stringify({ type: "response.output_text.delta", delta: "started" }))
+        socket.send(
+          JSON.stringify({
+            type: "response.incomplete",
+            incomplete_details: { reason: "max_output_tokens" },
+          }),
+        )
+      })
+    })
+
+    const socket = await OpenAIWebSocket.connectResponsesWebSocket({ url: server.wsUrl, headers: {} })
+    const response = OpenAIWebSocket.streamResponsesWebSocket({
+      socket,
+      body: { stream: true, input: "hi" },
+      onConnectionInvalid: (error) => invalid.push(error.message),
+    })
+
+    const error = await readTextError(response.text())
+    expect(error.message).toContain("WebSocket stream failed: response.incomplete")
+    expect(error.message).toContain("max_output_tokens")
+    expect(invalid).toHaveLength(1)
+    expect(invalid[0]).toContain("max_output_tokens")
+  })
+
+  test("closes normally with [DONE] when response.incomplete arrives without a reason after partial output", async () => {
+    const invalid: string[] = []
+    const completed: Record<string, unknown>[] = []
+    await using server = await createWebSocketServer((socket) => {
+      socket.once("message", () => {
+        socket.send(JSON.stringify({ type: "response.output_text.delta", delta: "started" }))
+        socket.send(
+          JSON.stringify({
+            type: "response.incomplete",
+            incomplete_details: {},
+          }),
+        )
+      })
+    })
+
+    const socket = await OpenAIWebSocket.connectResponsesWebSocket({ url: server.wsUrl, headers: {} })
+    const response = OpenAIWebSocket.streamResponsesWebSocket({
+      socket,
+      body: { stream: true, input: "hi" },
+      onConnectionInvalid: (error) => invalid.push(error.message),
+      onComplete: (event) => completed.push(event),
+    })
+
+    const text = await response.text()
+    expect(text).toContain('data: {"type":"response.output_text.delta","delta":"started"}')
+    expect(text).toContain('data: {"type":"response.incomplete"')
+    expect(text).toContain("data: [DONE]\n\n")
+    expect(invalid).toEqual([])
+    expect(completed).toHaveLength(1)
+    expect(completed[0]?.type).toBe("response.incomplete")
   })
 
   test("retries websocket connection limit errors on the next stream attempt", async () => {
