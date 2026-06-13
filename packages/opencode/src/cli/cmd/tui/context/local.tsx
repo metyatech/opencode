@@ -14,7 +14,7 @@ import { useArgs } from "./args"
 import { useSDK } from "./sdk"
 import { RGBA } from "@opentui/core"
 import { Filesystem } from "@/util/filesystem"
-import { isManagedAgent, MANAGED_AGENT_NOTICE } from "./managed-agent"
+import { isManagedAgent, managedAgentCurrentModel, MANAGED_AGENT_NOTICE, resolveAgentSet } from "./managed-agent"
 
 export function parseModel(model: string) {
   const [providerID, ...rest] = model.split("/")
@@ -210,6 +210,14 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
 
       const currentModel = createMemo(() => {
         const a = agent.current()
+        // Spec #5: a managed agent's model is fixed by the agent config.
+        // Do not consult the saved manual model, recent list, session scope,
+        // or provider default -- return the agent's configured `model`
+        // directly so the footer / prompt reflect the agent's choice and
+        // not stale UI state from a previous user-managed agent.
+        if (a && isManagedAgent(a)) {
+          return managedAgentCurrentModel(a) ?? fallbackModel()
+        }
         return (
           getFirstValidModel(
             () => a && modelStore.model[a.name],
@@ -413,6 +421,21 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
           },
         },
       }
+
+      // Spec #5: when the current agent becomes a managed agent, drop any
+      // previously saved manual model for that agent. The persistent per-agent
+      // model slot is the TUI's only "session/draft" state for this purpose;
+      // clearing it guarantees `currentModel()` cannot surface a stale user
+      // pick for a managed agent. Switching back to a user-managed agent
+      // leaves its saved model alone. See resolveAgentSet for the policy
+      // and the regression test that pins it.
+      createEffect(() => {
+        const value = agent.current()
+        if (!value) return
+        if (!isManagedAgent(value)) return
+        if (!modelStore.model[value.name]) return
+        setModelStore("model", (current) => resolveAgentSet(value, current))
+      })
     })
 
     const session = iife(() => {

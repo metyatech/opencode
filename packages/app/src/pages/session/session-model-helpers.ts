@@ -1,9 +1,9 @@
 import type { UserMessage } from "@opencode-ai/sdk/v2"
-import { isManagedAgent } from "@/lib/managed-agent"
+import { isManagedAgent, type ManagedAgentShape } from "@/lib/managed-agent"
 
 type Local = {
   agent: {
-    list: () => ReadonlyArray<{ name: string } & Record<string, unknown>>
+    list: () => ReadonlyArray<{ name: string } & ManagedAgentShape>
   }
   session: {
     reset(): void

@@ -311,6 +311,18 @@ export const layer = Layer.effect(
           item.permission = Permission.merge(item.permission, Permission.fromConfig(value.permission ?? {}))
         }
 
+        // Spec #6: normalize modelSelection to a non-undefined value on every
+        // agent. The user-facing `model_selection` config key is optional; the
+        // runtime `Agent.Info.modelSelection` must always be "user" or
+        // "managed" so downstream code (TUI/App footer, lock guards, backend
+        // model resolution) can rely on a discriminator instead of treating
+        // undefined as "user". Default to "user".
+        for (const name in agents) {
+          const item = agents[name]
+          if (item.modelSelection === "managed") continue
+          item.modelSelection = "user"
+        }
+
         // Ensure Truncate.GLOB is allowed unless explicitly configured
         for (const name in agents) {
           const agent = agents[name]

@@ -114,8 +114,13 @@ function splashInfo(title: string | undefined, history: RunPrompt[]) {
   }
 }
 
-function footerLabels(input: Pick<RunInput, "agent" | "model" | "variant">): FooterLabels {
-  const agentLabel = Locale.titlecase(input.agent ?? "build")
+function footerLabels(input: {
+  agent: string | undefined
+  isManaged: boolean
+  model: RunInput["model"]
+  variant: string | undefined
+}): FooterLabels {
+  const agentLabel = formatAgentLabel(input.agent, input.isManaged)
 
   if (!input.model) {
     return {
@@ -128,6 +133,19 @@ function footerLabels(input: Pick<RunInput, "agent" | "model" | "variant">): Foo
     agentLabel,
     modelLabel: formatModelLabel(input.model, input.variant),
   }
+}
+
+/**
+ * Render the footer agent label.
+ *
+ * Spec #5: managed agents get a generic " · Auto" suffix so the footer
+ * clearly distinguishes a managed-agent run from a user-managed run
+ * without hardcoding any specific agent name. The discriminator is the
+ * typed `modelSelection` field, never the agent's name.
+ */
+export function formatAgentLabel(agent: string | undefined, isManaged: boolean): string {
+  const base = Locale.titlecase(agent ?? "build")
+  return isManaged ? `${base} \u00b7 Auto` : base
 }
 
 function queueSplash(
@@ -212,8 +230,16 @@ export async function createRuntimeLifecycle(input: LifecycleInput): Promise<Lif
 
         const { RunFooter } = await footerTask
 
+        // Spec #5: look up whether the current agent is managed so the
+        // footer can render a generic "AgentName · Auto" label. The lookup
+        // uses the typed `modelSelection` discriminator; the agent's
+        // name is not used as a heuristic.
+        const currentAgent = input.agent
+          ? input.agents.find((item) => item.name === input.agent)
+          : undefined
         const labels = footerLabels({
           agent: input.agent,
+          isManaged: currentAgent?.modelSelection === "managed",
           model: input.model,
           variant: input.variant,
         })

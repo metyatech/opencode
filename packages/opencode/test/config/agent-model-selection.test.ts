@@ -35,12 +35,14 @@ describe("ConfigAgent model_selection", () => {
 })
 
 it.instance(
-  "Agent.get reflects configured model selection",
+  "Agent.get reflects configured model selection and normalizes unspecified agents to user",
   () =>
     Effect.gen(function* () {
       expect((yield* AgentSvc.use.get("build")).modelSelection).toBe("managed")
       expect((yield* AgentSvc.use.get("plan")).modelSelection).toBe("user")
-      expect((yield* AgentSvc.use.get("general")).modelSelection).toBeUndefined()
+      // Spec #6: an unspecified user agent is normalized to "user" at runtime
+      // so the lock guard and footer label never see undefined.
+      expect((yield* AgentSvc.use.get("general")).modelSelection).toBe("user")
     }),
   {
     git: true,

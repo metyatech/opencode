@@ -6,7 +6,13 @@ import { createStore } from "solid-js/store"
 import { useModels } from "@/context/models"
 import { useProviders } from "@/hooks/use-providers"
 import { Persist, persisted } from "@/utils/persist"
-import { isManagedAgent, MANAGED_AGENT_NOTICE } from "@/lib/managed-agent"
+import {
+  isManagedAgent,
+  managedAgentCurrentModel,
+  MANAGED_AGENT_NOTICE,
+  resolveAgentSwitch,
+  resolveSessionRestore,
+} from "@/lib/managed-agent"
 import { showToast } from "@opencode-ai/ui/toast"
 import { cycleModelVariant, getConfiguredAgentVariant, resolveModelVariant } from "./model-variant"
 import { useSDK } from "./sdk"
@@ -193,12 +199,11 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
             model: item.model,
             variant: item.variant ?? null,
           })
-          const prev = scope()
-          const next = {
-            agent: item.name,
-            model: item.model ?? prev?.model,
-            variant: item.variant ?? prev?.variant,
-          } satisfies State
+          // Spec #5: switching INTO a managed agent drops the manual model
+          // and variant pick; switching to a user-managed agent keeps the
+          // user's prior pick for that agent. See resolveAgentSwitch for
+          // the policy and the regression test that pins it.
+          const next = resolveAgentSwitch(item, scope()) satisfies State
           const session = id()
           if (session) {
             setSaved("session", session, next)
@@ -224,6 +229,17 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
     }
 
     const current = () => {
+      const managed = agent.current()
+      // Spec #5: a managed agent's model is fixed by the agent config.
+      // Do not consult the saved per-session/draft model, the recent list,
+      // or a provider default. Return the agent's configured `model`
+      // directly so the UI cannot show a stale user pick for a managed
+      // agent.
+      if (managed && isManagedAgent(managed)) {
+        const item = managedAgentCurrentModel(managed) ?? fallback()
+        if (!item) return
+        return models.find(item)
+      }
       const item = firstModel(
         () => scope()?.model,
         () => agent.current()?.model,
@@ -233,7 +249,7 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
       return models.find(item)
     }
 
-    const agentIsManaged = createMemo(() => isManagedAgent(agent.current() as Record<string, unknown> | undefined))
+    const agentIsManaged = createMemo(() => isManagedAgent(agent.current()))
 
     const notifyManagedAgentLocked = () => {
       showToast({ description: MANAGED_AGENT_NOTICE })
@@ -413,15 +429,14 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
           if (handoff.has(handoffKey(sdk.directory, session))) return
 
           const restoredAgent = list().find((item) => item.name === msg.agent)
-          const model = isManagedAgent(restoredAgent as Record<string, unknown> | undefined)
-            ? undefined
-            : msg.model
-
-          setSaved("session", session, {
-            agent: msg.agent,
-            model,
-            variant: model?.variant ?? null,
-          })
+          // Spec #5: a managed agent must not pull a stale message-time
+          // model into the local selection. See resolveSessionRestore for
+          // the policy and the regression test that pins it.
+          setSaved(
+            "session",
+            session,
+            resolveSessionRestore(restoredAgent, msg) satisfies State,
+          )
         },
       },
     }
