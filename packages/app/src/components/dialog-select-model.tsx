@@ -66,7 +66,7 @@ const ModelList: Component<{
         </Tooltip>
       )}
       onSelect={(x) => {
-        if (isManagedAgent(useLocal().agent.current() as Record<string, unknown> | undefined)) {
+        if (isManagedAgent(useLocal().agent.current())) {
           showToast({ description: MANAGED_AGENT_NOTICE })
           return
         }
@@ -136,7 +136,7 @@ export function ModelSelectorPopover(props: {
     <Kobalte
       open={store.open}
       onOpenChange={(next) => {
-        if (next && isManagedAgent(local.agent.current() as Record<string, unknown> | undefined)) {
+        if (next && isManagedAgent(local.agent.current())) {
           showToast({ description: MANAGED_AGENT_NOTICE })
           return
         }

@@ -9,9 +9,15 @@ import { Persist, persisted } from "@/utils/persist"
 import {
   isManagedAgent,
   managedAgentCurrentModel,
+  MANUAL_AGENT_SELECTION_KEYS,
   MANAGED_AGENT_NOTICE,
+  migrateAgentSwitchState,
   resolveAgentSwitch,
+  resolveModelSelect,
   resolveSessionRestore,
+  resolveVariantSelect,
+  type ManualAgentSelection,
+  type ManualAgentSelections,
 } from "@/lib/managed-agent"
 import { showToast } from "@opencode-ai/ui/toast"
 import { cycleModelVariant, getConfiguredAgentVariant, resolveModelVariant } from "./model-variant"
@@ -24,6 +30,7 @@ type State = {
   agent?: string
   model?: ModelKey
   variant?: string | null
+  manualByAgent?: ManualAgentSelections
 }
 
 type Saved = {
@@ -56,7 +63,49 @@ const clone = (value: State | undefined) => {
   return {
     ...value,
     model: value.model ? { ...value.model } : undefined,
+    manualByAgent: cloneManual(value.manualByAgent),
   } satisfies State
+}
+
+const cloneManual = (current: ManualAgentSelections | undefined): ManualAgentSelections => {
+  if (!current) return {}
+  const next: ManualAgentSelections = {}
+  for (const key of Object.keys(current)) {
+    const value = current[key]
+    if (!value) continue
+    next[key] = {
+      ...(value.model ? { model: { ...value.model } } : {}),
+      ...(value.variant !== undefined ? { variant: value.variant } : {}),
+    }
+  }
+  return next
+}
+
+const mergeManualSelections = (
+  previous: ManualAgentSelections | undefined,
+  incoming: ManualAgentSelections | undefined,
+): ManualAgentSelections => {
+  if (!previous) return cloneManual(incoming)
+  if (!incoming) return cloneManual(previous)
+  const next = cloneManual(previous)
+  for (const key of Object.keys(incoming)) {
+    const value = incoming[key]
+    if (!value) continue
+    next[key] = {
+      ...(value.model ? { model: { ...value.model } } : {}),
+      ...(value.variant !== undefined ? { variant: value.variant } : {}),
+    }
+  }
+  return next
+}
+
+const manualSelectionFromState = (value: State | undefined): ManualAgentSelection | undefined => {
+  if (!value?.agent) return undefined
+  const entry: ManualAgentSelection = {}
+  if (value.model) entry.model = { providerID: value.model.providerID, modelID: value.model.modelID }
+  if (value.variant !== undefined) entry.variant = value.variant
+  if (!entry.model && entry.variant === undefined) return undefined
+  return entry
 }
 
 export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
@@ -126,6 +175,22 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
       setStore("current", items[0]?.name)
     })
 
+    // Spec #5 / Item #8: the persisted `Saved.session[session]` payload
+    // may predate the `manualByAgent` field. Migrate it on the fly so
+    // legacy per-agent model picks survive the upgrade without losing
+    // the existing session state. We never wipe the legacy fields --
+    // we only add `manualByAgent` next to them.
+    createEffect(() => {
+      const session = id()
+      if (!session) return
+      const existing = saved.session[session]
+      if (!existing) return
+      if (existing.manualByAgent !== undefined) return
+      const migrated = migrateAgentSwitchState(existing, (name) => list().find((item) => item.name === name))
+      if (!migrated) return
+      setSaved("session", session, migrated)
+    })
+
     const scope = createMemo<State | undefined>(() => {
       const session = id()
       if (!session) return store.draft
@@ -179,6 +244,14 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
 
     const fallback = createMemo<ModelKey | undefined>(() => configuredModel() ?? recentModel() ?? defaultModel())
 
+    const currentAgentName = () => agent.current()?.name
+
+    const manualForCurrent = (): ManualAgentSelection | undefined => {
+      const name = currentAgentName()
+      if (!name) return undefined
+      return scope()?.manualByAgent?.[name]
+    }
+
     const agent = {
       list,
       current() {
@@ -199,10 +272,13 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
             model: item.model,
             variant: item.variant ?? null,
           })
-          // Spec #5: switching INTO a managed agent drops the manual model
-          // and variant pick; switching to a user-managed agent keeps the
-          // user's prior pick for that agent. See resolveAgentSwitch for
-          // the policy and the regression test that pins it.
+          // Spec #5 / Item #8: switching INTO a managed agent clears
+          // the active manual model/variant and clears that agent's
+          // own manual slot. Switching INTO a normal agent restores
+          // the prior per-agent pick with precedence
+          // 1) manualByAgent[target]
+          // 2) target's own configured model/variant
+          // 3) the in-flight session/draft pick.
           const next = resolveAgentSwitch(item, scope()) satisfies State
           const session = id()
           if (session) {
@@ -230,17 +306,23 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
 
     const current = () => {
       const managed = agent.current()
-      // Spec #5: a managed agent's model is fixed by the agent config.
-      // Do not consult the saved per-session/draft model, the recent list,
-      // or a provider default. Return the agent's configured `model`
-      // directly so the UI cannot show a stale user pick for a managed
-      // agent.
+      // Spec #5 / Item #7: a managed agent's model is fixed by the
+      // agent config. Do NOT consult the saved per-session/draft
+      // model, the recent list, a provider default, the previous
+      // normal agent's model, or any other fallback. A managed agent
+      // with no model yields `current model = undefined`. The UI
+      // renders the managed agent's "Auto" label in that case.
       if (managed && isManagedAgent(managed)) {
-        const item = managedAgentCurrentModel(managed) ?? fallback()
+        const item = managedAgentCurrentModel(managed)
         if (!item) return
         return models.find(item)
       }
       const item = firstModel(
+        () => {
+          const manual = manualForCurrent()
+          if (!manual?.model) return undefined
+          return { ...manual.model }
+        },
         () => scope()?.model,
         () => agent.current()?.model,
         fallback,
@@ -265,7 +347,11 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
       })
     }
 
-    const selected = () => scope()?.variant
+    const selected = (): string | null | undefined => {
+      const manual = manualForCurrent()
+      if (manual?.variant !== undefined) return manual.variant
+      return scope()?.variant
+    }
 
     const snapshot = () => {
       const model = current()
@@ -273,21 +359,17 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
         agent: agent.current()?.name,
         model: model ? { providerID: model.provider.id, modelID: model.id } : undefined,
         variant: selected(),
+        manualByAgent: cloneManual(scope()?.manualByAgent),
       } satisfies State
     }
 
-    const write = (next: Partial<State>) => {
-      const state = {
-        ...(scope() ?? { agent: agent.current()?.name }),
-        ...next,
-      } satisfies State
-
+    const write = (next: State) => {
       const session = id()
       if (session) {
-        setSaved("session", session, state)
+        setSaved("session", session, next)
         return
       }
-      setStore("draft", state)
+      setStore("draft", next)
     }
 
     const recent = createMemo(() => models.recent.list().map(models.find).filter(Boolean))
@@ -322,14 +404,22 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
           notifyManagedAgentLocked()
           return
         }
+        const name = currentAgentName()
+        if (!name) return
         batch(() => {
           setStore("last", {
             type: "model",
-            agent: agent.current()?.name,
+            agent: name,
             model: item ?? null,
             variant: selected(),
           })
-          write({ model: item })
+          // Spec #5 / Item #8: writing a model on a normal agent
+          // updates the active selection AND records the pick into
+          // `manualByAgent[currentAgent]` so it survives a future
+          // managed-agent round-trip.
+          const prior = scope() ?? { agent: name }
+          const next = resolveModelSelect(name, item, prior) satisfies State
+          write(next)
           if (!item) return
           models.setVisibility(item, true)
           if (!options?.recent) return
@@ -367,15 +457,22 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
             notifyManagedAgentLocked()
             return
           }
+          const name = currentAgentName()
+          if (!name) return
           batch(() => {
             const model = current()
             setStore("last", {
               type: "variant",
-              agent: agent.current()?.name,
+              agent: name,
               model: model ? { providerID: model.provider.id, modelID: model.id } : null,
               variant: value ?? null,
             })
-            write({ variant: value ?? null })
+            const prior = scope() ?? { agent: name }
+            // Spec #5 / Item #8: the variant pick is recorded into
+            // `manualByAgent[currentAgent].variant` so it survives a
+            // future managed-agent round-trip.
+            const next = resolveVariantSelect(name, value ?? null, prior) satisfies State
+            write(next)
             if (model) {
               models.variant.set({ providerID: model.provider.id, modelID: model.id }, value ?? undefined)
             }
@@ -429,13 +526,18 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
           if (handoff.has(handoffKey(sdk.directory, session))) return
 
           const restoredAgent = list().find((item) => item.name === msg.agent)
-          // Spec #5: a managed agent must not pull a stale message-time
-          // model into the local selection. See resolveSessionRestore for
-          // the policy and the regression test that pins it.
+          // Spec #5 / Item #8: a managed agent must not pull a stale
+          // message-time model into the local selection, and the
+          // message-time model must NOT be recorded in
+          // `manualByAgent`. A user-managed agent's message-time
+          // model IS recorded in `manualByAgent[target]` so the
+          // user's last pick survives a future managed-agent
+          // round-trip.
+          const prior = saved.session[session]
           setSaved(
             "session",
             session,
-            resolveSessionRestore(restoredAgent, msg) satisfies State,
+            resolveSessionRestore(restoredAgent, msg, prior) satisfies State,
           )
         },
       },
@@ -443,3 +545,7 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
     return result
   },
 })
+
+// Re-export the manual selection keys so they are discoverable from the
+// app side without leaking internal managed-agent details.
+export { MANUAL_AGENT_SELECTION_KEYS }

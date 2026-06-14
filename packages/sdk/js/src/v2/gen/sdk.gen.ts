@@ -3433,6 +3433,7 @@ export class Session2 extends HeyApiClient {
       }
       format?: OutputFormat
       system?: string
+      transientSystem?: string
       variant?: string
       parts?: Array<TextPartInput | FilePartInput | AgentPartInput | SubtaskPartInput>
     },
@@ -3453,6 +3454,7 @@ export class Session2 extends HeyApiClient {
             { in: "body", key: "tools" },
             { in: "body", key: "format" },
             { in: "body", key: "system" },
+            { in: "body", key: "transientSystem" },
             { in: "body", key: "variant" },
             { in: "body", key: "parts" },
           ],
@@ -3786,6 +3788,7 @@ export class Session2 extends HeyApiClient {
       }
       format?: OutputFormat
       system?: string
+      transientSystem?: string
       variant?: string
       parts?: Array<TextPartInput | FilePartInput | AgentPartInput | SubtaskPartInput>
     },
@@ -3806,6 +3809,7 @@ export class Session2 extends HeyApiClient {
             { in: "body", key: "tools" },
             { in: "body", key: "format" },
             { in: "body", key: "system" },
+            { in: "body", key: "transientSystem" },
             { in: "body", key: "variant" },
             { in: "body", key: "parts" },
           ],
@@ -3841,6 +3845,8 @@ export class Session2 extends HeyApiClient {
       }
       agent?: string
       variant?: string
+      system?: string
+      transientSystem?: string
     },
     options?: Options<never, ThrowOnError>,
   ) {
@@ -3856,6 +3862,8 @@ export class Session2 extends HeyApiClient {
             { in: "body", key: "model" },
             { in: "body", key: "agent" },
             { in: "body", key: "variant" },
+            { in: "body", key: "system" },
+            { in: "body", key: "transientSystem" },
           ],
         },
       ],
@@ -3889,6 +3897,8 @@ export class Session2 extends HeyApiClient {
       }
       agent?: string
       variant?: string
+      system?: string
+      transientSystem?: string
     },
     options?: Options<never, ThrowOnError>,
   ) {
@@ -3904,6 +3914,8 @@ export class Session2 extends HeyApiClient {
             { in: "body", key: "model" },
             { in: "body", key: "agent" },
             { in: "body", key: "variant" },
+            { in: "body", key: "system" },
+            { in: "body", key: "transientSystem" },
           ],
         },
       ],

@@ -69,7 +69,7 @@ export const DialogSelectModelUnpaid: Component<{ model?: ModelState }> = (props
             </Tooltip>
           )}
           onSelect={(x) => {
-            if (isManagedAgent(useLocal().agent.current() as Record<string, unknown> | undefined)) {
+            if (isManagedAgent(useLocal().agent.current())) {
               showToast({ description: MANAGED_AGENT_NOTICE })
               return
             }

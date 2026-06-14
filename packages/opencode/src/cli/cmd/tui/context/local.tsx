@@ -210,13 +210,14 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
 
       const currentModel = createMemo(() => {
         const a = agent.current()
-        // Spec #5: a managed agent's model is fixed by the agent config.
-        // Do not consult the saved manual model, recent list, session scope,
-        // or provider default -- return the agent's configured `model`
-        // directly so the footer / prompt reflect the agent's choice and
-        // not stale UI state from a previous user-managed agent.
+        // Spec #5 / Item #7: a managed agent's model is fixed by the agent
+        // config. Do NOT consult the saved per-agent manual model, the
+        // recent list, a provider default, the previous normal agent's
+        // model, or any other fallback. A managed agent with no model
+        // yields `current model = undefined`. The footer renders the
+        // managed agent's "Auto" label in that case.
         if (a && isManagedAgent(a)) {
-          return managedAgentCurrentModel(a) ?? fallbackModel()
+          return managedAgentCurrentModel(a)
         }
         return (
           getFirstValidModel(

@@ -17,6 +17,8 @@ export type Event =
   | EventLspClientDiagnostics
   | EventLspUpdated
   | EventMessagePartDelta
+  | EventSessionStatus
+  | EventSessionIdle
   | EventPermissionAsked
   | EventPermissionReplied
   | EventSessionDiff
@@ -25,8 +27,6 @@ export type Event =
   | EventQuestionReplied
   | EventQuestionRejected
   | EventTodoUpdated
-  | EventSessionStatus
-  | EventSessionIdle
   | EventMcpToolsChanged
   | EventMcpBrowserOpenFailed
   | EventCommandExecuted
@@ -173,6 +173,28 @@ export type EventTuiSessionSelect = {
     sessionID: string
   }
 }
+
+export type SessionStatus =
+  | {
+      type: "idle"
+    }
+  | {
+      type: "retry"
+      attempt: number
+      message: string
+      action?: {
+        reason: string
+        provider: string
+        title: string
+        message: string
+        label: string
+        link?: string
+      }
+      next: number
+    }
+  | {
+      type: "busy"
+    }
 
 export type PermissionRequest = {
   id: string
@@ -329,28 +351,6 @@ export type Todo = {
    */
   priority: string
 }
-
-export type SessionStatus =
-  | {
-      type: "idle"
-    }
-  | {
-      type: "retry"
-      attempt: number
-      message: string
-      action?: {
-        reason: string
-        provider: string
-        title: string
-        message: string
-        label: string
-        link?: string
-      }
-      next: number
-    }
-  | {
-      type: "busy"
-    }
 
 export type Project = {
   id: string
@@ -818,6 +818,8 @@ export type GlobalEvent = {
     | EventLspClientDiagnostics
     | EventLspUpdated
     | EventMessagePartDelta
+    | EventSessionStatus
+    | EventSessionIdle
     | EventPermissionAsked
     | EventPermissionReplied
     | EventSessionDiff
@@ -826,8 +828,6 @@ export type GlobalEvent = {
     | EventQuestionReplied
     | EventQuestionRejected
     | EventTodoUpdated
-    | EventSessionStatus
-    | EventSessionIdle
     | EventMcpToolsChanged
     | EventMcpBrowserOpenFailed
     | EventCommandExecuted
@@ -1008,6 +1008,7 @@ export type AgentConfig = {
   steps?: number
   maxSteps?: number
   permission?: PermissionConfig
+  model_selection?: "user" | "managed"
   [key: string]:
     | unknown
     | string
@@ -1032,6 +1033,8 @@ export type AgentConfig = {
     | "info"
     | number
     | PermissionConfig
+    | "user"
+    | "managed"
     | undefined
 }
 
@@ -1645,6 +1648,7 @@ export type Agent = {
     providerID: string
   }
   variant?: string
+  modelSelection: "user" | "managed"
   prompt?: string
   options: {
     [key: string]: unknown
@@ -2573,6 +2577,23 @@ export type EventMessagePartDelta = {
   }
 }
 
+export type EventSessionStatus = {
+  id: string
+  type: "session.status"
+  properties: {
+    sessionID: string
+    status: SessionStatus
+  }
+}
+
+export type EventSessionIdle = {
+  id: string
+  type: "session.idle"
+  properties: {
+    sessionID: string
+  }
+}
+
 export type EventPermissionAsked = {
   id: string
   type: "permission.asked"
@@ -2603,6 +2624,14 @@ export type EventSessionError = {
   type: "session.error"
   properties: {
     sessionID?: string
+    messageID?: string
+    parentID?: string
+    agent?: string
+    model?: {
+      providerID: string
+      modelID: string
+      variant?: string
+    }
     error?:
       | ProviderAuthError
       | UnknownError
@@ -2638,23 +2667,6 @@ export type EventTodoUpdated = {
   properties: {
     sessionID: string
     todos: Array<Todo>
-  }
-}
-
-export type EventSessionStatus = {
-  id: string
-  type: "session.status"
-  properties: {
-    sessionID: string
-    status: SessionStatus
-  }
-}
-
-export type EventSessionIdle = {
-  id: string
-  type: "session.idle"
-  properties: {
-    sessionID: string
   }
 }
 
@@ -6386,6 +6398,7 @@ export type SessionPromptData = {
     }
     format?: OutputFormat
     system?: string
+    transientSystem?: string
     variant?: string
     parts: Array<TextPartInput | FilePartInput | AgentPartInput | SubtaskPartInput>
   }
@@ -6733,6 +6746,7 @@ export type SessionPromptAsyncData = {
     }
     format?: OutputFormat
     system?: string
+    transientSystem?: string
     variant?: string
     parts: Array<TextPartInput | FilePartInput | AgentPartInput | SubtaskPartInput>
   }
@@ -6776,6 +6790,8 @@ export type SessionRetryData = {
     }
     agent?: string
     variant?: string
+    system?: string
+    transientSystem?: string
   }
   path: {
     sessionID: string
@@ -6790,11 +6806,11 @@ export type SessionRetryData = {
 
 export type SessionRetryErrors = {
   /**
-   * Bad request
+   * BadRequest | InvalidRequestError
    */
-  400: BadRequestError
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
   /**
-   * Not found
+   * NotFoundError
    */
   404: NotFoundError
 }
@@ -6821,6 +6837,8 @@ export type SessionRetryAsyncData = {
     }
     agent?: string
     variant?: string
+    system?: string
+    transientSystem?: string
   }
   path: {
     sessionID: string
@@ -6835,11 +6853,11 @@ export type SessionRetryAsyncData = {
 
 export type SessionRetryAsyncErrors = {
   /**
-   * Bad request
+   * BadRequest | InvalidRequestError
    */
-  400: BadRequestError
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
   /**
-   * Not found
+   * NotFoundError
    */
   404: NotFoundError
 }

@@ -37,6 +37,7 @@ function testAgent(input: {
     mode: input.mode,
     permission: Permission.fromConfig(input.permission),
     options: {},
+    modelSelection: "user",
   } satisfies Agent.Info
 }
 

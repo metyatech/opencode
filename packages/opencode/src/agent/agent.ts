@@ -43,7 +43,7 @@ export const Info = Schema.Struct({
     }),
   ),
   variant: Schema.optional(Schema.String),
-  modelSelection: Schema.optional(Schema.Literals(["user", "managed"])),
+  modelSelection: Schema.Literals(["user", "managed"]),
   prompt: Schema.optional(Schema.String),
   options: Schema.Record(Schema.String, Schema.Unknown),
   steps: Schema.optional(Schema.Finite),
@@ -142,6 +142,7 @@ export const layer = Layer.effect(
             ),
             mode: "primary",
             native: true,
+            modelSelection: "user",
           },
           plan: {
             name: "plan",
@@ -165,6 +166,7 @@ export const layer = Layer.effect(
             ),
             mode: "primary",
             native: true,
+            modelSelection: "user",
           },
           general: {
             name: "general",
@@ -179,6 +181,7 @@ export const layer = Layer.effect(
             options: {},
             mode: "subagent",
             native: true,
+            modelSelection: "user",
           },
           explore: {
             name: "explore",
@@ -202,6 +205,7 @@ export const layer = Layer.effect(
             options: {},
             mode: "subagent",
             native: true,
+            modelSelection: "user",
           },
           ...(flags.experimentalScout
             ? {
@@ -230,6 +234,7 @@ export const layer = Layer.effect(
                   options: {},
                   mode: "subagent" as const,
                   native: true,
+                  modelSelection: "user",
                 },
               }
             : {}),
@@ -247,6 +252,7 @@ export const layer = Layer.effect(
               user,
             ),
             options: {},
+            modelSelection: "user",
           },
           title: {
             name: "title",
@@ -263,6 +269,7 @@ export const layer = Layer.effect(
               user,
             ),
             prompt: PROMPT_TITLE,
+            modelSelection: "user",
           },
           summary: {
             name: "summary",
@@ -278,6 +285,7 @@ export const layer = Layer.effect(
               user,
             ),
             prompt: PROMPT_SUMMARY,
+            modelSelection: "user",
           },
         }
 
@@ -294,10 +302,11 @@ export const layer = Layer.effect(
               permission: Permission.merge(defaults, user),
               options: {},
               native: false,
+              modelSelection: "user",
             }
           if (value.model) item.model = Provider.parseModel(value.model)
           item.variant = value.variant ?? item.variant
-          item.modelSelection = value.model_selection ?? item.modelSelection
+          if (value.model_selection) item.modelSelection = value.model_selection
           item.prompt = value.prompt ?? item.prompt
           item.description = value.description ?? item.description
           item.temperature = value.temperature ?? item.temperature
