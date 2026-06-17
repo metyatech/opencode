@@ -327,17 +327,21 @@ export const withProviderRequestWatchdog = <E>(
       modelID: options.modelID,
     })
 
-  return Stream.callback<LLMEvent, E | TimeoutInstance>((queue) =>
+  return Stream.unwrap(
     Effect.scoped(
       Effect.gen(function* () {
         const scope = yield* Effect.scope
-        // Coordination: a Deferred used as a "done" signal. The consumer
-        // fiber awaits this signal at the start of every pull so a stuck
-        // upstream (`Stream.never` or an abort-ignoring source) cannot
-        // block the watchdog path. The watchdog timeout fires
-        // `Queue.failCauseUnsafe` AND `signalDone` so the consumer exits
-        // immediately and the inner Effect returns so Stream.callback can
-        // tear down.
+        // Unbounded queue that decouples upstream pull from downstream
+        // pull. `Stream.fromQueue` is pull-based; with an unbounded queue
+        // the consumer fiber can always enqueue, and `Stream.runCollect`
+        // / `Stream.runDrain` drains whenever it pulls. A bounded queue
+        // deadlocked here because `Stream.callback`'s internal queue
+        // blocks offers while no downstream pull is active.
+        const queue = yield* Queue.unbounded<LLMEvent>()
+
+        // Coordination: a Deferred used as a "done" signal so the
+        // upstream consumer fiber can wake up when the watchdog fires and
+        // abandon a stuck `pull`.
         const consumerDone = yield* Deferred.make<void, never>()
         const signalDone = () => {
           Deferred.doneUnsafe(consumerDone, Effect.succeed(undefined as void))
@@ -348,63 +352,44 @@ export const withProviderRequestWatchdog = <E>(
           clock,
           onTimeout: (event) =>
             Effect.sync(() => {
-              // The queue fails FIRST so `Stream.runDrain` / `Stream.runCollect`
-              // exits with the typed error. Then signal the deferred so the
-              // inner Effect can exit. Finally call `abort.abort()` as
-              // cleanup — the upstream may be stuck and we don't depend on
-              // its reaction to abort for the typed error to surface.
+              // The queue fails FIRST so `Stream.fromQueue` exits with the
+              // typed error. Then signal the deferred so the consumer
+              // fiber's stuck pull is interrupted. Finally call
+              // `abort.abort()` as cleanup — the upstream may be stuck and
+              // we don't depend on its reaction to abort for the typed
+              // error to surface.
               Queue.failCauseUnsafe(queue, Cause.fail(makeError(event.phase)))
               signalDone()
               options.abort.abort()
             }),
         })
 
-        // Consumer fiber: pulls events from the upstream stream, forwards
-        // them through the watchdog, and offers them to the consumer queue.
-        // Every pull is raced against the `consumerDone` signal so a stuck
-        // upstream (`Stream.never`, an abort-ignoring source) cannot pin
-        // the consumer fiber indefinitely — when the watchdog fires, the
-        // signal resolves, the pull is interrupted, and the consumer exits.
-        //
-        // The fiber is forked in `scope` so it is also interrupted
-        // automatically when the stream's scope closes (e.g. user cancel).
+        // Upstream consumer fiber: pulls events from the upstream stream,
+        // forwards them through the watchdog, and enqueues them. Every
+        // pull is raced against the `consumerDone` signal so a stuck
+        // upstream cannot pin the fiber indefinitely. The fiber is
+        // forked in `scope` so it is interrupted when the stream's scope
+        // closes (e.g. user cancel).
         yield* Effect.forkIn(
           Effect.gen(function* () {
             const pull = yield* Stream.toPull(source)
             while (true) {
               const chunk = yield* Effect.race(pull, Deferred.await(consumerDone))
-              // If the race was won by the done signal, the pulled effect
-              // was interrupted and the consumer must exit. Otherwise the
-              // chunk is a real chunk from the upstream stream.
-              if (!chunk || chunk.length === 0) {
-                // Empty chunk also signals end-of-stream.
-                signalDone()
-                return
-              }
+              if (!chunk) return
               for (const event of chunk) {
                 watchdog.handle(event)
-                Queue.offerUnsafe(queue, event)
+                yield* Queue.offer(queue, event)
               }
             }
           }).pipe(
             Effect.catchCause((cause) =>
               Effect.sync(() => {
-                // Read the watchdog's state BEFORE cancelling so we know
-                // whether the timer fired already (typed timeout published)
-                // vs the upstream terminated first.
                 const fired = watchdog.state()._tag === "fired"
-                // Cancel the watchdog so any pending timer is interrupted
-                // and never fires after the consumer has already settled.
                 watchdog.cancel()
                 if (fired) {
-                  // Watchdog already published the typed timeout; nothing else to do.
                   signalDone()
                   return
                 }
-                // The upstream terminated for a reason that is NOT a typed
-                // timeout. If the upstream ended without producing any
-                // event AND the watchdog never fired, the contract says the
-                // first_event timeout is the correct outcome.
                 const wasAwaitingFirstEvent =
                   watchdog.state()._tag === "inactive" ||
                   watchdog.state()._tag === "awaiting-first-event"
@@ -417,7 +402,6 @@ export const withProviderRequestWatchdog = <E>(
                   return
                 }
                 if (Cause.isDone(cause)) {
-                  // Normal end (at least one event arrived). No timeout.
                   signalDone()
                   return
                 }
@@ -429,27 +413,34 @@ export const withProviderRequestWatchdog = <E>(
           scope,
         )
 
-        // Wait for the consumer / watchdog to complete. The deferred is
-        // signalled on (a) upstream normal end, (b) watchdog timeout, or
-        // (c) upstream failure. The Deferred never fails. If the stream
-        // scope is closed externally (user cancel), the consumer fiber is
-        // interrupted by forkIn, the finalizer below runs, and `Deferred
-        // .await` is also interrupted.
-        yield* Deferred.await(consumerDone)
-
         // Scope finalizer: cancel the watchdog, abort the upstream
-        // controller. `Effect.forkIn` already cancels the consumer fiber
-        // when the scope closes. The queue is closed by Stream.callback's
-        // own shutdown finalizer.
+        // controller. The consumer fiber is interrupted by forkIn when
+        // the scope closes.
         yield* Effect.addFinalizer(() =>
           Effect.sync(() => {
             watchdog.cancel()
             options.abort.abort()
+            signalDone()
           }),
         )
+
+        return Stream.unfoldChunkEffect(undefined, () =>
+          // `Queue.take` blocks until the queue has data, the queue is
+          // failed, or the queue is ended. The watchdog timeout fails the
+          // queue with the typed `ProviderRequestTimeoutError` so this
+          // step fails with that exact cause, which the stream propagates
+          // to the consumer. We do NOT race against `consumerDone` here
+          // — the queue-fail path is the authoritative signal, and racing
+          // would cause `Stream.unfoldChunkEffect` to silently end
+          // (`Option.none`) when the done signal wins, losing the typed
+          // error.
+          Queue.take(queue).pipe(
+            Effect.map((chunk) => Option.some([undefined, chunk] as const)),
+          ),
+        ) as Stream.Stream<LLMEvent, E | TimeoutInstance>
       }),
     ),
-  ) as Stream.Stream<LLMEvent, E | TimeoutInstance>
+  )
 }
 
 export { Exit }
