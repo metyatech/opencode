@@ -295,7 +295,7 @@ export const layer = Layer.effect(
 
       yield* sync(sessionID, [
         { type: "session", data: info },
-        ...messages.map((item) => ({ type: "message" as const, data: item.info as SDK.Message })),
+        ...messages.map((item) => ({ type: "message" as const, data: item.info })),
         ...messages.flatMap((item) => item.parts.map((part) => ({ type: "part" as const, data: part }))),
         { type: "session_diff", data: diffs },
         { type: "model", data: models },

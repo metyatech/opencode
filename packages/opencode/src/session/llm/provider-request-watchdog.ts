@@ -1,4 +1,4 @@
-import { Clock, Deferred, Effect, Exit, Fiber, Schema } from "effect"
+import { Cause, Clock, Deferred, Effect, Exit, Fiber, Queue, Schema } from "effect"
 import * as Stream from "effect/Stream"
 import type { LLMEvent } from "@opencode-ai/llm"
 import { NonNegativeInt } from "@opencode-ai/core/schema"
@@ -7,7 +7,7 @@ import { ProviderRequestTimeoutError } from "../message-error"
 const TimeoutPhase = Schema.Literals(["first_event", "stream_idle"])
 export type TimeoutPhase = "first_event" | "stream_idle"
 
-type TimeoutInstance = InstanceType<typeof ProviderRequestTimeoutError>
+export type TimeoutInstance = InstanceType<typeof ProviderRequestTimeoutError>
 
 /**
  * Clock abstraction. Tests inject a fake clock whose `sleep` returns a
@@ -279,25 +279,31 @@ const timeoutMessage = (phase: TimeoutPhase, ms: number, providerID: string, mod
     : `Provider ${providerID}/${modelID} stream was idle for more than ${ms}ms`
 
 /**
- * Wrap a `Stream.Stream<LLMEvent, unknown>` with the watchdog. The wrapper:
+ * Wrap a `Stream.Stream<LLMEvent, E>` with the watchdog. The wrapper:
  *
  *   - emits every upstream event unchanged,
- *   - calls `abort.abort()` once on `first_event` / `stream_idle` so the
- *     request-scoped `AbortController` interrupts the AI SDK / native stream,
- *   - fails the stream with `ProviderRequestTimeoutError` exactly once,
- *   - cancels the timer on every terminal transition (step-finish / finish /
- *     provider-error / normal end / failure / user cancel / scope end),
+ *   - fails the stream with `ProviderRequestTimeoutError` exactly once when
+ *     the deadline fires — independently of whether the upstream reacts to
+ *     `abort.abort()` or ignores it,
+ *   - cleans up the timer fiber, the request-scoped `AbortController`, and
+ *     the consumer queue on every terminal transition (success, typed
+ *     timeout, upstream failure, user cancel, scope end),
  *   - parks while a local `tool-call` is in flight and resumes on the next
  *     `step-start`.
  *
  * The wrapper is a no-op when `timeoutMs <= 0`.
  *
- * Implementation: `Stream.tap` invokes the watchdog on every event; the
- * watchdog forks a short-lived sleep fiber per arming. When the timer fires,
- * `onTimeout` calls `abort.abort()`, which makes the next upstream pull fail
- * with an `AbortError`. `mapError` translates that failure into the typed
- * `ProviderRequestTimeoutError`. Every other failure passes through to
- * `MessageV2.fromError` for classification.
+ * Implementation: the wrapper is `Stream.callback(...)` over an internal
+ * queue. A consumer fiber pulls events from the upstream stream, feeds them
+ * into the watchdog, and forwards them into the queue. The watchdog forks a
+ * scoped timer fiber on every arming; the timer fiber races `clock.sleep`
+ * against the upstream's next event. When the deadline resolves first, the
+ * timer fiber calls `Queue.failCauseUnsafe(queue, Cause.fail(makeError))`
+ * (the authoritative signal) and then `abort.abort()` for upstream cleanup.
+ * The consumer fiber is forked via `Effect.forkIn(scope)` so it is
+ * interrupted when the stream's scope closes. The callback Effect itself
+ * holds the inner `Deferred.await` so it stays alive until the watchdog
+ * signals completion — without depending on the upstream reacting to abort.
  */
 export const withProviderRequestWatchdog = <E>(
   source: Stream.Stream<LLMEvent, E>,
@@ -313,40 +319,130 @@ export const withProviderRequestWatchdog = <E>(
     return source as Stream.Stream<LLMEvent, E | TimeoutInstance>
   }
   const clock = options.clock ?? liveWatchdogClock()
-  const watchdog = createProviderRequestWatchdog({
-    timeoutMs: options.timeoutMs,
-    clock,
-    onTimeout: () =>
-      Effect.sync(() => {
-        options.abort.abort()
-      }),
-  })
+  const makeError = (phase: TimeoutPhase) =>
+    makeTimeoutError({
+      phase,
+      timeoutMs: options.timeoutMs,
+      providerID: options.providerID,
+      modelID: options.modelID,
+    })
 
-  return source.pipe(
-    Stream.tap((event) =>
-      Effect.sync(() => {
-        watchdog.handle(event)
+  return Stream.callback<LLMEvent, E | TimeoutInstance>((queue) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const scope = yield* Effect.scope
+        // Coordination: when the watchdog fires (or the upstream finishes
+        // / fails), the inner Effect must exit so `Stream.callback` closes
+        // the stream. The deferred is signalled on every terminal path so
+        // the inner Effect never blocks waiting for a stuck upstream that
+        // ignores the abort signal.
+        const consumerDone = yield* Deferred.make<void, never>()
+        const signalDone = () => {
+          // doneUnsafe completes the deferred synchronously and propagates
+          // the value to all waiting fibers immediately, so the inner
+          // Effect can exit as soon as the watchdog fires.
+          Deferred.doneUnsafe(consumerDone, Effect.succeed(undefined as void))
+        }
+
+        const watchdog = createProviderRequestWatchdog({
+          timeoutMs: options.timeoutMs,
+          clock,
+          onTimeout: (event) =>
+            Effect.sync(() => {
+              // The queue fails FIRST so `Stream.runDrain` / `Stream.runCollect`
+              // exits with the typed error. Then signal the deferred so the
+              // inner Effect can exit. Finally call `abort.abort()` as
+              // cleanup — the upstream may be stuck and we don't depend on
+              // its reaction to abort for the typed error to surface.
+              Queue.failCauseUnsafe(queue, Cause.fail(makeError(event.phase)))
+              signalDone()
+              options.abort.abort()
+            }),
+        })
+
+// Consumer fiber: pulls events from the upstream stream, forwards
+        // them through the watchdog, and offers them to the consumer queue.
+        // If the upstream errors, the queue fails with that error (unless
+        // the watchdog has already fired and emitted the typed timeout).
+        // The fiber is forked in `scope` so it is interrupted automatically
+        // when the stream's scope closes (e.g. user cancel).
+        //
+        // We do NOT call `Queue.endUnsafe` from the consumer — the queue
+        // is shut down by `Stream.callback`'s built-in finalizer when the
+        // scope closes. Ending the queue early would race the downstream
+        // pull and silently drop buffered events.
+        yield* Effect.forkIn(
+          Effect.gen(function* () {
+            const pull = yield* Stream.toPull(source)
+            while (true) {
+              const chunk = yield* pull
+              for (const event of chunk) {
+                watchdog.handle(event)
+                Queue.offerUnsafe(queue, event)
+              }
+            }
+          }).pipe(
+            Effect.catchCause((cause) =>
+              Effect.sync(() => {
+                // Read the watchdog's state BEFORE cancelling so we know
+                // whether the timer fired already (typed timeout published)
+                // vs the upstream terminated first.
+                const wasAwaitingFirstEvent =
+                  watchdog.state()._tag === "awaiting-first-event"
+                const fired = watchdog.state()._tag === "fired"
+                // Cancel the watchdog so any pending timer is interrupted
+                // and never fires after the consumer has already settled.
+                watchdog.cancel()
+                if (Cause.isDone(cause)) {
+                  if (wasAwaitingFirstEvent) {
+                    // Upstream completed without ever producing an event.
+                    // Per the wrapper contract, the typed `first_event`
+                    // timeout is what should surface here.
+                    Queue.failCauseUnsafe(
+                      queue,
+                      Cause.fail(makeError("first_event")),
+                    )
+                    signalDone()
+                    return
+                  }
+                  // Normal end (at least one event arrived). No timeout.
+                  signalDone()
+                  return
+                }
+                if (fired) {
+                  // Watchdog already published the typed timeout; nothing else to do.
+                  signalDone()
+                  return
+                }
+                Queue.failCauseUnsafe(queue, cause)
+                signalDone()
+              }),
+            ),
+          ),
+          scope,
+        )
+
+        // Wait for the consumer / watchdog to complete. The deferred is
+        // signalled on (a) upstream normal end, (b) watchdog timeout, or
+        // (c) upstream failure. The Deferred never fails. If the stream
+        // scope is closed externally (user cancel), the consumer fiber is
+        // interrupted by forkIn, the finalizer below runs, and `Deferred
+        // .await` is also interrupted.
+        yield* Deferred.await(consumerDone)
+
+        // Scope finalizer: cancel the watchdog, abort the upstream
+        // controller. `Effect.forkIn` already cancels the consumer fiber
+        // when the scope closes. The queue is closed by Stream.callback's
+        // own shutdown finalizer (see Channel.callbackArray internals).
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => {
+            watchdog.cancel()
+            options.abort.abort()
+          }),
+        )
       }),
     ),
-    Stream.mapError((cause) => {
-      const fired = watchdog.state()
-      if (fired._tag === "fired") {
-        watchdog.cancel()
-        return makeTimeoutError({
-          phase: fired.phase,
-          timeoutMs: options.timeoutMs,
-          providerID: options.providerID,
-          modelID: options.modelID,
-        })
-      }
-      // The watchdog hasn't fired. Pass the upstream cause through unchanged
-      // so `MessageV2.fromError` downstream classifies it (AbortedError when
-      // the user cancels; the original provider error otherwise).
-      watchdog.cancel()
-      return cause as E | TimeoutInstance
-    }),
-    Stream.onEnd(Effect.sync(() => watchdog.cancel())),
-  )
+  ) as Stream.Stream<LLMEvent, E | TimeoutInstance>
 }
 
 export { Exit }

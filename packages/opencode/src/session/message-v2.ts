@@ -383,7 +383,6 @@ const AssistantErrorSchema = Schema.Union([
   StructuredOutputError.EffectSchema,
   ContextOverflowError.EffectSchema,
   APIError.EffectSchema,
-  ProviderRequestTimeoutError.EffectSchema,
 ]).annotate({ discriminator: "name" })
 type AssistantError = Schema.Schema.Type<typeof AssistantErrorSchema>
 

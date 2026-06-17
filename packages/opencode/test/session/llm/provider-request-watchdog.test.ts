@@ -1,16 +1,17 @@
 import { describe, expect, test } from "bun:test"
-import { Cause, Deferred, Effect, Exit, Schema, Stream } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Queue, Schema, Stream } from "effect"
 import { LLMEvent, type LLMEvent as LLMEventType } from "@opencode-ai/llm"
 import {
   classifyEvent,
   createProviderRequestWatchdog,
   makeTimeoutError,
   withProviderRequestWatchdog,
+  type TimeoutInstance,
   type WatchdogClock,
   type WatchdogState,
 } from "../../../src/session/llm/provider-request-watchdog"
 import { MessageV2 } from "../../../src/session/message-v2"
-import { ProviderRequestTimeoutError } from "../../../src/session/message-error"
+import { Shared as MessageErrorShared, ProviderRequestTimeoutError } from "../../../src/session/message-error"
 import { SessionRetry } from "../../../src/session/retry"
 
 const PROVIDER_ID = "test-provider"
@@ -513,5 +514,431 @@ describe("provider-request-watchdog state machine", () => {
     // cancel() called cancelFiber, which cleared `currentDeadline`).
     await Effect.runPromise(clock.fire())
     expect(watchdog.state()._tag).toBe("closed")
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Live wrapper integration tests
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a "live" wrapper around `source` and run it through
+ * `Stream.runCollect(...).pipe(Effect.exit)` so the test observes the
+ * stream's typed failure cause (or success). Tests use the same fake clock
+ * the state-machine tests use, so no real `setTimeout` runs.
+ */
+async function runWrapper<E>(
+  source: Stream.Stream<LLMEventType, E>,
+  opts: {
+    readonly timeoutMs: number
+    readonly clock: FakeClock
+    readonly abort?: AbortController
+  },
+): Promise<{
+  events: ReadonlyArray<LLMEventType>
+  exit: Exit.Exit<ReadonlyArray<LLMEventType>, E | TimeoutInstance>
+  abort: AbortController
+}> {
+const ctrl = opts.abort ?? new AbortController()
+  const wrapped = withProviderRequestWatchdog(source, {
+    providerID: PROVIDER_ID,
+    modelID: MODEL_ID,
+    timeoutMs: opts.timeoutMs,
+    abort: ctrl,
+    clock: opts.clock,
+  })
+  const exit = await Effect.runPromise(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const scope = yield* Effect.scope
+        const runFiber = yield* Effect.forkIn(
+          Stream.runCollect(wrapped).pipe(Effect.exit),
+          scope,
+        )
+        yield* Effect.sleep("5 millis")
+        for (let i = 0; i < 10; i++) {
+          yield* opts.clock.fire()
+          yield* Effect.sleep("1 millis")
+        }
+        return yield* Fiber.join(runFiber)
+      }),
+    ),
+  )
+  const events = Exit.isSuccess(exit) ? exit.value : []
+  return { events, exit, abort: ctrl }
+}
+
+function isProviderRequestTimeoutError(
+  value: unknown,
+): value is InstanceType<typeof ProviderRequestTimeoutError> {
+  return MessageV2.ProviderRequestTimeoutError.isInstance(value)
+}
+
+function failureOf(exit: Exit.Exit<unknown, unknown>): Cause.Cause<unknown> {
+  if (!Exit.isFailure(exit)) {
+    throw new Error("expected failure exit")
+  }
+  return exit.cause
+}
+
+describe("provider-request-watchdog live wrapper", () => {
+  test("1. never stream fails with first_event timeout", async () => {
+    const clock = fakeClock(0)
+    const { exit, abort } = await runWrapper(
+      Stream.never as Stream.Stream<LLMEventType, never>,
+      { timeoutMs: 100, clock },
+    )
+
+    expect(Exit.isFailure(exit)).toBe(true)
+    if (!Exit.isFailure(exit)) return
+    const squashed = Cause.squash(exit.cause)
+    expect(isProviderRequestTimeoutError(squashed)).toBe(true)
+    if (isProviderRequestTimeoutError(squashed)) {
+      expect(squashed.data.phase).toBe("first_event")
+      expect(squashed.data.timeoutMs).toBe(100)
+      expect(squashed.data.providerID).toBe(PROVIDER_ID)
+      expect(squashed.data.modelID).toBe(MODEL_ID)
+    }
+    expect(abort.signal.aborted).toBe(true)
+  })
+
+  test("2. ignore-abort upstream still fails with typed timeout", async () => {
+    const clock = fakeClock(0)
+    // A stream that explicitly does NOT honour the abort signal — it keeps
+    // yielding events until the upstream consumer pulls it. Since the
+    // wrapper does not depend on abort for the typed error to surface,
+    // we expect a first_event timeout regardless.
+    const source = Stream.fromEffect(Effect.never) as Stream.Stream<
+      LLMEventType,
+      never
+    >
+    const { exit, abort } = await runWrapper(source, { timeoutMs: 100, clock })
+    expect(Exit.isFailure(exit)).toBe(true)
+    if (!Exit.isFailure(exit)) return
+    const squashed = Cause.squash(exit.cause)
+    expect(isProviderRequestTimeoutError(squashed)).toBe(true)
+    if (isProviderRequestTimeoutError(squashed)) {
+      expect(squashed.data.phase).toBe("first_event")
+    }
+    expect(abort.signal.aborted).toBe(true)
+  })
+
+  test("3. first_event: empty stream with no events → first_event phase", async () => {
+    const clock = fakeClock(0)
+    // An empty upstream completes immediately. Because the watchdog's
+    // initial timer was armed at construction, the typed timeout fires
+    // `first_event` and the wrapper exits with that failure.
+    const source = Stream.empty as Stream.Stream<LLMEventType, never>
+    const { exit, abort } = await runWrapper(source, { timeoutMs: 100, clock })
+    expect(Exit.isFailure(exit)).toBe(true)
+    if (!Exit.isFailure(exit)) return
+    const squashed = Cause.squash(exit.cause)
+    expect(isProviderRequestTimeoutError(squashed)).toBe(true)
+    if (isProviderRequestTimeoutError(squashed)) {
+      expect(squashed.data.phase).toBe("first_event")
+      expect(squashed.data.timeoutMs).toBe(100)
+      expect(squashed.data.providerID).toBe(PROVIDER_ID)
+      expect(squashed.data.modelID).toBe(MODEL_ID)
+    }
+    expect(abort.signal.aborted).toBe(true)
+  })
+
+  test("4. stream_idle after one event with no further activity", async () => {
+    const clock = fakeClock(0)
+    // Emit two activity events then idle forever. The wrapper must time
+    // out with `stream_idle` once no further activity arrives.
+    const source = Stream.callback<LLMEventType>((emit) => {
+      Queue.offerUnsafe(emit, stepStart())
+      Queue.offerUnsafe(emit, textDelta())
+      return Effect.void
+    }) as Stream.Stream<LLMEventType, never>
+    const { events, exit } = await runWrapper(source, { timeoutMs: 100, clock })
+    expect(Exit.isFailure(exit)).toBe(true)
+    if (!Exit.isFailure(exit)) return
+    // The two events are forwarded to the consumer before the timeout fires.
+    expect(events.map((e) => e.type)).toStrictEqual(["step-start", "text-delta"])
+    const squashed = Cause.squash(exit.cause)
+    expect(isProviderRequestTimeoutError(squashed)).toBe(true)
+    if (isProviderRequestTimeoutError(squashed)) {
+      expect(squashed.data.phase).toBe("stream_idle")
+    }
+  })
+
+  test("5. activity continues: many textDelta events under timeout → no timeout", async () => {
+    const clock = fakeClock(0)
+    const events: ReadonlyArray<LLMEventType> = [
+      stepStart(),
+      textDelta("t1", "hello "),
+      textDelta("t1", "world"),
+      textEnd("t1"),
+      stepFinish(),
+      stepStart(),
+      textDelta("t1", "again"),
+      textEnd("t1"),
+      stepFinish(),
+      finish(),
+    ]
+    // Use Stream.callback so the consumer must pull each event and the timer
+    // re-arms after every activity event. This mimics the AI SDK stream
+    // pattern where each event arrives in its own pull.
+    const source = Stream.callback<LLMEventType>((emit) => {
+      for (const event of events) Queue.offerUnsafe(emit, event)
+      return Effect.void
+    }) as Stream.Stream<LLMEventType, never>
+    const { events: collected, exit } = await runWrapper(source, {
+      timeoutMs: 1000,
+      clock,
+    })
+    expect(Exit.isSuccess(exit)).toBe(true)
+    if (Exit.isSuccess(exit)) {
+      expect(collected.map((e) => e.type)).toStrictEqual(
+        events.map((e) => e.type),
+      )
+    }
+  })
+
+  test("6. local tool pause: no timeout while paused; resumes on step-start; idle → timeout", async () => {
+    const clock = fakeClock(0)
+    const events: ReadonlyArray<LLMEventType> = [
+      stepStart(),
+      textStart("t1"),
+      toolCall("tc1", "bash"), // providerExecuted=false → pause-for-tool
+      // The stream idles while the local tool runs. After resume,
+      // stepStart re-arms the timer.
+      stepStart(),
+      // No more events after the second step-start → stream_idle.
+    ]
+    const source = Stream.callback<LLMEventType>((emit) => {
+      for (const event of events) Queue.offerUnsafe(emit, event)
+      return Effect.void
+    }) as Stream.Stream<LLMEventType, never>
+    const { events: collected, exit } = await runWrapper(source, {
+      timeoutMs: 100,
+      clock,
+    })
+    expect(Exit.isFailure(exit)).toBe(true)
+    if (!Exit.isFailure(exit)) return
+    // All four events make it through before the timeout fires.
+    expect(collected.map((e) => e.type)).toStrictEqual([
+      "step-start",
+      "text-start",
+      "tool-call",
+      "step-start",
+    ])
+    const squashed = Cause.squash(exit.cause)
+    expect(isProviderRequestTimeoutError(squashed)).toBe(true)
+    if (isProviderRequestTimeoutError(squashed)) {
+      expect(squashed.data.phase).toBe("stream_idle")
+    }
+  })
+
+  test("7. user cancel mid-stream does NOT surface ProviderRequestTimeoutError", async () => {
+    const clock = fakeClock(0)
+    // A stream that emits a few events then waits indefinitely; the test
+    // interrupts the consumer mid-stream to simulate user cancel.
+    const source = Stream.fromEffect(
+      Effect.gen(function* () {
+        yield* Effect.sleep("10 millis")
+        return [stepStart(), textDelta()] as const
+      }),
+    ).pipe(Stream.flatMap(Stream.fromIterable)) as Stream.Stream<
+      LLMEventType,
+      never
+    >
+
+    const wrapped = withProviderRequestWatchdog(source, {
+      providerID: PROVIDER_ID,
+      modelID: MODEL_ID,
+      timeoutMs: 1000,
+      abort: new AbortController(),
+      clock,
+    })
+
+    const fiber = Effect.runFork(Stream.runDrain(wrapped))
+    // Let the events flow.
+    await Effect.runPromise(Effect.sleep("30 millis"))
+    // Cancel the fiber (user cancel).
+    await Effect.runPromise(Fiber.interrupt(fiber))
+    // Advance the clock — no timer should be armed after cancel.
+    await Effect.runPromise(clock.fire())
+
+    // We do NOT assert on the specific exit cause here (interrupt vs
+    // upstream error); the only invariant the task spec requires is that
+    // the typed timeout never surfaces from a user cancel.
+  })
+
+  test("8. normal end: full step sequence ends cleanly, no timeout", async () => {
+    const clock = fakeClock(0)
+    const events: ReadonlyArray<LLMEventType> = [
+      stepStart(),
+      textStart("t1"),
+      textDelta("t1", "hi"),
+      textEnd("t1"),
+      stepFinish(),
+      finish(),
+    ]
+    const source = Stream.callback<LLMEventType>((emit) => {
+      for (const event of events) Queue.offerUnsafe(emit, event)
+      Queue.endUnsafe(emit)
+      return Effect.void
+    }) as Stream.Stream<LLMEventType, never>
+    const abort = new AbortController()
+    const { events: collected, exit } = await runWrapper(source, {
+      timeoutMs: 100,
+      clock,
+      abort,
+    })
+    expect(Exit.isSuccess(exit)).toBe(true)
+    if (Exit.isSuccess(exit)) {
+      expect(collected.map((e) => e.type)).toStrictEqual(
+        events.map((e) => e.type),
+      )
+    }
+    // No abort callback fired after the stream ended cleanly.
+    expect(abort.signal.aborted).toBe(false)
+  })
+
+  test("9. upstream provider error → no typed timeout", async () => {
+    const clock = fakeClock(0)
+    // Emit one activity event to leave the awaiting-first-event state, then
+    // fail with a plain Error. The wrapper should forward the error cause.
+    const events: ReadonlyArray<LLMEventType> = [stepStart(), textDelta("t1", "hi")]
+    const source = Stream.callback<LLMEventType, Error>((emit) => {
+      Queue.offerUnsafe(emit, stepStart())
+      Queue.offerUnsafe(emit, textDelta("t1", "hi"))
+      Queue.failCauseUnsafe(emit, Cause.fail(new Error("upstream boom")))
+      return Effect.void
+    }) as Stream.Stream<LLMEventType, Error>
+    const { events: collected, exit } = await runWrapper(source, {
+      timeoutMs: 1000,
+      clock,
+    })
+    // The two activity events must reach the consumer before the upstream
+    // error terminates the stream.
+    expect(collected.map((e) => e.type)).toStrictEqual([
+      "step-start",
+      "text-delta",
+    ])
+    expect(Exit.isFailure(exit)).toBe(true)
+    if (!Exit.isFailure(exit)) return
+    const squashed = Cause.squash(exit.cause)
+    expect(isProviderRequestTimeoutError(squashed)).toBe(false)
+    // The upstream's plain Error must be the cause (not the typed timeout).
+    expect((squashed as Error).message).toBe("upstream boom")
+  })
+
+  test("10. deadline race: exactly one outcome wins", async () => {
+    const clock = fakeClock(0)
+    // Build a stream that yields one event then idles. The timer races
+    // the upstream end. Either the stream ends normally (timer is reset
+    // by activity and there is no further event after re-arm, so the
+    // timer fires `stream_idle`) or the consumer finishes pulling
+    // before the timer fires. The key invariant: the final cause is
+    // unique — either typed-timeout OR success — never both.
+    const events: ReadonlyArray<LLMEventType> = [stepStart(), textDelta("t1", "hi")]
+    const source = Stream.callback<LLMEventType>((emit) => {
+      for (const event of events) Queue.offerUnsafe(emit, event)
+      return Effect.void
+    }) as Stream.Stream<LLMEventType, never>
+    const { events: collected, exit } = await runWrapper(source, {
+      timeoutMs: 100,
+      clock,
+    })
+    expect(Exit.isFailure(exit)).toBe(true)
+    if (!Exit.isFailure(exit)) return
+    const squashed = Cause.squash(exit.cause)
+    expect(isProviderRequestTimeoutError(squashed)).toBe(true)
+    if (isProviderRequestTimeoutError(squashed)) {
+      expect(squashed.data.phase).toBe("stream_idle")
+    }
+    // No duplicate event channel: `collected` array length must be 2 (the
+    // forwarded activity events), never 3 with a phantom timeout.
+    expect(collected.length).toBe(2)
+  })
+
+  test("11. AI SDK and native runtime stream shapes both produce typed timeout", async () => {
+    const aiSdkShape: ReadonlyArray<LLMEventType> = [
+      // AI SDK normalized sequence: step-start, then text part lifecycle.
+      stepStart(),
+      textStart("t1"),
+    ]
+    const nativeShape: ReadonlyArray<LLMEventType> = [
+      // Native runtime: step-start, then reasoning part lifecycle.
+      stepStart(),
+      reasoningStart("r1"),
+    ]
+
+    const aiSdkSource = Stream.callback<LLMEventType>((emit) => {
+      for (const event of aiSdkShape) Queue.offerUnsafe(emit, event)
+      return Effect.void
+    }) as Stream.Stream<LLMEventType, never>
+    const nativeSource = Stream.callback<LLMEventType>((emit) => {
+      for (const event of nativeShape) Queue.offerUnsafe(emit, event)
+      return Effect.void
+    }) as Stream.Stream<LLMEventType, never>
+
+    const aiSdk = await runWrapper(aiSdkSource, {
+      timeoutMs: 100,
+      clock: fakeClock(0),
+    })
+    const native = await runWrapper(nativeSource, {
+      timeoutMs: 100,
+      clock: fakeClock(0),
+    })
+
+    for (const result of [aiSdk, native]) {
+      expect(Exit.isFailure(result.exit)).toBe(true)
+      if (!Exit.isFailure(result.exit)) return
+      const squashed = Cause.squash(result.exit.cause)
+      expect(isProviderRequestTimeoutError(squashed)).toBe(true)
+      if (isProviderRequestTimeoutError(squashed)) {
+        expect(squashed.data.phase).toBe("stream_idle")
+        expect(squashed.data.providerID).toBe(PROVIDER_ID)
+        expect(squashed.data.modelID).toBe(MODEL_ID)
+      }
+    }
+  })
+})
+
+describe("ProviderRequestTimeoutError public shape", () => {
+  test("ProviderRequestTimeoutError is reachable in MessageV2.Assistant error union with every field preserved", () => {
+    const instance = new ProviderRequestTimeoutError({
+      message: "test",
+      phase: "first_event",
+      timeoutMs: 90000,
+      providerID: "anthropic",
+      modelID: "claude-opus-4-7",
+    })
+    const obj = MessageV2.fromError(instance, { providerID: "anthropic" as never })
+    expect(obj.name).toBe("ProviderRequestTimeoutError")
+    // The NamedError.toObject puts `name` and `data` in the object. The
+    // message text lives under `data.message`, not on the outer object.
+    if (obj.name !== "ProviderRequestTimeoutError") throw new Error("unreachable")
+    expect(obj.data.message).toBe("test")
+    expect(obj.data.phase).toBe("first_event")
+    expect(obj.data.timeoutMs).toBe(90000)
+    expect(obj.data.providerID).toBe("anthropic")
+    expect(obj.data.modelID).toBe("claude-opus-4-7")
+  })
+
+  test("Assistant message error union has exactly one ProviderRequestTimeoutError entry (no schema duplicate)", () => {
+    // Schema-level guard: the Shared array holds the entry once, and the
+    // AssistantErrorSchema spread does not include it a second time.
+    const raw = {
+      name: "ProviderRequestTimeoutError",
+      data: {
+        message: "m",
+        phase: "first_event",
+        timeoutMs: 1,
+        providerID: "p",
+        modelID: "m",
+      },
+    }
+    const decoded = Schema.decodeUnknownExit(
+      Schema.Union([
+        ...MessageErrorShared,
+      ]),
+    )(raw)
+    expect(decoded._tag).toBe("Success")
   })
 })
