@@ -25,8 +25,8 @@ import { Effect, Schema, Types } from "effect"
 import { NonNegativeInt } from "@opencode-ai/core/schema"
 import * as EffectLogger from "@opencode-ai/core/effect/logger"
 import { MessageError } from "./message-error"
-import { AuthError, OutputLengthError } from "./message-error"
-export { AuthError, OutputLengthError } from "./message-error"
+import { AuthError, OutputLengthError, ProviderRequestTimeoutError } from "./message-error"
+export { AuthError, OutputLengthError, ProviderRequestTimeoutError } from "./message-error"
 
 /** Error shape thrown by Bun's fetch() when gzip/br decompression fails mid-stream */
 interface FetchDecompressionError extends Error {
@@ -383,6 +383,7 @@ const AssistantErrorSchema = Schema.Union([
   StructuredOutputError.EffectSchema,
   ContextOverflowError.EffectSchema,
   APIError.EffectSchema,
+  ProviderRequestTimeoutError.EffectSchema,
 ]).annotate({ discriminator: "name" })
 type AssistantError = Schema.Schema.Type<typeof AssistantErrorSchema>
 
@@ -1150,6 +1151,8 @@ export function fromError(
   ctx: { providerID: ProviderID; aborted?: boolean },
 ): NonNullable<Assistant["error"]> {
   switch (true) {
+    case ProviderRequestTimeoutError.isInstance(e):
+      return e
     case e instanceof DOMException && e.name === "AbortError":
       return new AbortedError(
         { message: e.message },

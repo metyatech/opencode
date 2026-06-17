@@ -85,6 +85,9 @@ export function isQuotaExhausted(message: unknown): boolean {
 }
 
 export function retryable(error: Err, provider: string) {
+  // Provider-request timeouts are user-facing diagnostics; retrying the same
+  // model against the same window would just hit the same stall, so suppress.
+  if (MessageV2.ProviderRequestTimeoutError.isInstance(error)) return undefined
   // context overflow errors should not be retried
   if (MessageV2.ContextOverflowError.isInstance(error)) return undefined
   if (MessageV2.APIError.isInstance(error)) {

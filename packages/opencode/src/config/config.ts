@@ -301,6 +301,10 @@ export const Info = Schema.Struct({
       mcp_timeout: Schema.optional(PositiveInt).annotate({
         description: "Timeout in milliseconds for model context protocol (MCP) requests",
       }),
+      provider_request_timeout_ms: Schema.optional(NonNegativeInt).annotate({
+        description:
+          "Watchdog timeout (milliseconds) for LLM streams. Fires a typed ProviderRequestTimeoutError when no normalized event arrives within the window from subscription start (first_event) or from the most recent activity (stream_idle). Set to 0 to disable. The watchdog pauses while a local tool call is in flight and resumes on the next step-start.",
+      }),
     }),
   ),
 }).annotate({ identifier: "Config" })
