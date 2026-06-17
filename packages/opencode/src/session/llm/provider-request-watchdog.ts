@@ -331,16 +331,15 @@ export const withProviderRequestWatchdog = <E>(
     Effect.scoped(
       Effect.gen(function* () {
         const scope = yield* Effect.scope
-        // Coordination: when the watchdog fires (or the upstream finishes
-        // / fails), the inner Effect must exit so `Stream.callback` closes
-        // the stream. The deferred is signalled on every terminal path so
-        // the inner Effect never blocks waiting for a stuck upstream that
-        // ignores the abort signal.
+        // Coordination: a Deferred used as a "done" signal. The consumer
+        // fiber awaits this signal at the start of every pull so a stuck
+        // upstream (`Stream.never` or an abort-ignoring source) cannot
+        // block the watchdog path. The watchdog timeout fires
+        // `Queue.failCauseUnsafe` AND `signalDone` so the consumer exits
+        // immediately and the inner Effect returns so Stream.callback can
+        // tear down.
         const consumerDone = yield* Deferred.make<void, never>()
         const signalDone = () => {
-          // doneUnsafe completes the deferred synchronously and propagates
-          // the value to all waiting fibers immediately, so the inner
-          // Effect can exit as soon as the watchdog fires.
           Deferred.doneUnsafe(consumerDone, Effect.succeed(undefined as void))
         }
 
@@ -360,22 +359,28 @@ export const withProviderRequestWatchdog = <E>(
             }),
         })
 
-// Consumer fiber: pulls events from the upstream stream, forwards
+        // Consumer fiber: pulls events from the upstream stream, forwards
         // them through the watchdog, and offers them to the consumer queue.
-        // If the upstream errors, the queue fails with that error (unless
-        // the watchdog has already fired and emitted the typed timeout).
-        // The fiber is forked in `scope` so it is interrupted automatically
-        // when the stream's scope closes (e.g. user cancel).
+        // Every pull is raced against the `consumerDone` signal so a stuck
+        // upstream (`Stream.never`, an abort-ignoring source) cannot pin
+        // the consumer fiber indefinitely — when the watchdog fires, the
+        // signal resolves, the pull is interrupted, and the consumer exits.
         //
-        // We do NOT call `Queue.endUnsafe` from the consumer — the queue
-        // is shut down by `Stream.callback`'s built-in finalizer when the
-        // scope closes. Ending the queue early would race the downstream
-        // pull and silently drop buffered events.
+        // The fiber is forked in `scope` so it is also interrupted
+        // automatically when the stream's scope closes (e.g. user cancel).
         yield* Effect.forkIn(
           Effect.gen(function* () {
             const pull = yield* Stream.toPull(source)
             while (true) {
-              const chunk = yield* pull
+              const chunk = yield* Effect.race(pull, Deferred.await(consumerDone))
+              // If the race was won by the done signal, the pulled effect
+              // was interrupted and the consumer must exit. Otherwise the
+              // chunk is a real chunk from the upstream stream.
+              if (!chunk || chunk.length === 0) {
+                // Empty chunk also signals end-of-stream.
+                signalDone()
+                return
+              }
               for (const event of chunk) {
                 watchdog.handle(event)
                 Queue.offerUnsafe(queue, event)
@@ -387,30 +392,32 @@ export const withProviderRequestWatchdog = <E>(
                 // Read the watchdog's state BEFORE cancelling so we know
                 // whether the timer fired already (typed timeout published)
                 // vs the upstream terminated first.
-                const wasAwaitingFirstEvent =
-                  watchdog.state()._tag === "awaiting-first-event"
                 const fired = watchdog.state()._tag === "fired"
                 // Cancel the watchdog so any pending timer is interrupted
                 // and never fires after the consumer has already settled.
                 watchdog.cancel()
-                if (Cause.isDone(cause)) {
-                  if (wasAwaitingFirstEvent) {
-                    // Upstream completed without ever producing an event.
-                    // Per the wrapper contract, the typed `first_event`
-                    // timeout is what should surface here.
-                    Queue.failCauseUnsafe(
-                      queue,
-                      Cause.fail(makeError("first_event")),
-                    )
-                    signalDone()
-                    return
-                  }
-                  // Normal end (at least one event arrived). No timeout.
+                if (fired) {
+                  // Watchdog already published the typed timeout; nothing else to do.
                   signalDone()
                   return
                 }
-                if (fired) {
-                  // Watchdog already published the typed timeout; nothing else to do.
+                // The upstream terminated for a reason that is NOT a typed
+                // timeout. If the upstream ended without producing any
+                // event AND the watchdog never fired, the contract says the
+                // first_event timeout is the correct outcome.
+                const wasAwaitingFirstEvent =
+                  watchdog.state()._tag === "inactive" ||
+                  watchdog.state()._tag === "awaiting-first-event"
+                if (Cause.isDone(cause) && wasAwaitingFirstEvent) {
+                  Queue.failCauseUnsafe(
+                    queue,
+                    Cause.fail(makeError("first_event")),
+                  )
+                  signalDone()
+                  return
+                }
+                if (Cause.isDone(cause)) {
+                  // Normal end (at least one event arrived). No timeout.
                   signalDone()
                   return
                 }
@@ -433,7 +440,7 @@ export const withProviderRequestWatchdog = <E>(
         // Scope finalizer: cancel the watchdog, abort the upstream
         // controller. `Effect.forkIn` already cancels the consumer fiber
         // when the scope closes. The queue is closed by Stream.callback's
-        // own shutdown finalizer (see Channel.callbackArray internals).
+        // own shutdown finalizer.
         yield* Effect.addFinalizer(() =>
           Effect.sync(() => {
             watchdog.cancel()
