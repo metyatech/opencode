@@ -17,6 +17,7 @@ import { Session as SessionNs } from "@/session/session"
 import { MessageV2 } from "../../src/session/message-v2"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
 import { SessionStatus } from "../../src/session/status"
+import { SessionRetryExact } from "../../src/session/retry-exact"
 import { SessionSummary } from "../../src/session/summary"
 import { SessionV2 } from "../../src/v2/session"
 import { ModelID, ProviderID } from "../../src/provider/schema"
@@ -273,10 +274,17 @@ function compactionProcessLayer(options?: CompactionProcessOptions) {
         Layer.provide(summary),
         Layer.provide(Image.defaultLayer),
         Layer.provide(RuntimeFlags.layer({ experimentalEventSystem: true })),
-        Layer.provide(status),
+        Layer.provideMerge(status),
+        Layer.provideMerge(SessionRetryExact.defaultLayer),
       )
     : layer(options?.result ?? "continue")
-  return Layer.mergeAll(SessionCompaction.layer.pipe(Layer.provide(processor)), processor, bus, status).pipe(
+  return Layer.mergeAll(
+    SessionCompaction.layer.pipe(Layer.provide(processor)),
+    processor,
+    bus,
+    status,
+    SessionRetryExact.defaultLayer,
+  ).pipe(
     Layer.provide(SessionNs.defaultLayer),
     Layer.provide((options?.provider ?? wide()).layer),
     Layer.provide(Snapshot.defaultLayer),
@@ -324,6 +332,51 @@ function llm() {
           const stream = typeof item === "function" ? item(input) : item
           return stream.pipe(Stream.mapEffect((event) => Effect.succeed(event)))
         },
+        prepare: (input) => {
+          const item = queue.shift()
+          if (!item) {
+            return Effect.succeed({
+              sessionID: input.sessionID,
+              userID: input.user.id,
+              assistantID: "",
+              provider: { providerID: input.model.providerID, modelID: input.model.id },
+              fingerprint: "mock-fingerprint",
+              createdAt: Date.now(),
+              ttlMs: 1_800_000,
+              run: () => Stream.empty,
+              canonical: {
+                model: { providerID: input.model.providerID, modelID: input.model.id, apiID: input.model.id },
+                system: input.system,
+                messages: input.messages,
+                tools: [],
+                toolChoice: undefined,
+                params: { options: {} },
+                headers: {},
+              },
+            } as unknown as LLM.PreparedInvocation)
+          }
+          const stream = typeof item === "function" ? item(input) : item
+          return Effect.succeed({
+            sessionID: input.sessionID,
+            userID: input.user.id,
+            assistantID: "",
+            provider: { providerID: input.model.providerID, modelID: input.model.id },
+            fingerprint: "mock-fingerprint",
+            createdAt: Date.now(),
+            ttlMs: 1_800_000,
+            run: () => stream.pipe(Stream.mapEffect((event) => Effect.succeed(event))),
+            canonical: {
+              model: { providerID: input.model.providerID, modelID: input.model.id, apiID: input.model.id },
+              system: input.system,
+              messages: input.messages,
+              tools: [],
+              toolChoice: undefined,
+              params: { options: {} },
+              headers: {},
+            },
+          } as unknown as LLM.PreparedInvocation)
+        },
+        streamPrepared: (prepared, abort) => prepared.run(abort),
       }),
     ),
   }

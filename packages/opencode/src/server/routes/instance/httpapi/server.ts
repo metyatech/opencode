@@ -38,6 +38,8 @@ import { Question } from "@/question"
 import { Session } from "@/session/session"
 import { SessionCompaction } from "@/session/compaction"
 import { SessionPrompt } from "@/session/prompt"
+import { SessionRetryExact } from "@/session/retry-exact"
+import { LLM } from "@/session/llm"
 import { SessionRevert } from "@/session/revert"
 import { SessionRunState } from "@/session/run-state"
 import { SessionStatus } from "@/session/status"
@@ -203,6 +205,7 @@ export function createRoutes(
       Format.defaultLayer,
       LSP.defaultLayer,
       Installation.defaultLayer,
+      LLM.defaultLayer,
       MCP.defaultLayer,
       ModelsDev.defaultLayer,
       Permission.defaultLayer,
@@ -219,6 +222,7 @@ export function createRoutes(
       SessionCompaction.defaultLayer,
       SessionPrompt.defaultLayer,
       SessionRevert.defaultLayer,
+      SessionRetryExact.defaultLayer,
       SessionShare.defaultLayer,
       SessionRunState.defaultLayer,
       SessionStatus.defaultLayer,

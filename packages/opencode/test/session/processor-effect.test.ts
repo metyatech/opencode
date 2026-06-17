@@ -15,6 +15,7 @@ import { Provider } from "@/provider/provider"
 import { ModelID, ProviderID } from "../../src/provider/schema"
 import { Session } from "@/session/session"
 import { LLM } from "../../src/session/llm"
+import { SessionRetryExact } from "../../src/session/retry-exact"
 import { MessageV2 } from "../../src/session/message-v2"
 import { SessionProcessor } from "../../src/session/processor"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
@@ -184,6 +185,7 @@ const deps = Layer.mergeAll(
   status,
   SyncEvent.defaultLayer,
   EventV2Bridge.defaultLayer,
+  SessionRetryExact.defaultLayer,
 ).pipe(Layer.provideMerge(infra))
 const env = Layer.mergeAll(
   TestLLMServer.layer,

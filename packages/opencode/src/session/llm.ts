@@ -26,6 +26,15 @@ import * as OtelTracer from "@effect/opentelemetry/Tracer"
 import { LLMAISDK } from "./llm/ai-sdk"
 import { LLMNativeRuntime } from "./llm/native-runtime"
 import { LLMRequestPrep } from "./llm/request"
+import {
+  buildCanonical,
+  computeFingerprint,
+  type CanonicalCanonical,
+  type PreparedInvocation,
+} from "./llm/invocation"
+import { DEFAULT_TTL_MS } from "./llm/invocation-cache"
+
+export type { PreparedInvocation } from "./llm/invocation"
 
 const log = Log.create({ service: "llm" })
 export const OUTPUT_TOKEN_MAX = ProviderTransform.OUTPUT_TOKEN_MAX
@@ -51,11 +60,43 @@ export type StreamRequest = StreamInput & {
 
 export interface Interface {
   readonly stream: (input: StreamInput) => Stream.Stream<LLMEvent, unknown>
+  readonly prepare: (
+    input: StreamInput,
+  ) => Effect.Effect<PreparedInvocation, Auth.AuthError | Provider.ModelNotFoundError, never>
+  readonly streamPrepared: (prepared: PreparedInvocation, abort: AbortSignal) => Stream.Stream<LLMEvent, unknown>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/LLM") {}
 
 export const use = serviceUse(Service)
+
+// Provider families that use a session-stable `prompt_cache_key` for implicit
+// prompt caching. Resolved by the opencode provider in `LLMRequestPrep` and
+// re-exposed on the `PreparedInvocation` for visibility to the retry-exact
+// canary and to downstream observers.
+const SESSION_AFFINITY_HEADER = "x-session-affinity"
+
+const resolvePromptCacheKey = (
+  model: Provider.Model,
+  sessionID: string,
+  headers: Record<string, string>,
+): string | undefined => {
+  const providerID = model.providerID
+  if (providerID === "openai" || providerID === "opencode" || providerID.startsWith("opencode-")) {
+    // OpenAI Responses uses `prompt_cache_key` (camelCase) at the wire level;
+    // the opencode provider sets it through the x-opencode-session header.
+    if (headers["x-opencode-session"] || providerID.startsWith("opencode")) {
+      return sessionID
+    }
+    if (providerID === "openai") {
+      // Non-opencode OpenAI deployments honor the session affinity header as
+      // the cache key — this is the legacy behavior.
+      if (headers[SESSION_AFFINITY_HEADER]) return sessionID
+    }
+  }
+  if (headers[SESSION_AFFINITY_HEADER]) return sessionID
+  return undefined
+}
 
 const live: Layer.Layer<
   Service,
@@ -78,7 +119,12 @@ const live: Layer.Layer<
     const llmClient = yield* LLMClient.Service
     const flags = yield* RuntimeFlags.Service
 
-    const run = Effect.fn("LLM.run")(function* (input: StreamRequest) {
+    // --- Preparation ----------------------------------------------------------
+    // The `prepare` step captures every value that contributes to the provider
+    // request body so a retry can replay it without re-deriving any of the
+    // inputs (system prompt, tool schema, headers, model choice, params). This
+    // is the load-bearing step for prompt-cache hits on retry.
+    const prepare = Effect.fn("LLM.prepare")(function* (input: StreamInput) {
       const l = log
         .clone()
         .tag("providerID", input.model.providerID)
@@ -87,7 +133,7 @@ const live: Layer.Layer<
         .tag("small", (input.small ?? false).toString())
         .tag("agent", input.agent.name)
         .tag("mode", input.agent.mode)
-      l.info("stream", {
+      l.info("prepare", {
         modelID: input.model.id,
         providerID: input.model.providerID,
       })
@@ -132,7 +178,7 @@ const live: Layer.Layer<
             const result = await t.execute!(JSON.parse(argsJson), {
               toolCallId: _requestID,
               messages: input.messages,
-              abortSignal: input.abort,
+              abortSignal: new AbortController().signal,
             })
             const output = typeof result === "string" ? result : (result?.output ?? JSON.stringify(result))
             return {
@@ -215,8 +261,37 @@ const live: Layer.Layer<
           })
         : undefined
 
-      // Runtime seam: native is an opt-in adapter over @opencode-ai/llm. It
-      // either returns a ready LLMEvent stream or a concrete fallback reason.
+      const promptCacheKey = resolvePromptCacheKey(input.model, input.sessionID, prepared.headers)
+
+      const canonical: CanonicalCanonical = buildCanonical({
+        model: {
+          providerID: input.model.providerID,
+          modelID: input.model.id,
+          apiID: input.model.api.id,
+          ...(input.user.model.variant ? { variant: input.user.model.variant } : {}),
+        },
+        system: prepared.system,
+        messages: prepared.messages,
+        tools: prepared.tools,
+        toolChoice: input.toolChoice,
+        params: {
+          ...(prepared.params.temperature === undefined ? {} : { temperature: prepared.params.temperature }),
+          ...(prepared.params.topP === undefined ? {} : { topP: prepared.params.topP }),
+          ...(prepared.params.topK === undefined ? {} : { topK: prepared.params.topK }),
+          ...(prepared.params.maxOutputTokens === undefined
+            ? {}
+            : { maxOutputTokens: prepared.params.maxOutputTokens }),
+          options: prepared.params.options,
+        },
+        headers: prepared.headers,
+        ...(promptCacheKey ? { promptCacheKey } : {}),
+      })
+
+      const fingerprint = computeFingerprint(canonical)
+
+      // Decide the runtime ONCE during prepare; the run closure below reuses
+      // the same selection so retries land on the same adapter path.
+      let runtime: PreparedRuntime
       if (flags.experimentalNativeLlm) {
         const native = LLMNativeRuntime.stream({
           model: input.model,
@@ -232,7 +307,11 @@ const live: Layer.Layer<
           maxOutputTokens: prepared.params.maxOutputTokens,
           providerOptions: prepared.params.options,
           headers: prepared.headers,
-          abort: input.abort,
+          // The native runtime branch is itself a stream factory; we wrap
+          // it so the closure receives a per-attempt AbortSignal. The
+          // body that hits the wire is the same on every retry because
+          // all the inputs are captured.
+          abort: new AbortController().signal,
         })
         if (native.type === "supported") {
           yield* Effect.logInfo("llm runtime selected").pipe(
@@ -242,104 +321,90 @@ const live: Layer.Layer<
               "llm.model": input.model.id,
             }),
           )
-          return {
-            type: "native" as const,
-            stream: native.stream,
+          runtime = { type: "native", factory: () => native.stream }
+        } else {
+          yield* Effect.logInfo("llm runtime selected").pipe(
+            Effect.annotateLogs({
+              "llm.runtime": "ai-sdk",
+              "llm.provider": input.model.providerID,
+              "llm.model": input.model.id,
+              "llm.native_unsupported_reason": native.reason,
+            }),
+          )
+          l.info("native runtime unavailable; falling back to ai-sdk", { reason: native.reason })
+          runtime = {
+            type: "ai-sdk",
+            factory: makeAISDKFactory({
+              input,
+              prepared,
+              language: language as AISDKModel,
+              cfg,
+              telemetryTracer,
+            }),
           }
         }
+      } else {
         yield* Effect.logInfo("llm runtime selected").pipe(
           Effect.annotateLogs({
             "llm.runtime": "ai-sdk",
             "llm.provider": input.model.providerID,
             "llm.model": input.model.id,
-            "llm.native_unsupported_reason": native.reason,
           }),
         )
-        l.info("native runtime unavailable; falling back to ai-sdk", { reason: native.reason })
+        runtime = {
+          type: "ai-sdk",
+          factory: makeAISDKFactory({
+            input,
+            prepared,
+            language: language as AISDKModel,
+            cfg,
+            telemetryTracer,
+          }),
+        }
       }
 
-      yield* Effect.logInfo("llm runtime selected").pipe(
-        Effect.annotateLogs({
-          "llm.runtime": "ai-sdk",
-          "llm.provider": input.model.providerID,
-          "llm.model": input.model.id,
-        }),
-      )
-      // Default runtime path: AI SDK owns provider execution and tool dispatch;
-      // LLMAISDK.toLLMEvents below normalizes fullStream parts for the processor.
-      return {
-        type: "ai-sdk" as const,
-        result: streamText({
-          onError(error) {
-            l.error("stream error", {
-              error,
-            })
-          },
-          async experimental_repairToolCall(failed) {
-            const lower = failed.toolCall.toolName.toLowerCase()
-            if (lower !== failed.toolCall.toolName && prepared.tools[lower]) {
-              l.info("repairing tool call", {
-                tool: failed.toolCall.toolName,
-                repaired: lower,
-              })
-              return {
-                ...failed.toolCall,
-                toolName: lower,
-              }
-            }
-            return {
-              ...failed.toolCall,
-              input: JSON.stringify({
-                tool: failed.toolCall.toolName,
-                error: failed.error.message,
-              }),
-              toolName: "invalid",
-            }
-          },
-          temperature: prepared.params.temperature,
-          topP: prepared.params.topP,
-          topK: prepared.params.topK,
-          providerOptions: ProviderTransform.providerOptions(input.model, prepared.params.options),
-          activeTools: Object.keys(prepared.tools).filter((x) => x !== "invalid"),
-          tools: prepared.tools,
-          toolChoice: input.toolChoice,
-          maxOutputTokens: prepared.params.maxOutputTokens,
-          abortSignal: input.abort,
-          headers: prepared.headers,
-          maxRetries: input.retries ?? 0,
-          messages: prepared.messages,
-          model: wrapLanguageModel({
-            model: language,
-            middleware: [
-              {
-                specificationVersion: "v3" as const,
-                async transformParams(args) {
-                  if (args.type === "stream") {
-                    // @ts-expect-error
-                    args.params.prompt = ProviderTransform.message(
-                      args.params.prompt,
-                      input.model,
-                      prepared.messageTransformOptions,
-                    )
-                  }
-                  return args.params
-                },
-              },
-            ],
-          }),
-          experimental_telemetry: {
-            isEnabled: cfg.experimental?.openTelemetry,
-            functionId: "session.llm",
-            tracer: telemetryTracer,
-            metadata: {
-              userId: cfg.username ?? "unknown",
-              sessionId: input.sessionID,
-            },
-          },
-        }),
+      const createdAt = Date.now()
+
+      const invocation: PreparedInvocation = {
+        sessionID: input.sessionID,
+        userID: input.user.id,
+        assistantID: "", // populated by the processor on publish
+        provider: {
+          providerID: input.model.providerID,
+          modelID: input.model.id,
+          ...(input.user.model.variant ? { variant: input.user.model.variant } : {}),
+        },
+        fingerprint,
+        ...(promptCacheKey ? { promptCacheKey } : {}),
+        createdAt,
+        ttlMs: DEFAULT_TTL_MS,
+        run: (abort) => runtime.factory(abort),
+        canonical,
       }
+
+      return invocation
     })
 
+    // --- streamPrepared -------------------------------------------------------
+    // Re-runs the HTTP stream with the caller's per-attempt AbortSignal.
+    // The body is identical to the original attempt because the closure
+    // was built from the captured configuration. Adapter state (e.g.
+    // counters) is per-attempt. The caller is responsible for owning the
+    // AbortSignal's lifecycle — when the consumer fiber is interrupted,
+    // the caller's signal aborts and the underlying streamText cancels
+    // its in-flight request.
+    const streamPrepared = (
+      prepared: PreparedInvocation,
+      abort: AbortSignal,
+    ): Stream.Stream<LLMEvent, unknown> => prepared.run(abort)
+
+    // --- stream (back-compat) -------------------------------------------------
+    // For callers that want a one-shot stream (not retries) we provide the
+    // historical `stream(input)` entry point. It internally uses
+    // `prepare` + `streamPrepared`. The per-attempt abort controller is
+    // owned by the `Stream.scoped` wrap, so the consumer's fiber
+    // interrupt propagates to the in-flight `streamText` request via the
+    // scope's cleanup.
     const stream: Interface["stream"] = (input) =>
       Stream.scoped(
         Stream.unwrap(
@@ -348,27 +413,124 @@ const live: Layer.Layer<
               Effect.sync(() => new AbortController()),
               (ctrl) => Effect.sync(() => ctrl.abort()),
             )
-
-            const result = yield* run({ ...input, abort: ctrl.signal })
-
-            if (result.type === "native") return result.stream
-
-            // Adapter seam: both runtimes expose the same LLMEvent stream. Native
-            // already returns one; AI SDK streams are converted here.
-            const state = LLMAISDK.adapterState()
-            return Stream.fromAsyncIterable(result.result.fullStream, (e) =>
-              e instanceof Error ? e : new Error(String(e)),
-            ).pipe(
-              Stream.mapEffect((event) => LLMAISDK.toLLMEvents(state, event)),
-              Stream.flatMap((events) => Stream.fromIterable(events)),
-            )
+            const prepared = yield* prepare(input)
+            return streamPrepared(prepared, ctrl.signal)
           }),
         ),
       )
 
-    return Service.of({ stream })
+    return Service.of({ stream, prepare, streamPrepared })
   }),
 )
+
+// Factory that returns a fresh AI SDK streamText result per attempt. The
+// returned factory is what the PreparedInvocation.run closure calls.
+type PreparedRuntime =
+  | { type: "ai-sdk"; factory: (abort: AbortSignal) => Stream.Stream<LLMEvent, unknown> }
+  | { type: "native"; factory: (abort: AbortSignal) => Stream.Stream<LLMEvent, unknown> }
+
+// The tracer proxy produced in `prepare` matches the AI SDK's
+// `experimental_telemetry.tracer` type. We keep it loose here so the
+// surrounding prepare/run code can hand the value back into streamText
+// without an extra cast at the call site.
+type TelemetryTracer = NonNullable<
+  NonNullable<Parameters<typeof streamText>[0]["experimental_telemetry"]>["tracer"]
+>
+
+// `wrapLanguageModel` accepts `LanguageModelV3` from `@ai-sdk/provider`,
+// which the `ai` re-export doesn't surface directly. We pull the type out
+// of `wrapLanguageModel`'s parameter list to avoid a hand-rolled cast.
+type AISDKModel = Parameters<typeof wrapLanguageModel>[0]["model"]
+
+function makeAISDKFactory(input: {
+  readonly input: StreamInput
+  readonly prepared: LLMRequestPrep.Prepared
+  readonly language: AISDKModel
+  readonly cfg: Config.Info
+  readonly telemetryTracer: TelemetryTracer | undefined
+}): (abort: AbortSignal) => Stream.Stream<LLMEvent, unknown> {
+  const l = log.clone().tag("providerID", input.input.model.providerID).tag("modelID", input.input.model.id)
+
+  return (abort) => {
+    // Build a fresh streamText result on every attempt. AI SDK performs the
+    // HTTP request when the result is consumed, so building fresh per
+    // attempt + sharing the same configuration => byte-identical body.
+    const result = streamText({
+      onError(error) {
+        l.error("stream error", { error })
+      },
+      async experimental_repairToolCall(failed) {
+        const lower = failed.toolCall.toolName.toLowerCase()
+        if (lower !== failed.toolCall.toolName && input.prepared.tools[lower]) {
+          l.info("repairing tool call", {
+            tool: failed.toolCall.toolName,
+            repaired: lower,
+          })
+          return {
+            ...failed.toolCall,
+            toolName: lower,
+          }
+        }
+        return {
+          ...failed.toolCall,
+          input: JSON.stringify({
+            tool: failed.toolCall.toolName,
+            error: failed.error.message,
+          }),
+          toolName: "invalid",
+        }
+      },
+      temperature: input.prepared.params.temperature,
+      topP: input.prepared.params.topP,
+      topK: input.prepared.params.topK,
+      providerOptions: ProviderTransform.providerOptions(input.input.model, input.prepared.params.options),
+      activeTools: Object.keys(input.prepared.tools).filter((x) => x !== "invalid"),
+      tools: input.prepared.tools,
+      toolChoice: input.input.toolChoice,
+      maxOutputTokens: input.prepared.params.maxOutputTokens,
+      abortSignal: abort,
+      headers: input.prepared.headers,
+      maxRetries: input.input.retries ?? 0,
+      messages: input.prepared.messages,
+      model: wrapLanguageModel({
+        model: input.language,
+        middleware: [
+          {
+            specificationVersion: "v3" as const,
+            async transformParams(args) {
+              if (args.type === "stream") {
+                // @ts-expect-error
+                args.params.prompt = ProviderTransform.message(
+                  args.params.prompt,
+                  input.input.model,
+                  input.prepared.messageTransformOptions,
+                )
+              }
+              return args.params
+            },
+          },
+        ],
+      }),
+      experimental_telemetry: {
+        isEnabled: input.cfg.experimental?.openTelemetry,
+        functionId: "session.llm",
+        tracer: input.telemetryTracer,
+        metadata: {
+          userId: input.cfg.username ?? "unknown",
+          sessionId: input.input.sessionID,
+        },
+      },
+    })
+
+    const state = LLMAISDK.adapterState()
+    return Stream.fromAsyncIterable(result.fullStream, (e) =>
+      e instanceof Error ? e : new Error(String(e)),
+    ).pipe(
+      Stream.mapEffect((event) => LLMAISDK.toLLMEvents(state, event)),
+      Stream.flatMap((events) => Stream.fromIterable(events)),
+    )
+  }
+}
 
 export const layer = live.pipe(Layer.provide(Permission.defaultLayer))
 
@@ -386,5 +548,11 @@ export const defaultLayer = Layer.suspend(() =>
 )
 
 export const hasToolCalls = LLMRequestPrep.hasToolCalls
+
+// The existing namespace contract is preserved through the self-reexport at
+// the bottom of this file (`export * as LLM from "./llm"`). The new prepare
+// / streamPrepared surface lives on the `LLM.Service` interface and the
+// `PreparedInvocation` type / cache is available via direct imports from
+// `@/session/llm/invocation` and `@/session/llm/invocation-cache`.
 
 export * as LLM from "./llm"

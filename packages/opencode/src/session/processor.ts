@@ -14,6 +14,7 @@ import { isOverflow } from "./overflow"
 import { PartID } from "./schema"
 import type { SessionID } from "./schema"
 import { SessionRetry } from "./retry"
+import { SessionRetryExact } from "./retry-exact"
 import { SessionStatus } from "./status"
 import { SessionSummary } from "./summary"
 import type { Provider } from "@/provider/provider"
@@ -125,6 +126,7 @@ export const layer = Layer.effect(
     const image = yield* Image.Service
     const events = yield* EventV2Bridge.Service
     const flags = yield* RuntimeFlags.Service
+    const retryExact = yield* SessionRetryExact.Service
 
     const create = Effect.fn("SessionProcessor.create")(function* (input: Input) {
       // Pre-capture snapshot before the LLM stream starts. The AI SDK
@@ -462,6 +464,11 @@ export const layer = Layer.effect(
             if (ctx.assistantMessage.summary) {
               throw new Error(`Tool call not allowed while generating summary: ${value.name}`)
             }
+            // The first tool call invalidates the retry-exact cache: a
+            // tool side-effect may have produced state that an exact
+            // retry would miss. Subsequent retries are forced to go
+            // through the normal session path.
+            yield* retryExact.invalidate(ctx.sessionID, "tool-started")
             yield* ensureToolCall(value)
             return
 
@@ -601,6 +608,10 @@ export const layer = Layer.effect(
                 timestamp: DateTime.makeUnsafe(Date.now()),
               })
             }
+            // Recording a tool result invalidates the retry-exact cache
+            // because the assistant's surface has now diverged from the
+            // prepared invocation's view.
+            yield* retryExact.invalidate(ctx.sessionID, "tool-result")
             yield* completeToolCall(value.id, output)
             return
           }
@@ -721,6 +732,10 @@ export const layer = Layer.effect(
           }
 
           case "text-start":
+            // The first text delta invalidates the retry-exact cache:
+            // the assistant has produced visible output that a retry
+            // would duplicate.
+            yield* retryExact.invalidate(ctx.sessionID, "assistant-activity")
             if (!ctx.assistantMessage.summary) {
               // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
               if (flags.experimentalEventSystem) {
@@ -924,12 +939,23 @@ export const layer = Layer.effect(
         retryError = undefined
 
         return yield* Effect.gen(function* () {
+          const prepared = yield* llm.prepare(streamInput)
+          yield* retryExact.publish(prepared)
+
           yield* Effect.gen(function* () {
             ctx.currentText = undefined
             ctx.reasoningMap = {}
             retryError = undefined
             yield* status.set(ctx.sessionID, { type: "busy" })
-            const stream = llm.stream(streamInput)
+            // Per-attempt AbortController. The controller is owned by
+            // this generator and is wired into both the LLM call AND
+            // the fiber interrupt path so a consumer-level cancel reaches
+            // the in-flight request immediately.
+            const ctrl = yield* Effect.acquireRelease(
+              Effect.sync(() => new AbortController()),
+              (ctrl) => Effect.sync(() => ctrl.abort()),
+            )
+            const stream = llm.streamPrepared(prepared, ctrl.signal)
 
             yield* stream.pipe(
               Stream.tap((event) => handleEvent(event)),
@@ -1015,6 +1041,7 @@ export const defaultLayer = Layer.suspend(() =>
     Layer.provide(Config.defaultLayer),
     Layer.provide(RuntimeFlags.defaultLayer),
     Layer.provide(EventV2Bridge.defaultLayer),
+    Layer.provide(SessionRetryExact.defaultLayer),
   ),
 )
 

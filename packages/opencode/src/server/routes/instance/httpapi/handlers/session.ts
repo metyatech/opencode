@@ -9,6 +9,7 @@ import { SessionCompaction } from "@/session/compaction"
 import { MessageV2 } from "@/session/message-v2"
 import { SessionPrompt } from "@/session/prompt"
 import { SessionRevert } from "@/session/revert"
+import { SessionRetryExact } from "@/session/retry-exact"
 import { SessionRunState } from "@/session/run-state"
 import { SessionStatus } from "@/session/status"
 import { SessionSummary } from "@/session/summary"
@@ -29,6 +30,8 @@ import {
   MessagesQuery,
   PermissionResponsePayload,
   PromptPayload,
+  RetryExactPayload,
+  RetryExactRejectedError,
   RetryPayload,
   RevertPayload,
   ShellPayload,
@@ -79,6 +82,8 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
     const requireSession = Effect.fn("SessionHttpApi.requireSession")(function* (sessionID: SessionID) {
       return yield* SessionError.mapStorageNotFound(session.get(sessionID))
     })
+
+    const retryExactSvc = yield* SessionRetryExact.Service
 
     const get = Effect.fn("SessionHttpApi.get")(function* (ctx: { params: { sessionID: SessionID } }) {
       return yield* requireSession(ctx.params.sessionID)
@@ -354,6 +359,30 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       return HttpApiSchema.NoContent.make()
     })
 
+    const retryExact = Effect.fn("SessionHttpApi.retryExact")(function* (ctx: {
+      params: { sessionID: SessionID }
+      payload: typeof RetryExactPayload.Type
+    }) {
+      yield* requireSession(ctx.params.sessionID)
+      const outcome = yield* retryExactSvc.canRetry({
+        sessionID: ctx.params.sessionID,
+        ...(ctx.payload.messageID ? { messageID: ctx.payload.messageID } : {}),
+        expectedProviderID: ctx.payload.expectedProviderID,
+        expectedModelID: ctx.payload.expectedModelID,
+        ...(ctx.payload.expectedVariant ? { expectedVariant: ctx.payload.expectedVariant } : {}),
+      })
+      if (!("accepted" in outcome)) {
+        return yield* Effect.fail(
+          new RetryExactRejectedError({
+            reason: outcome.reason,
+            ...(outcome.fingerprint ? { fingerprint: outcome.fingerprint } : {}),
+            ...(outcome.promptCacheKey ? { promptCacheKey: outcome.promptCacheKey } : {}),
+          }),
+        )
+      }
+      return outcome
+    })
+
     const command = Effect.fn("SessionHttpApi.command")(function* (ctx: {
       params: { sessionID: SessionID }
       payload: typeof CommandPayload.Type
@@ -458,6 +487,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       .handle("promptAsync", promptAsync)
       .handle("retry", retry)
       .handle("retryAsync", retryAsync)
+      .handle("retryExact", retryExact)
       .handle("command", command)
       .handle("shell", shell)
       .handle("revert", revert)
