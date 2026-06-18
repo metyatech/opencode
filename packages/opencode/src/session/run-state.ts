@@ -17,6 +17,21 @@ export interface Interface {
     onInterrupt: Effect.Effect<MessageV2.WithParts>,
     work: Effect.Effect<MessageV2.WithParts, Auth.AuthError | Provider.ModelNotFoundError, Scope.Scope>,
   ) => Effect.Effect<MessageV2.WithParts>
+  /**
+   * Atomically claim this session's runner for an exclusive detached run.
+   * Returns `true` if the runner was Idle and the work was forked into the
+   * runner scope (transitioning to Running); returns `false` if the runner
+   * was already busy with a prompt/retry/shell or another exact retry. The
+   * work runs to completion in the runner scope and the runner resets to
+   * idle on its own (`onIdle`); the caller does not await the result. Used
+   * by `session.retryExact` so exact replays share the same runner
+   * exclusion as every other session operation.
+   */
+  readonly claimExclusive: (
+    sessionID: SessionID,
+    onInterrupt: Effect.Effect<MessageV2.WithParts>,
+    work: Effect.Effect<MessageV2.WithParts, Auth.AuthError | Provider.ModelNotFoundError, Scope.Scope>,
+  ) => Effect.Effect<boolean>
   readonly startShell: (
     sessionID: SessionID,
     onInterrupt: Effect.Effect<MessageV2.WithParts>,
@@ -94,6 +109,14 @@ export const layer = Layer.effect(
       return yield* (yield* runner(sessionID, onInterrupt)).ensureRunning(work)
     })
 
+    const claimExclusive = Effect.fn("SessionRunState.claimExclusive")(function* (
+      sessionID: SessionID,
+      onInterrupt: Effect.Effect<MessageV2.WithParts>,
+      work: Effect.Effect<MessageV2.WithParts>,
+    ) {
+      return yield* (yield* runner(sessionID, onInterrupt)).tryStart(work)
+    })
+
     const startShell = Effect.fn("SessionRunState.startShell")(function* (
       sessionID: SessionID,
       onInterrupt: Effect.Effect<MessageV2.WithParts>,
@@ -109,6 +132,7 @@ export const layer = Layer.effect(
       assertNotBusy,
       cancel,
       ensureRunning: ensureRunning as unknown as Interface["ensureRunning"],
+      claimExclusive: claimExclusive as unknown as Interface["claimExclusive"],
       startShell: startShell as unknown as Interface["startShell"],
     })
   }),

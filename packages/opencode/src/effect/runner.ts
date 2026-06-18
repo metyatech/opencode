@@ -4,6 +4,19 @@ export interface Runner<A, E = never> {
   readonly state: State<A, E>
   readonly busy: boolean
   readonly ensureRunning: (work: Effect.Effect<A, E>) => Effect.Effect<A, E>
+  /**
+   * Atomically claim the runner for an exclusive detached run. If the
+   * runner is Idle, the work is forked into the runner scope (exactly
+   * like `ensureRunning`'s Idle branch) and the runner transitions to
+   * `Running`; returns `true` without awaiting completion. If the runner
+   * is in any non-Idle state, the work is NOT started and `false` is
+   * returned. This is the claim-or-fail primitive used by
+   * `session.retryExact`: unlike `ensureRunning` it never joins an
+   * in-flight run, so a concurrent normal prompt/retry/shell or another
+   * exact retry deterministically loses the race instead of silently
+   * attaching to the existing run.
+   */
+  readonly tryStart: (work: Effect.Effect<A, E>) => Effect.Effect<boolean>
   readonly startShell: (work: Effect.Effect<A, E>, ready?: Latch.Latch) => Effect.Effect<A, E | Busy>
   readonly cancel: Effect.Effect<void>
 }
@@ -140,6 +153,17 @@ export const make = <A, E = never>(
       }),
     ).pipe(Effect.flatten)
 
+  const tryStart = (work: Effect.Effect<A, E>): Effect.Effect<boolean> =>
+    SynchronizedRef.modifyEffect(
+      ref,
+      Effect.fnUntraced(function* (st) {
+        if (st._tag !== "Idle") return [Effect.succeed(false), st] as const
+        const done = yield* Deferred.make<A, E | Cancelled>()
+        const run = yield* startRun(work, done)
+        return [Effect.succeed(true), { _tag: "Running", run }] as const
+      }),
+    ).pipe(Effect.flatten)
+
   const startShell = (work: Effect.Effect<A, E>, ready?: Latch.Latch): Effect.Effect<A, E | Busy> =>
     SynchronizedRef.modifyEffect(
       ref,
@@ -212,6 +236,7 @@ export const make = <A, E = never>(
       return state()._tag !== "Idle"
     },
     ensureRunning,
+    tryStart,
     startShell,
     cancel,
   }

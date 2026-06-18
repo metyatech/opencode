@@ -8,17 +8,13 @@ import { Session } from "@/session/session"
 import { SessionCompaction } from "@/session/compaction"
 import { MessageV2 } from "@/session/message-v2"
 import { SessionPrompt } from "@/session/prompt"
-import { SessionProcessor } from "@/session/processor"
+import { SessionRetryExactDispatch } from "@/session/retry-exact-dispatch"
 import { SessionRevert } from "@/session/revert"
-import { SessionRetryExact } from "@/session/retry-exact"
 import { SessionRunState } from "@/session/run-state"
 import { SessionStatus } from "@/session/status"
 import { SessionSummary } from "@/session/summary"
 import { Todo } from "@/session/todo"
 import { MessageID, PartID, SessionID } from "@/session/schema"
-import { Provider } from "@/provider/provider"
-import { ModelID, ProviderID } from "@/provider/schema"
-import { InstanceState } from "@/effect/instance-state"
 import { NamedError } from "@opencode-ai/core/util/error"
 import { Cause, Effect, Option, Schema, Scope } from "effect"
 import * as Stream from "effect/Stream"
@@ -60,8 +56,6 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
     const runState = yield* SessionRunState.Service
     const agentSvc = yield* Agent.Service
     const permissionSvc = yield* Permission.Service
-    const processorSvc = yield* SessionProcessor.Service
-    const provider = yield* Provider.Service
     const statusSvc = yield* SessionStatus.Service
     const todoSvc = yield* Todo.Service
     const summary = yield* SessionSummary.Service
@@ -88,7 +82,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       return yield* SessionError.mapStorageNotFound(session.get(sessionID))
     })
 
-    const retryExactSvc = yield* SessionRetryExact.Service
+    const retryExactDispatch = yield* SessionRetryExactDispatch.Service
 
     const get = Effect.fn("SessionHttpApi.get")(function* (ctx: { params: { sessionID: SessionID } }) {
       return yield* requireSession(ctx.params.sessionID)
@@ -369,157 +363,17 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       payload: typeof RetryExactPayload.Type
     }) {
       yield* requireSession(ctx.params.sessionID)
-      // First perform the eligibility check. We split this from
-      // the dispatch so the typed rejection is returned in the
-      // success body (HTTP 200) and the handler does not have to
-      // rethrow / re-catch between the two branches.
-      const claim = yield* retryExactSvc.claim({
+      // Eligibility, the atomic per-session runner claim, assistant-message
+      // creation, processor wiring, and release cleanup all live inside
+      // `dispatch`. The handler just surfaces the typed accepted/rejected
+      // union in the HTTP 200 body.
+      return yield* retryExactDispatch.dispatch({
         sessionID: ctx.params.sessionID,
         ...(ctx.payload.messageID ? { messageID: ctx.payload.messageID } : {}),
         expectedProviderID: ctx.payload.expectedProviderID,
         expectedModelID: ctx.payload.expectedModelID,
         ...(ctx.payload.expectedVariant ? { expectedVariant: ctx.payload.expectedVariant } : {}),
       })
-      if (claim.accepted === false) {
-        return {
-          accepted: false as const,
-          reason: claim.reason,
-          ...(claim.fingerprint ? { fingerprint: claim.fingerprint } : {}),
-          ...(claim.promptCacheKey ? { promptCacheKey: claim.promptCacheKey } : {}),
-        } satisfies SessionRetryExact.RetryExactRejection
-      }
-      const prepared = claim.prepared
-      const rejected = (reason: SessionRetryExact.RetryExactRejectionReason): SessionRetryExact.RetryExactRejection => ({
-        accepted: false,
-        reason,
-        fingerprint: prepared.fingerprint,
-        ...(prepared.promptCacheKey ? { promptCacheKey: prepared.promptCacheKey } : {}),
-      })
-
-      // Look up the user message to anchor the new assistant
-      // message. The cache invariant guarantees the message
-      // exists, so a miss here is reported as
-      // `no-prepared-invocation`.
-      const userMessage = yield* MessageV2.get({
-        sessionID: ctx.params.sessionID,
-        messageID: prepared.userID as MessageID,
-      }).pipe(Effect.orElseSucceed(() => undefined))
-      if (!userMessage || userMessage.info.role !== "user") {
-        yield* retryExactSvc.release(ctx.params.sessionID)
-        return rejected("no-prepared-invocation")
-      }
-      const model = yield* provider
-        .getModel(
-          prepared.provider.providerID as ProviderID,
-          prepared.provider.modelID as ModelID,
-        )
-        .pipe(Effect.orElseSucceed(() => undefined))
-      if (!model) {
-        yield* retryExactSvc.release(ctx.params.sessionID)
-        return rejected("model-mismatch")
-      }
-
-      // Drive the prepared invocation through the processor
-      // pipeline. We do NOT use `SessionRunState.ensureRunning`
-      // here because the runner collapses the work effect's
-      // return type to `MessageV2.WithParts`, which loses the
-      // discriminated union we want to return to the HTTP
-      // caller. Instead, the runner's `onIdle` callback fires
-      // when the dispatch completes and resets the session
-      // status to `idle`; the processor's `cleanup` also sets
-      // `idle` as a safety net.
-      //
-      // The atomic claim inside `retryExact.claim` already
-      // checked the busy-ness under the cache lock, and we
-      // re-check below with `SessionRunState.assertNotBusy` so
-      // a concurrent `prompt` / `retry` request cannot race us
-      // between the claim and the dispatch.
-      const busy = yield* runState
-        .assertNotBusy(ctx.params.sessionID)
-        .pipe(Effect.map(() => false), Effect.orElseSucceed(() => true))
-      if (busy) {
-        yield* retryExactSvc.release(ctx.params.sessionID)
-        return rejected("retry-already-running")
-      }
-
-      const ctxInstance = yield* InstanceState.context
-      const now = Date.now()
-      const assistantMessage: MessageV2.Assistant = {
-        id: MessageID.ascending(),
-        parentID: userMessage.info.id,
-        role: "assistant",
-        mode: "primary",
-        agent: userMessage.info.agent ?? "build",
-        ...(prepared.provider.variant ? { variant: prepared.provider.variant } : {}),
-        path: { cwd: ctxInstance.directory, root: ctxInstance.worktree },
-        cost: 0,
-        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
-        modelID: model.id,
-        providerID: model.providerID,
-        time: { created: now },
-        sessionID: ctx.params.sessionID,
-      }
-      yield* session.updateMessage(assistantMessage)
-      const handle = yield* processorSvc.create({
-        assistantMessage,
-        sessionID: ctx.params.sessionID,
-        model,
-      })
-      // Drive the prepared invocation through the processor's
-      // event-handling pipeline. Forked into the server scope so
-      // the dispatch continues after this handler returns the
-      // accepted response.
-      yield* Effect.forkIn(
-        handle.processPrepared(prepared).pipe(
-          Effect.catch((error: unknown) =>
-            Effect.gen(function* () {
-              yield* bus.publish(Session.Event.Error, {
-                sessionID: ctx.params.sessionID,
-                messageID: assistantMessage.id,
-                parentID: assistantMessage.parentID,
-                agent: assistantMessage.agent,
-                model: {
-                  providerID: assistantMessage.providerID,
-                  modelID: assistantMessage.modelID,
-                  ...(assistantMessage.variant ? { variant: assistantMessage.variant } : {}),
-                },
-                error: MessageV2.fromError(error, {
-                  providerID: assistantMessage.providerID,
-                  aborted: false,
-                }),
-              })
-            }),
-          ),
-          Effect.ensuring(
-            Effect.all(
-              [retryExactSvc.release(ctx.params.sessionID), statusSvc.set(ctx.params.sessionID, { type: "idle" })],
-              { discard: true },
-            ),
-          ),
-        ),
-        scope,
-        { startImmediately: true },
-      )
-
-      yield* bus.publish(
-        SessionRetryExact.ExactReplayEvent,
-        SessionRetryExact.ExactReplayPayload.make({
-          sessionID: ctx.params.sessionID,
-          ...(ctx.payload.messageID ? { messageID: ctx.payload.messageID } : {}),
-          providerID: prepared.provider.providerID,
-          modelID: prepared.provider.modelID,
-          ...(prepared.provider.variant ? { variant: prepared.provider.variant } : {}),
-          fingerprint: prepared.fingerprint,
-          ...(prepared.promptCacheKey ? { promptCacheKey: prepared.promptCacheKey } : {}),
-          attempt: 1,
-        }),
-      )
-
-      return {
-        accepted: true as const,
-        fingerprint: prepared.fingerprint,
-        ...(prepared.promptCacheKey ? { promptCacheKey: prepared.promptCacheKey } : {}),
-      }
     })
 
     const command = Effect.fn("SessionHttpApi.command")(function* (ctx: {
