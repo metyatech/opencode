@@ -128,7 +128,7 @@ const live: Layer.Layer<
             sessionID: input.sessionID,
             model,
           })
-          yield* handle.processPrepared(prepared)
+          yield* Effect.scoped(handle.processPrepared(prepared))
           return yield* MessageV2.get({ sessionID: input.sessionID, messageID: assistantMessage.id }).pipe(
             Effect.orElseSucceed(() => ({ info: assistantMessage, parts: [] }) as MessageV2.WithParts),
           )

@@ -19,11 +19,11 @@ import { ModelID, ProviderID } from "../../src/provider/schema"
 import type { Config } from "@/config/config"
 import { Session as SessionNs } from "@/session/session"
 import { errorMessage } from "../../src/util/error"
-import { TestLLMServer } from "../lib/llm-server"
+import { TestLLMServer, reply } from "../lib/llm-server"
 import path from "path"
 import { resetDatabase } from "../fixture/db"
 import { disposeAllInstances, TestInstance, tmpdirScoped } from "../fixture/fixture"
-import { awaitWithTimeout, testEffect } from "../lib/effect"
+import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
 import { testProviderConfig } from "../lib/test-provider"
 
 const noopBootstrap = Layer.succeed(InstanceBootstrap.Service, InstanceBootstrap.Service.of({ run: Effect.void }))
@@ -805,6 +805,114 @@ describe("HttpApi SDK", () => {
         }
       }),
     ),
+  )
+
+  httpapi(
+    "replays retryExact through HTTP, SessionProcessor, and the mock provider without adding a user turn",
+    Effect.gen(function* () {
+      const llm = yield* TestLLMServer
+      yield* llm.push(reply().usage({ input: 11, output: 0 }).stop())
+      yield* llm.text("cached response", { usage: { input: 11, output: 5, cacheRead: 3 } })
+
+      const config = testProviderConfig(llm.url)
+      return yield* withProject(
+        "default",
+        {
+          config: {
+            ...config,
+            provider: {
+              test: {
+                ...config.provider.test,
+                options: {
+                  ...config.provider.test.options,
+                  headers: { "x-session-affinity": "1" },
+                },
+              },
+            },
+          },
+        },
+        ({ directory }) =>
+          Effect.gen(function* () {
+            const sdk = createLegacyOpencodeClient({
+              baseUrl: "http://localhost",
+              directory,
+              fetch: serverFetch("default"),
+            })
+            const model = { providerID: "test", modelID: "test-model" }
+            const created = yield* call(() =>
+              sdk.session.create({
+                body: {
+                  title: "exact e2e",
+                  permission: [{ permission: "*", pattern: "*", action: "allow" }],
+                },
+              }),
+            )
+            const sessionID = String(record(created.data).id)
+
+            const prompt = yield* call(() =>
+              sdk.session.prompt({
+                path: { sessionID },
+                body: {
+                  model,
+                  agent: "build",
+                  parts: [{ type: "text", text: "hello exact" }],
+                },
+              }),
+            )
+            expect(prompt.response.status).toBe(200)
+            yield* llm.wait(1)
+            const before = yield* call(() => sdk.session.messages({ path: { sessionID } }))
+            const beforeMessages = array(before.data)
+            const beforeUserMessages = beforeMessages.filter((item) => record(record(item).info).role === "user")
+            const beforeUsers = beforeUserMessages.length
+            const firstInputs = yield* llm.inputs
+            expect(firstInputs).toHaveLength(1)
+
+            const retry = yield* call(() =>
+              sdk.session.retryExact({
+                path: { sessionID },
+                body: {
+                  expectedProviderID: model.providerID,
+                  expectedModelID: model.modelID,
+                  messageID: String(record(record(beforeUserMessages.at(-1)).info).id),
+                },
+              }),
+            )
+            expect(retry.response.status).toBe(200)
+            expect(record(retry.data)).toMatchObject({ accepted: true })
+            expect(record(retry.data).accepted).toBe(true)
+            expect(record(retry.data).promptCacheKey).toBe(sessionID)
+            yield* llm.wait(2)
+
+            const status = yield* pollWithTimeout(
+              call(() => sdk.session.status()).pipe(
+                Effect.map((result) => {
+                  const current = record(record(result.data)[sessionID])
+                  const type = current.type ?? "idle"
+                  return type === "idle" ? { type } : undefined
+                }),
+              ),
+              "retryExact session never returned to idle",
+            )
+            const after = yield* call(() => sdk.session.messages({ path: { sessionID } }))
+            const afterMessages = array(after.data)
+            const afterUsers = afterMessages.filter((item) => record(record(item).info).role === "user").length
+            const assistantMessages = afterMessages
+              .map((item) => record(item).info)
+              .filter((info) => record(info).role === "assistant")
+            const lastAssistant = record(assistantMessages.at(-1))
+            const inputs = yield* llm.inputs
+
+            expect(inputs).toHaveLength(2)
+            expect(inputs[1]).toEqual(inputs[0])
+            expect(JSON.stringify(after.data)).toContain("cached response")
+            expect(record(record(lastAssistant).tokens).cache).toMatchObject({ read: 3 })
+            expect(afterUsers).toBe(beforeUsers)
+            expect(JSON.stringify(inputs[1])).not.toContain("transientSystem")
+            expect(status).toMatchObject({ type: "idle" })
+          }),
+      )
+    }).pipe(Effect.provide(TestLLMServer.layer)),
   )
 
   httpapi(
