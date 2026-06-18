@@ -242,6 +242,17 @@ export type MessageOutputLengthError = {
   }
 }
 
+export type ProviderRequestTimeoutError = {
+  name: "ProviderRequestTimeoutError"
+  data: {
+    message: string
+    phase: "first_event" | "stream_idle"
+    timeoutMs: number
+    providerID: string
+    modelID: string
+  }
+}
+
 export type MessageAbortedError = {
   name: "MessageAbortedError"
   data: {
@@ -439,6 +450,7 @@ export type AssistantMessage = {
     | ProviderAuthError
     | UnknownError
     | MessageOutputLengthError
+    | ProviderRequestTimeoutError
     | MessageAbortedError
     | StructuredOutputError
     | ContextOverflowError
@@ -1319,6 +1331,7 @@ export type Config = {
     primary_tools?: Array<string>
     continue_loop_on_deny?: boolean
     mcp_timeout?: number
+    provider_request_timeout_ms?: number
   }
 }
 
@@ -2636,6 +2649,7 @@ export type EventSessionError = {
       | ProviderAuthError
       | UnknownError
       | MessageOutputLengthError
+      | ProviderRequestTimeoutError
       | MessageAbortedError
       | StructuredOutputError
       | ContextOverflowError
