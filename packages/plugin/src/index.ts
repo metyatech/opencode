@@ -4,7 +4,7 @@ import type {
   Project,
   Model,
   Provider,
-  Permission,
+  PermissionRequest,
   UserMessage,
   Message,
   Part,
@@ -69,6 +69,13 @@ export type PluginOptions = Record<string, unknown>
 
 export type Config = Omit<SDKConfig, "plugin"> & {
   plugin?: Array<string | [string, PluginOptions]>
+  // TUI-specific fields that are consumed by `tui.ts` but were dropped
+  // from the regenerated SDK's `Config` schema. These still exist in the
+  // runtime `~/.config/opencode/opencode.json` layout; we keep them on
+  // the plugin's `Config` type so consumer type definitions like
+  // `TuiConfigView` keep working.
+  theme?: string
+  tui?: Record<string, unknown>
 }
 
 export type Plugin = (input: PluginInput, options?: PluginOptions) => Promise<Hooks>
@@ -258,7 +265,7 @@ export interface Hooks {
     input: { sessionID: string; agent: string; model: Model; provider: ProviderContext; message: UserMessage },
     output: { headers: Record<string, string> },
   ) => Promise<void>
-  "permission.ask"?: (input: Permission, output: { status: "ask" | "deny" | "allow" }) => Promise<void>
+  "permission.ask"?: (input: PermissionRequest, output: { status: "ask" | "deny" | "allow" }) => Promise<void>
   "command.execute.before"?: (
     input: { command: string; sessionID: string; arguments: string },
     output: { parts: Part[] },
