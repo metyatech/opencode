@@ -539,14 +539,21 @@ async function runWrapper<E>(
   exit: Exit.Exit<ReadonlyArray<LLMEventType>, E | TimeoutInstance>
   abort: AbortController
 }> {
-const ctrl = opts.abort ?? new AbortController()
+  const ctrl = opts.abort ?? new AbortController()
+  const events: Array<LLMEventType> = []
   const wrapped = withProviderRequestWatchdog(source, {
     providerID: PROVIDER_ID,
     modelID: MODEL_ID,
     timeoutMs: opts.timeoutMs,
     abort: ctrl,
     clock: opts.clock,
-  })
+  }).pipe(
+    Stream.tap((event) =>
+      Effect.sync(() => {
+        events.push(event)
+      }),
+    ),
+  )
   const exit = await Effect.runPromise(
     Effect.scoped(
       Effect.gen(function* () {
@@ -564,7 +571,6 @@ const ctrl = opts.abort ?? new AbortController()
       }),
     ),
   )
-  const events = Exit.isSuccess(exit) ? exit.value : []
   return { events, exit, abort: ctrl }
 }
 
