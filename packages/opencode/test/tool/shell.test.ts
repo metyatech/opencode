@@ -1,6 +1,7 @@
 import { describe, expect } from "bun:test"
 import { Cause, Effect, Exit, Layer } from "effect"
 import type * as Scope from "effect/Scope"
+import fs from "node:fs/promises"
 import os from "os"
 import path from "path"
 import { Config } from "@/config/config"
@@ -113,8 +114,78 @@ const fill = (mode: "lines" | "bytes", n: number) => {
   if (PS.has(sh())) return `& ${text}`
   return text
 }
+const nodeEval = (code: string) => {
+  const text = `${bin} -e ${evalarg(code)}`
+  if (PS.has(sh())) return `& ${text}`
+  return text
+}
 const glob = (p: string) =>
   process.platform === "win32" ? Filesystem.normalizePathPattern(p) : p.replaceAll("\\", "/")
+
+const descendantPidFile = "descendant.pid"
+
+function alive(pid: number) {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function gone(pid: number, timeout = 5_000) {
+  const end = Date.now() + timeout
+  while (Date.now() < end) {
+    if (!alive(pid)) return true
+    await new Promise((resolve) => setTimeout(resolve, 50))
+  }
+  return !alive(pid)
+}
+
+const ignoredKillError = (err: unknown) => {
+  const code = typeof err === "object" && err !== null && "code" in err ? (err as { code?: unknown }).code : undefined
+  return code === "ESRCH" || code === "EINVAL"
+}
+
+async function killProcessTree(pid: number | undefined) {
+  if (!pid || !Number.isFinite(pid) || pid <= 0) return
+  if (process.platform === "win32") {
+    await Bun.spawn(["taskkill", "/pid", String(pid), "/T", "/F"], {
+      stdout: "ignore",
+      stderr: "ignore",
+      windowsHide: true,
+    }).exited.catch(() => undefined)
+    await gone(pid, 1_000)
+    return
+  }
+
+  try {
+    process.kill(-pid, "SIGKILL")
+  } catch (err) {
+    if (ignoredKillError(err)) return
+    try {
+      process.kill(pid, "SIGKILL")
+    } catch (singleErr) {
+      if (!ignoredKillError(singleErr)) throw singleErr
+    }
+  }
+  await gone(pid, 1_000)
+}
+
+async function cleanupPidFile(file: string) {
+  const pid = Number((await fs.readFile(file, "utf8").catch(() => "")).trim())
+  if (Number.isFinite(pid)) await killProcessTree(pid)
+}
+
+const tmpdirWithPidCleanup = () =>
+  Effect.acquireRelease(
+    Effect.promise(() => fs.mkdtemp(path.join(os.tmpdir(), "opencode-shell-stdio-"))),
+    (dir) =>
+      Effect.promise(async () => {
+        await cleanupPidFile(path.join(dir, descendantPidFile))
+        await fs.rm(dir, { recursive: true, force: true })
+      }),
+  )
 
 const forms = (dir: string) => {
   if (process.platform !== "win32") return [dir]
@@ -1227,4 +1298,284 @@ describe("tool.shell truncation", () => {
       }),
     ),
   )
+})
+
+describe("tool.shell stdio lifecycle regression", () => {
+  // Regression for anomalyco/opencode#20902, #24731, #24784, #22012:
+  // the shell tool must finalize output when the foreground process exits,
+  // not when stdio is finally closed. Descendants may keep stdio open
+  // indefinitely; the shell result must not be held hostage.
+  it.live(
+    "returns in bounded time when detached child holds stdio open",
+    () =>
+      runIn(
+        projectRoot,
+        Effect.gen(function* () {
+          // Foreground command writes a line, then spawns a detached child
+          // that inherits stdio and runs for 10 seconds. The shell tool
+          // must return promptly after the foreground exits, and include
+          // the foreground's output.
+          const tmp = yield* tmpdirWithPidCleanup()
+          const pidFile = path.join(tmp, descendantPidFile)
+          const helper = `const fs=require("node:fs");console.log("fg-output");const c=require("node:child_process").spawn(${JSON.stringify(
+            process.execPath,
+          )},["-e","setTimeout(()=>{},10000)"],{detached:true,stdio:"inherit",shell:false,windowsHide:true});fs.writeFileSync(${JSON.stringify(
+            pidFile,
+          )},String(c.pid));c.unref();process.exit(0)`
+          const command = nodeEval(helper)
+          const started = Date.now()
+          const result = yield* run({ command, description: "Detached child holds stdio" })
+          const elapsed = Date.now() - started
+          // Foreground exits in well under 5s even though detached child
+          // holds stdio for 10s.
+          expect(elapsed).toBeLessThan(5_000)
+          expect(result.output).toContain("fg-output")
+        }),
+      ),
+    15_000,
+  )
+
+  it.live(
+    "does not import continuous descendant output after foreground exit",
+    () =>
+      runIn(
+        projectRoot,
+        Effect.gen(function* () {
+          // Foreground writes a marker, exits. A detached child then keeps
+          // writing "noise" to the inherited stdout for 5s. The shell
+          // result must contain the marker but NOT be held open for the
+          // full 5s, and must not include unbounded noise.
+          const marker = "FG-MARKER"
+          const noise = "noise-line"
+          const tmp = yield* tmpdirWithPidCleanup()
+          const pidFile = path.join(tmp, descendantPidFile)
+          const inner = `setInterval(() => process.stdout.write(${JSON.stringify(noise + "\n")}), 50)`
+          const nodeScript = `const fs=require("node:fs");console.log(${JSON.stringify(
+            marker,
+          )});const c=require("node:child_process").spawn(${JSON.stringify(process.execPath)},["-e",${JSON.stringify(
+            inner,
+          )}],{detached:true,stdio:"inherit",shell:false,windowsHide:true});fs.writeFileSync(${JSON.stringify(
+            pidFile,
+          )},String(c.pid));c.unref();process.exit(0)`
+          const command = nodeEval(nodeScript)
+          const started = Date.now()
+          const result = yield* run({ command, description: "Descendant writes noise" })
+          const elapsed = Date.now() - started
+          // Foreground exits promptly. We tolerate up to 5s for the capture
+          // drain grace window; the detached noise-writer would otherwise
+          // hold stdio for much longer.
+          expect(elapsed).toBeLessThan(5_000)
+          expect(result.output).toContain(marker)
+          // We assert that the result did not accumulate an unbounded
+          // amount of noise. The capture boundary is the foreground exit,
+          // so we expect at most a small amount of noise (the drain grace
+          // window). 200 lines of noise is a generous bound; the actual
+          // amount is normally a handful.
+          const noiseCount = (result.output.match(/noise-line/g) ?? []).length
+          expect(noiseCount).toBeLessThan(200)
+        }),
+      ),
+    15_000,
+  )
+
+  it.live(
+    "preserves foreground output produced before exit",
+    () =>
+      runIn(
+        projectRoot,
+        Effect.gen(function* () {
+          // The foreground process writes a distinctive string, then exits
+          // normally. The shell result must contain that string even
+          // though there is also a small amount of inherited-stdio data
+          // flowing around the exit.
+          const result = yield* run({
+            command: `echo fg-marker-output`,
+            description: "Preserve foreground output",
+          })
+          expect(result.output).toContain("fg-marker-output")
+        }),
+      ),
+  )
+
+  it.live(
+    "fast producer: large output is not lost when metadata callbacks are slow",
+    () =>
+      runIn(
+        projectRoot,
+        Effect.gen(function* () {
+          // The metadata callback intentionally sleeps. The producer
+          // emits many lines. Capture must continue even when metadata
+          // is slow: the final output must contain all (or nearly all)
+          // foreground lines. We use `fill("lines", lines)` to construct
+          // a command that is compatible with all configured shells.
+          const lines = 500
+          const command = fill("lines", lines)
+          let metadataCalls = 0
+          const result = yield* run(
+            { command, description: "Fast producer" },
+            {
+              ...ctx,
+              metadata: () =>
+                Effect.promise(
+                  () =>
+                    new Promise<void>((resolve) =>
+                      setTimeout(() => {
+                        metadataCalls++
+                        resolve()
+                      }, 5),
+                    ),
+                ),
+            },
+          )
+          // We require the output to contain at least most of the lines.
+          // The capture pipeline is decoupled from metadata so a slow
+          // metadata callback cannot back-pressure persistence.
+          const missing = Array.from({ length: lines }, (_, i) => `${i + 1}`).filter(
+            (line) => !result.output.includes(line),
+          )
+          expect(missing.length).toBeLessThan(5)
+        }),
+      ),
+    15_000,
+  )
+
+  it.live(
+    "abort returns in bounded time",
+    () =>
+      runIn(
+        projectRoot,
+        Effect.gen(function* () {
+          const controller = new AbortController()
+          const command = `echo begin && ${process.platform === "win32" ? "ping -n 30 127.0.0.1 > nul" : "sleep 30"}`
+          const start = Date.now()
+          const result = yield* run(
+            { command, description: "Abort timing" },
+            {
+              ...ctx,
+              abort: controller.signal,
+              metadata: (input) =>
+                Effect.sync(() => {
+                  const output = (input.metadata as { output?: string })?.output
+                  if (output && output.includes("begin") && !controller.signal.aborted) {
+                    controller.abort()
+                  }
+                }),
+            },
+          )
+          const elapsed = Date.now() - start
+          // Abort must complete in well under 30s (the would-be sleep).
+          expect(elapsed).toBeLessThan(5_000)
+          expect(result.output).toContain("begin")
+          expect(result.output).toContain("User aborted the command")
+        }),
+      ),
+    10_000,
+  )
+
+  it.live(
+    "timeout returns in bounded time",
+    () =>
+      runIn(
+        projectRoot,
+        Effect.gen(function* () {
+          const start = Date.now()
+          const result = yield* run({
+            command: `echo begun && ${process.platform === "win32" ? "ping -n 30 127.0.0.1 > nul" : "sleep 30"}`,
+            description: "Timeout timing",
+            timeout: 500,
+          })
+          const elapsed = Date.now() - start
+          // Timeout fires at ~500ms; cleanup must complete promptly.
+          expect(elapsed).toBeLessThan(5_000)
+          expect(result.output).toContain("begun")
+          expect(result.output).toContain("shell tool terminated command after exceeding timeout")
+        }),
+      ),
+    10_000,
+  )
+})
+
+// Windows + PowerShell integration regression test.
+//
+// The original bug surfaced on Windows where a foreground process exits
+// but a detached descendant (e.g. conhost, a daemon, a grandchild) holds
+// the stdio handles open. We exercise the shell tool end-to-end through
+// PowerShell 5.1 and pwsh (if available) to confirm the fix on the exact
+// platform where the bug was reported.
+//
+// The fixture script writes a distinctive marker, spawns a detached child
+// that inherits stdio, and exits. The shell tool must return promptly,
+// include the marker, and not be held hostage by the detached child's
+// open stdio handles.
+describe("tool.shell Windows PowerShell integration", () => {
+  if (process.platform !== "win32") {
+    it.live("skipped on non-Windows", () => Effect.void)
+    return
+  }
+
+  const ps51 = Bun.which("powershell")
+  const ps7 = Bun.which("pwsh")
+  const allShells = [
+    ps51 ? { label: "powershell-5.1", shell: ps51 } : undefined,
+    ps7 ? { label: "pwsh", shell: ps7 } : undefined,
+  ].filter((s): s is { label: string; shell: string } => Boolean(s))
+
+  if (allShells.length === 0) {
+    it.live("skipped: no PowerShell 5.1 or pwsh available", () => Effect.void)
+    return
+  }
+
+  for (const item of allShells) {
+    it.live(
+      `${item.label}: detached child holds stdio but shell returns bounded time with marker`,
+      () =>
+        withShell(
+          item,
+          runIn(
+            projectRoot,
+            Effect.gen(function* () {
+              // Build a Node.js script that:
+              //  1. Writes a distinctive marker to stdout.
+              //  2. Spawns a detached child that inherits stdio and sleeps
+              //     for 10 seconds (so stdio stays open long after the
+              //     foreground process has exited).
+              //  3. Exits.
+              const tmp = yield* tmpdirWithPidCleanup()
+              const scriptPath = path.join(tmp, "detach-fixture.cjs")
+              const pidFile = path.join(tmp, descendantPidFile)
+              const fixture = `
+                const { spawn } = require("node:child_process")
+                const fs = require("node:fs")
+                process.stdout.write("PS-MARKER-${item.label}\\n")
+                const c = spawn(${JSON.stringify(process.execPath)}, ["-e", "setTimeout(()=>{}, 10000)"], {
+                  detached: true,
+                  stdio: "inherit",
+                  windowsHide: true,
+                })
+                fs.writeFileSync(${JSON.stringify(pidFile)}, String(c.pid))
+                c.unref()
+                process.exit(0)
+              `
+              yield* Effect.promise(() => Bun.write(scriptPath, fixture))
+              const start = Date.now()
+              const result = yield* run(
+                { command: `& ${bin} ${quote(scriptPath.replaceAll("\\", "/"))}`, description: "PS detach fixture" },
+              )
+              const elapsed = Date.now() - start
+              // The shell tool must return well under 10s. The detached
+              // child would otherwise hold stdio for the full 10s.
+              expect(elapsed).toBeLessThan(5_000)
+              // The marker must be present in the output.
+              expect(result.output).toContain(`PS-MARKER-${item.label}`)
+              // The shell tool must NOT report a timeout (the command
+              // finished promptly, only the detached child was slow).
+              expect(result.output).not.toContain("shell tool terminated command after exceeding timeout")
+              // Exit code must be 0 (the foreground process exited 0).
+              expect(result.metadata.exit).toBe(0)
+            }),
+          ),
+        ),
+      10_000,
+    )
+  }
 })

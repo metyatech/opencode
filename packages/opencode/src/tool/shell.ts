@@ -1,4 +1,4 @@
-import { Effect, Stream } from "effect"
+import { Effect, Fiber, Queue, Stream } from "effect"
 import os from "os"
 import { createWriteStream } from "node:fs"
 import * as Tool from "./tool"
@@ -441,8 +441,6 @@ export const ShellTool = Tool.define(
       let file = ""
       let sink: ReturnType<typeof createWriteStream> | undefined
       let cut = false
-      let expired = false
-      let aborted = false
 
       const closeSink = Effect.fnUntraced(function* () {
         const stream = sink
@@ -476,59 +474,109 @@ export const ShellTool = Tool.define(
         },
       })
 
-      const code: number | null = yield* Effect.scoped(
+      type Completion = { readonly _tag: "Exited" } | { readonly _tag: "Aborted" } | { readonly _tag: "TimedOut" }
+
+      const { code, completion }: { code: number | null; completion: Completion } = yield* Effect.scoped(
         Effect.gen(function* () {
           yield* Effect.addFinalizer(closeSink)
           const handle = yield* spawner.spawn(cmd(input.shell, input.command, input.cwd, input.env))
 
-          yield* Effect.forkScoped(
-            Stream.runForEach(Stream.decodeText(handle.all), (chunk) => {
-              const size = Buffer.byteLength(chunk, "utf-8")
-              list.push({ text: chunk, size })
-              used += size
-              while (used > keep && list.length > 1) {
-                const item = list.shift()
-                if (!item) break
-                used -= item.size
-                cut = true
-              }
+          // Output pipeline:
+          //
+          // 1. Capture: a producer fiber reads `handle.all` (decoded as text)
+          //    and offers chunks into a bounded queue. The capture stage
+          //    MUST NOT block on stdio EOF; on Windows or when detached
+          //    descendants inherit the stdio handles, `close` can lag the
+          //    foreground `exit` event indefinitely.
+          //
+          // 2. Persistence: a consumer fiber drains the queue, applies
+          //    truncation/file/output rules. The consumer ends only when it
+          //    receives a sentinel "done" chunk. Metadata is published on a
+          //    separate queue so a slow metadata callback cannot back-pressure
+          //    persistence.
+          //
+          // 3. Metadata: a third fiber drains the metadata queue and calls
+          //    `ctx.metadata`. It is decoupled from capture and persistence.
+          //
+          // 4. Foreground exit (or Aborted / TimedOut) is the capture
+          //    boundary: we interrupt the capture fiber and offer a "done"
+          //    sentinel so the persistence consumer drains already-accepted
+          //    chunks and stops. Output produced by detached descendants
+          //    after the foreground process has exited is NOT pulled into
+          //    this Shell result.
+          const CAPACITY = 256
+          type ChunkEnvelope = { readonly _tag: "chunk"; readonly text: string } | { readonly _tag: "done" }
+          const chunks = yield* Queue.bounded<ChunkEnvelope>(CAPACITY)
+          const meta = yield* Queue.bounded<{ output: string }>(CAPACITY)
 
-              last = preview(last + chunk)
-
-              if (file) {
-                sink?.write(chunk)
-              } else {
-                full += chunk
-                if (Buffer.byteLength(full, "utf-8") > limits.maxBytes) {
-                  return trunc.write(full).pipe(
-                    Effect.andThen((next) =>
-                      Effect.sync(() => {
-                        file = next
-                        cut = true
-                        sink = createWriteStream(next, { flags: "a" })
-                        full = ""
-                      }),
-                    ),
-                    Effect.andThen(
-                      ctx.metadata({
-                        metadata: {
-                          output: last,
-                          description: input.description,
-                        },
-                      }),
-                    ),
-                  )
+          // Persistence fiber: read from chunks queue, write to disk / list.
+          const persist = yield* Effect.forkScoped(
+            Effect.gen(function* () {
+              while (true) {
+                const item = yield* Queue.take(chunks)
+                if (item._tag === "done") {
+                  return
                 }
-              }
+                const chunk = item.text
+                const size = Buffer.byteLength(chunk, "utf-8")
+                list.push({ text: chunk, size })
+                used += size
+                while (used > keep && list.length > 1) {
+                  const first = list.shift()
+                  if (!first) break
+                  used -= first.size
+                  cut = true
+                }
 
-              return ctx.metadata({
-                metadata: {
-                  output: last,
-                  description: input.description,
-                },
-              })
+                last = preview(last + chunk)
+
+                if (file) {
+                  sink?.write(chunk)
+                } else {
+                  full += chunk
+                  if (Buffer.byteLength(full, "utf-8") > limits.maxBytes) {
+                    const next = yield* trunc.write(full)
+                    file = next
+                    cut = true
+                    sink = createWriteStream(next, { flags: "a" })
+                    full = ""
+                  }
+                }
+                // Publish a metadata update. We do NOT block on the metadata
+                // queue; if it is saturated, we drop the update. `last`
+                // remains the source of truth for the latest preview.
+                Queue.offerUnsafe(meta, { output: last })
+              }
             }),
           )
+
+          // Metadata fiber: take metadata updates and call `ctx.metadata`.
+          // We bound how many metadata updates we will issue to avoid
+          // producing an unbounded stream of events for fast producers.
+          yield* Effect.forkScoped(
+            Effect.gen(function* () {
+              while (true) {
+                const item = yield* Queue.take(meta)
+                yield* ctx.metadata({
+                  metadata: {
+                    output: item.output,
+                    description: input.description,
+                  },
+                })
+              }
+            }),
+          )
+
+          // Capture fiber: read `handle.all`, offer chunks. We fork and then
+          // interrupt this fiber once the foreground process exits (or abort/
+          // timeout fires), so we do not keep reading from a stdio handle
+          // held open by a detached descendant.
+          const captureFiber = Effect.runFork(
+            Stream.runForEach(Stream.decodeText(handle.all), (chunk) =>
+              Queue.offer(chunks, { _tag: "chunk", text: chunk }),
+            ).pipe(Effect.ignore),
+          )
+          yield* Effect.addFinalizer(() => Effect.sync(() => captureFiber.interruptUnsafe()))
 
           const abort = Effect.callback<void>((resume) => {
             if (ctx.abort.aborted) return resume(Effect.void)
@@ -539,32 +587,73 @@ export const ShellTool = Tool.define(
 
           const timeout = Effect.sleep(`${input.timeout + 100} millis`)
 
-          const exit = yield* Effect.raceAll([
-            handle.exitCode.pipe(Effect.map((code) => ({ kind: "exit" as const, code }))),
-            abort.pipe(Effect.map(() => ({ kind: "abort" as const, code: null }))),
-            timeout.pipe(Effect.map(() => ({ kind: "timeout" as const, code: null }))),
+          // Race foreground exit, abort, and timeout. The capture boundary
+          // is whichever of these resolves first. We use `Effect.exit` to
+          // convert a spawn failure (e.g. ENOENT) into a value so the race
+          // resolves immediately instead of waiting for the timeout — a
+          // failed spawn IS an exit, and we should not wait the full timeout
+          // just because the process could not start.
+          const completion: Completion = yield* Effect.raceAll([
+            Effect.map(Effect.exit(handle.exitCode), () => ({ _tag: "Exited" as const })),
+            Effect.map(abort, () => ({ _tag: "Aborted" as const })),
+            Effect.map(timeout, () => ({ _tag: "TimedOut" as const })),
           ])
 
-          if (exit.kind === "abort") {
-            aborted = true
+          // Foreground exit (or abort/timeout) reached. Abort/timeout kill
+          // the process group with a bounded wait. A normal foreground exit
+          // deliberately does not kill descendants, so we race the capture
+          // fiber's natural completion against a short grace window in case
+          // stdio is still held open by a detached descendant.
+          if (completion._tag === "Aborted") {
             yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
           }
-          if (exit.kind === "timeout") {
-            expired = true
+          if (completion._tag === "TimedOut") {
             yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
           }
 
-          return exit.kind === "exit" ? exit.code : null
+          // Drain the capture fiber when possible, then stop waiting at the
+          // foreground boundary. `interruptUnsafe()` is intentionally
+          // fire-and-forget: awaiting interruption can itself wait for stdio
+          // close in Node stream finalizers.
+          const CAPTURE_DRAIN_GRACE_MS = 500
+          const captured = yield* Effect.race(
+            Fiber.join(captureFiber).pipe(Effect.as(true)),
+            Effect.as(Effect.sleep(`${CAPTURE_DRAIN_GRACE_MS} millis`), false),
+          )
+          if (!captured) yield* Effect.sync(() => captureFiber.interruptUnsafe())
+          // Offer the done sentinel. We loop in case the queue is full
+          // because the persistence consumer is still draining prior chunks.
+          yield* Effect.gen(function* () {
+            while (!(yield* Queue.offer(chunks, { _tag: "done" }))) {
+              yield* Effect.yieldNow
+            }
+          })
+
+          // Wait for persistence to finish draining. Bounded by the queue
+          // size: persistence ends as soon as it observes the done sentinel.
+          yield* Fiber.join(persist)
+
+          // Resolve exit code: the public `handle.exitCode` is now safe to
+          // read because foreground process has exited (or we killed it).
+          let resolvedCode: number | null
+          if (completion._tag === "Exited") {
+            const c = yield* handle.exitCode.pipe(Effect.orElseSucceed(() => null))
+            resolvedCode = c === null ? null : (c as unknown as number)
+          } else {
+            resolvedCode = null
+          }
+
+          return { code: resolvedCode, completion }
         }),
       ).pipe(Effect.orDie)
 
       const meta: string[] = []
-      if (expired) {
+      if (completion._tag === "TimedOut") {
         meta.push(
           `shell tool terminated command after exceeding timeout ${input.timeout} ms. If this command is expected to take longer and is not waiting for interactive input, retry with a larger timeout value in milliseconds.`,
         )
       }
-      if (aborted) meta.push("User aborted the command")
+      if (completion._tag === "Aborted") meta.push("User aborted the command")
       const raw = list.map((item) => item.text).join("")
       const end = tail(raw, limits.maxLines, limits.maxBytes)
       if (end.cut) cut = true
