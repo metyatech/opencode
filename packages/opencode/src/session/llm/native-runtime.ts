@@ -131,10 +131,20 @@ export function prepare(
         messages: input.messages,
         abort,
       })
-      const stream = input.llmClient.stream({
-        request,
-        tools,
-      })
+      // The per-attempt AbortSignal is wired directly into the provider
+      // HTTP stream's lifecycle via `Stream.interruptWhen`. When the
+      // signal aborts, the stream is interrupted, which interrupts the
+      // fiber running `RequestExecutor`'s `HttpClient.execute` — Effect's
+      // HttpClient converts that interruption into a `fetch` AbortController
+      // abort, so the in-flight provider request is torn down. This makes
+      // the AbortSignal an explicit teardown trigger for the provider
+      // request rather than relying solely on ambient fiber interruption.
+      const stream = input.llmClient
+        .stream({
+          request,
+          tools,
+        })
+        .pipe(Stream.interruptWhen(abortToEffect(abort)))
       return fetch
         ? stream.pipe(Stream.provideService(FetchHttpClient.Fetch, fetch))
         : stream
@@ -152,6 +162,21 @@ export function stream(input: StreamInput): StreamResult {
   const prepared = prepare(input)
   if (prepared.type === "unsupported") return prepared
   return { ...prepared, stream: prepared.run(input.abort) }
+}
+
+// Bridges a web `AbortSignal` into an Effect that succeeds the moment the
+// signal aborts. Used with `Stream.interruptWhen` so the per-attempt abort
+// deterministically tears down the provider HTTP stream.
+export function abortToEffect(signal: AbortSignal): Effect.Effect<void> {
+  return Effect.callback<void>((resume) => {
+    if (signal.aborted) {
+      resume(Effect.void)
+      return
+    }
+    const onAbort = () => resume(Effect.void)
+    signal.addEventListener("abort", onAbort, { once: true })
+    return Effect.sync(() => signal.removeEventListener("abort", onAbort))
+  })
 }
 
 function providerFetch(input: Pick<StreamInput, "provider" | "auth">): typeof globalThis.fetch | undefined {
