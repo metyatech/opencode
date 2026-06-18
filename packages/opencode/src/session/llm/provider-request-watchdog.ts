@@ -49,24 +49,43 @@ export type WatchdogOptions = {
  *   paused-for-tool         — a local (non-provider-executed) `tool-call`
  *                             is in flight. Timer is parked. The next
  *                             `step-start` resumes `streaming` and re-arms.
+ *   waiting-next-step       — `step-finish` has been seen; the provider may
+ *                             still emit more events (e.g. local
+ *                             `tool-result`/`tool-error`, or a new
+ *                             `step-start`). Timer remains cleared; no
+ *                             timeout fires in this state. The next
+ *                             `step-start` resumes `streaming` and re-arms
+ *                             a fresh `stream_idle` timer.
  *
- * Terminal transitions (step-finish, finish, provider-error, stream normal
- * end, stream failure, user cancel, scope end) all clear the timer and the
- * listener so a watchdog can never classify an already-finished stream as a
- * timeout.
+ * Terminal transitions (finish, provider-error, stream normal end, stream
+ * failure, user cancel, scope end) all clear the timer and the listener so a
+ * watchdog can never classify an already-finished stream as a timeout.
+ * `step-finish` is NOT terminal — it parks the watchdog until the next
+ * `step-start` (or a real terminal event).
  */
 export type WatchdogState =
   | { readonly _tag: "inactive" }
   | { readonly _tag: "awaiting-first-event"; readonly lastActivityAt: number }
   | { readonly _tag: "streaming"; readonly lastActivityAt: number }
   | { readonly _tag: "paused-for-tool"; readonly lastActivityAt: number }
+  | { readonly _tag: "waiting-next-step"; readonly lastActivityAt: number }
   | { readonly _tag: "fired"; readonly phase: TimeoutPhase }
   | { readonly _tag: "closed" }
 
 /**
  * Effect an `LLMEvent` has on the watchdog state machine.
+ *
+ * `pause-between-steps` is distinct from `terminal`: a `step-finish` parks
+ * the watchdog in `waiting-next-step` (timer cleared) until the next
+ * `step-start` re-arms. Only `finish` and `provider-error` are terminal.
  */
-export type EventEffect = "activity" | "pause-for-tool" | "resume-from-tool" | "terminal" | "noop"
+export type EventEffect =
+  | "activity"
+  | "pause-for-tool"
+  | "resume-from-tool"
+  | "pause-between-steps"
+  | "terminal"
+  | "noop"
 
 export function classifyEvent(event: LLMEvent): EventEffect {
   switch (event.type) {
@@ -89,6 +108,15 @@ export function classifyEvent(event: LLMEvent): EventEffect {
     case "tool-error":
       return "noop"
     case "step-finish":
+      // `step-finish` is a between-step pause, NOT terminal: the provider
+      // may still emit a local `tool-result`/`tool-error` for a
+      // non-provider-executed `tool-call` issued earlier in the step, or
+      // a new `step-start` to begin the next step. Closing the watchdog
+      // here would ignore all of those events and never arm a timer for
+      // the next step's stream_idle window. The watchdog stays alive in
+      // `waiting-next-step` until a real terminal event (`finish` /
+      // `provider-error`) or a fresh `step-start` resumes it.
+      return "pause-between-steps"
     case "finish":
     case "provider-error":
       return "terminal"
@@ -138,6 +166,14 @@ export function createProviderRequestWatchdog(options: WatchdogOptions): Provide
    * Each arming creates a fresh Deferred so callers can race against the
    * deadline without subscribing to a single shared fiber. The fiber that
    * wakes it is held so we can interrupt it on cancel/re-arm.
+   *
+   * Fiber ownership: the timer fiber is started via `Effect.runFork` (NOT
+   * `forkIn(scope)`) so it is independent of any surrounding Effect scope.
+   * Cancellation flows through the state machine: `cancelFiber()`
+   * interrupts the prior fiber whenever we re-arm or close the watchdog
+   * (including via the `Effect.addFinalizer` in the live Stream wrapper,
+   * which calls `watchdog.cancel()`). The wrapper itself never reaches
+   * for the timer fiber directly.
    */
   let currentDeadline: Deferred.Deferred<void, never> | undefined
   let currentFiber: Fiber.Fiber<void, never> | undefined
@@ -211,6 +247,23 @@ export function createProviderRequestWatchdog(options: WatchdogOptions): Provide
         activity: true,
         deadline: currentDeadline ? Deferred.await(currentDeadline) : undefined,
       }
+    }
+    if (effect === "pause-between-steps") {
+      // `step-finish` parks the watchdog between steps without closing it.
+      // The provider may still emit local `tool-result`/`tool-error`
+      // events for non-provider-executed tool calls issued earlier in the
+      // step, or a fresh `step-start` to begin the next step. Clearing
+      // the timer fiber here keeps `armTimer` from firing a stale
+      // `stream_idle` while the provider is between steps. The state
+      // machine will re-arm on the next `step-start` via the
+      // `resume-from-tool` branch above (state transitions to
+      // `streaming` first, then `armTimer()` arms a fresh
+      // `stream_idle` timer — NOT `first_event`, since the watchdog
+      // already saw events in this stream).
+      cancelFiber()
+      currentDeadline = undefined
+      state = { _tag: "waiting-next-step", lastActivityAt: clock.now() }
+      return { state, activity: false, deadline: undefined }
     }
     if (effect === "terminal") {
       cancelFiber()

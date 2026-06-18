@@ -223,23 +223,50 @@ describe("provider-request-watchdog state machine", () => {
     expect(timeouts).toHaveLength(0)
   })
 
-  test("next step-start after tool finishes resumes the timer", async () => {
-    const { watchdog, clock } = buildWatchdog({ timeoutMs: 80 })
+  test("next step-start after tool finishes resumes the timer (realistic step-finish/tool-result interleaving)", async () => {
+    const { watchdog, clock, timeouts } = buildWatchdog({ timeoutMs: 80 })
 
+    // Round 1: local tool round-trip.
     watchdog.handle(textStart())
+    expect(watchdog.state()._tag).toBe("streaming")
+    clock.clear()
+
     watchdog.handle(toolCall("tc1", "bash"))
     expect(watchdog.state()._tag).toBe("paused-for-tool")
     clock.clear()
 
+    // step-finish before tool-result must park the watchdog in
+    // waiting-next-step (NOT close it).
+    watchdog.handle(stepFinish())
+    expect(watchdog.state()._tag).toBe("waiting-next-step")
+    clock.clear()
+
+    // tool-result while waiting-next-step keeps the state parked and the
+    // timer cleared.
+    watchdog.handle(toolResult("tc1", "bash"))
+    expect(watchdog.state()._tag).toBe("waiting-next-step")
+    expect(clock.pending()).toHaveLength(0)
+
+    // A fresh step-start resumes the stream and arms a stream_idle timer
+    // (NOT first_event — the watchdog has already seen events in this
+    // stream).
     watchdog.handle(stepStart())
     expect(watchdog.state()._tag).toBe("streaming")
     expect(clock.pending()).toHaveLength(1)
 
+    // Round 2: same shape, different tool.
     watchdog.handle(toolCall("tc2", "bash"))
     expect(watchdog.state()._tag).toBe("paused-for-tool")
     clock.clear()
 
-    // Resume from the second pause.
+    watchdog.handle(stepFinish())
+    expect(watchdog.state()._tag).toBe("waiting-next-step")
+    clock.clear()
+
+    watchdog.handle(toolResult("tc2", "bash"))
+    expect(watchdog.state()._tag).toBe("waiting-next-step")
+    expect(clock.pending()).toHaveLength(0)
+
     watchdog.handle(stepStart())
     expect(watchdog.state()._tag).toBe("streaming")
     expect(clock.pending()).toHaveLength(1)
@@ -248,6 +275,171 @@ describe("provider-request-watchdog state machine", () => {
     const state = watchdog.state() as Extract<WatchdogState, { _tag: "fired" }>
     expect(state._tag).toBe("fired")
     expect(state.phase).toBe("stream_idle")
+    // No early timeout while parked: the only recorded phase is the final
+    // stream_idle from the second round's resume.
+    expect(timeouts).toStrictEqual(["stream_idle"])
+  })
+
+  test("step-finish during streaming does NOT close the watchdog", async () => {
+    const { watchdog, clock, timeouts } = buildWatchdog({ timeoutMs: 100 })
+
+    // Get into `streaming` with an armed timer.
+    watchdog.handle(stepStart())
+    expect(watchdog.state()._tag).toBe("streaming")
+    expect(clock.pending()).toHaveLength(1)
+    clock.clear()
+
+    watchdog.handle(textDelta())
+    // textDelta re-armed the timer in the fake clock.
+    expect(clock.pending()).toHaveLength(1)
+
+    // step-finish must park the watchdog in `waiting-next-step` (NOT
+    // `closed`, NOT `fired`).
+    watchdog.handle(stepFinish())
+    const parked = watchdog.state() as Extract<WatchdogState, { _tag: "waiting-next-step" }>
+    expect(parked._tag).toBe("waiting-next-step")
+    expect(watchdog.state()._tag).not.toBe("closed")
+    expect(watchdog.state()._tag).not.toBe("fired")
+    // The fake clock does not observe the watchdog's internal fiber
+    // interruption; tell it to forget the prior deadline explicitly.
+    clock.clear()
+    expect(clock.pending()).toHaveLength(0)
+
+    // Even with the clock advanced far past the timeout window, no
+    // timeout fires while parked.
+    await Effect.runPromise(Effect.sleep("200 millis"))
+    expect(watchdog.state()._tag).toBe("waiting-next-step")
+    expect(timeouts).toHaveLength(0)
+
+    // A subsequent step-start transitions back to `streaming` and arms a
+    // fresh timer.
+    watchdog.handle(stepStart())
+    expect(watchdog.state()._tag).toBe("streaming")
+    expect(clock.pending()).toHaveLength(1)
+
+    // Firing the fresh timer must yield `stream_idle` (NOT `first_event`).
+    await Effect.runPromise(clock.fire())
+    const state = watchdog.state() as Extract<WatchdogState, { _tag: "fired" }>
+    expect(state._tag).toBe("fired")
+    expect(state.phase).toBe("stream_idle")
+  })
+
+  test("step-finish during paused-for-tool does NOT close the watchdog", async () => {
+    const { watchdog, clock, timeouts } = buildWatchdog({ timeoutMs: 100 })
+
+    // Get into `paused-for-tool` (local tool call in flight).
+    watchdog.handle(stepStart())
+    watchdog.handle(textStart("t1"))
+    expect(watchdog.state()._tag).toBe("streaming")
+    clock.clear()
+
+    watchdog.handle(toolCall("tc1", "bash"))
+    expect(watchdog.state()._tag).toBe("paused-for-tool")
+    clock.clear()
+
+    // step-finish while paused-for-tool must keep the watchdog alive
+    // (now in `waiting-next-step`).
+    watchdog.handle(stepFinish())
+    expect(watchdog.state()._tag).toBe("waiting-next-step")
+    clock.clear()
+    expect(clock.pending()).toHaveLength(0)
+
+    // tool-result while in waiting-next-step stays parked.
+    watchdog.handle(toolResult("tc1", "bash"))
+    expect(watchdog.state()._tag).toBe("waiting-next-step")
+    expect(clock.pending()).toHaveLength(0)
+
+    // No timeouts fired across the parked transitions.
+    await Effect.runPromise(Effect.sleep("200 millis"))
+    expect(watchdog.state()._tag).toBe("waiting-next-step")
+    expect(timeouts).toHaveLength(0)
+
+    // A subsequent step-start arms a fresh stream_idle timer.
+    watchdog.handle(stepStart())
+    expect(watchdog.state()._tag).toBe("streaming")
+    expect(clock.pending()).toHaveLength(1)
+  })
+
+  test("subsequent step-start after local tool re-arms a fresh stream_idle timer", async () => {
+    const { watchdog, clock, timeouts } = buildWatchdog({ timeoutMs: 100 })
+
+    // step-start -> tool-call -> step-finish -> tool-result -> step-start
+    watchdog.handle(stepStart())
+    expect(watchdog.state()._tag).toBe("streaming")
+    clock.clear()
+
+    watchdog.handle(toolCall("tc1", "bash"))
+    expect(watchdog.state()._tag).toBe("paused-for-tool")
+    clock.clear()
+
+    watchdog.handle(stepFinish())
+    expect(watchdog.state()._tag).toBe("waiting-next-step")
+    clock.clear()
+
+    watchdog.handle(toolResult("tc1", "bash"))
+    expect(watchdog.state()._tag).toBe("waiting-next-step")
+    expect(clock.pending()).toHaveLength(0)
+
+    watchdog.handle(stepStart())
+    expect(watchdog.state()._tag).toBe("streaming")
+    expect(clock.pending()).toHaveLength(1)
+
+    // The fresh timer must fire `stream_idle`, not `first_event`.
+    await Effect.runPromise(clock.fire())
+    const state = watchdog.state() as Extract<WatchdogState, { _tag: "fired" }>
+    expect(state._tag).toBe("fired")
+    expect(state.phase).toBe("stream_idle")
+    expect(timeouts).toStrictEqual(["stream_idle"])
+  })
+
+  test("multiple local tool rounds keep arming fresh stream_idle timers", async () => {
+    const { watchdog, clock, timeouts } = buildWatchdog({ timeoutMs: 100 })
+
+    // Round 1.
+    watchdog.handle(stepStart())
+    expect(watchdog.state()._tag).toBe("streaming")
+    clock.clear()
+
+    watchdog.handle(toolCall("tc1", "bash"))
+    expect(watchdog.state()._tag).toBe("paused-for-tool")
+    clock.clear()
+
+    watchdog.handle(stepFinish())
+    expect(watchdog.state()._tag).toBe("waiting-next-step")
+    clock.clear()
+
+    watchdog.handle(toolResult("tc1", "bash"))
+    expect(watchdog.state()._tag).toBe("waiting-next-step")
+    clock.clear()
+
+    watchdog.handle(stepStart())
+    expect(watchdog.state()._tag).toBe("streaming")
+    expect(clock.pending()).toHaveLength(1)
+    clock.clear()
+
+    // Round 2.
+    watchdog.handle(toolCall("tc2", "bash"))
+    expect(watchdog.state()._tag).toBe("paused-for-tool")
+    clock.clear()
+
+    watchdog.handle(stepFinish())
+    expect(watchdog.state()._tag).toBe("waiting-next-step")
+    clock.clear()
+
+    watchdog.handle(toolResult("tc2", "bash"))
+    expect(watchdog.state()._tag).toBe("waiting-next-step")
+    clock.clear()
+
+    watchdog.handle(stepStart())
+    expect(watchdog.state()._tag).toBe("streaming")
+    expect(clock.pending()).toHaveLength(1)
+
+    // Firing the final timer must yield `stream_idle`.
+    await Effect.runPromise(clock.fire())
+    const state = watchdog.state() as Extract<WatchdogState, { _tag: "fired" }>
+    expect(state._tag).toBe("fired")
+    expect(state.phase).toBe("stream_idle")
+    expect(timeouts).toStrictEqual(["stream_idle"])
   })
 
   test("tool-call with providerExecuted: true does NOT park", () => {
@@ -264,14 +456,16 @@ describe("provider-request-watchdog state machine", () => {
     expect(clock.pending()).toHaveLength(1)
   })
 
-  test("step-finish, finish, provider-error, and cancel clear the timer", async () => {
+  test("finish, provider-error, and cancel clear the timer (terminal transitions)", async () => {
     type Scenario = {
       name: string
       drive: (watchdog: ReturnType<typeof createProviderRequestWatchdog>) => void
     }
 
+    // `step-finish` is intentionally NOT in this list: it parks the
+    // watchdog in `waiting-next-step` instead of closing it. That
+    // behaviour has its own dedicated test below.
     const scenarios: ReadonlyArray<Scenario> = [
-      { name: "step-finish", drive: (w) => w.handle(stepFinish()) },
       { name: "finish", drive: (w) => w.handle(finish()) },
       { name: "provider-error", drive: (w) => w.handle(providerError()) },
       { name: "cancel", drive: (w) => w.cancel() },
@@ -387,7 +581,7 @@ describe("provider-request-watchdog state machine", () => {
     expect(classifyEvent(toolResult("c1", "x"))).toBe("noop")
     expect(classifyEvent(toolResult("c1", "x", true))).toBe("activity")
     expect(classifyEvent(toolError())).toBe("noop")
-    expect(classifyEvent(stepFinish())).toBe("terminal")
+    expect(classifyEvent(stepFinish())).toBe("pause-between-steps")
     expect(classifyEvent(finish())).toBe("terminal")
     expect(classifyEvent(providerError())).toBe("terminal")
   })
@@ -703,16 +897,18 @@ describe("provider-request-watchdog live wrapper", () => {
     }
   })
 
-  test("6. local tool pause: no timeout while paused; resumes on step-start; idle → timeout", async () => {
+  test("6. local tool pause: no timeout while paused; step-finish parks; resumes on next step-start; idle → timeout", async () => {
     const clock = fakeClock(0)
     const events: ReadonlyArray<LLMEventType> = [
       stepStart(),
       textStart("t1"),
       toolCall("tc1", "bash"), // providerExecuted=false → pause-for-tool
-      // The stream idles while the local tool runs. After resume,
-      // stepStart re-arms the timer.
+      // The local tool runs; the provider still emits step-finish, then
+      // a tool-result for the same tool call, then a fresh step-start to
+      // begin the next step. The stream idles after that → stream_idle.
+      stepFinish(),
+      toolResult("tc1", "bash"),
       stepStart(),
-      // No more events after the second step-start → stream_idle.
     ]
     const source = Stream.callback<LLMEventType>((emit) => {
       for (const event of events) Queue.offerUnsafe(emit, event)
@@ -724,11 +920,16 @@ describe("provider-request-watchdog live wrapper", () => {
     })
     expect(Exit.isFailure(exit)).toBe(true)
     if (!Exit.isFailure(exit)) return
-    // All four events make it through before the timeout fires.
+    // All six events make it through before the timeout fires — step-finish
+    // does NOT close the watchdog, so the tool-result and the second
+    // step-start reach the consumer, and the next step's stream_idle
+    // window is monitored.
     expect(collected.map((e) => e.type)).toStrictEqual([
       "step-start",
       "text-start",
       "tool-call",
+      "step-finish",
+      "tool-result",
       "step-start",
     ])
     const squashed = Cause.squash(exit.cause)
@@ -903,6 +1104,187 @@ describe("provider-request-watchdog live wrapper", () => {
         expect(squashed.data.modelID).toBe(MODEL_ID)
       }
     }
+  })
+
+  // -------------------------------------------------------------------------
+  // step-finish / waiting-next-step wrapper coverage.
+  //
+  // These cases verify the watchdog survives a `step-finish` between steps
+  // and re-arms a fresh `stream_idle` timer on the next `step-start`. The
+  // `runWrapper` helper drives the clock 10 times across the test
+  // (~10-15ms), which is enough to cross a 100ms deadline for cases that
+  // must time out, and harmless for cases that should end cleanly.
+  // -------------------------------------------------------------------------
+
+  test("A. real local tool sequence: stepStart -> toolCall -> stepFinish -> toolResult -> stepStart (no finish) → stream_idle", async () => {
+    const clock = fakeClock(0)
+    const events: ReadonlyArray<LLMEventType> = [
+      stepStart(),
+      toolCall("tc1", "bash"), // providerExecuted=false
+      stepFinish(),
+      toolResult("tc1", "bash"),
+      stepStart(),
+    ]
+    // Source ends after the last stepStart — no `finish` event. The
+    // wrapper must keep the watchdog alive across the step boundary
+    // and time out with `stream_idle` after the second step starts.
+    const source = Stream.callback<LLMEventType>((emit) => {
+      for (const event of events) Queue.offerUnsafe(emit, event)
+      return Effect.void
+    }) as Stream.Stream<LLMEventType, never>
+    const { events: collected, exit, abort } = await runWrapper(source, {
+      timeoutMs: 100,
+      clock,
+    })
+    // All five events reach the consumer.
+    expect(collected.map((e) => e.type)).toStrictEqual([
+      "step-start",
+      "tool-call",
+      "step-finish",
+      "tool-result",
+      "step-start",
+    ])
+    expect(Exit.isFailure(exit)).toBe(true)
+    if (!Exit.isFailure(exit)) return
+    const squashed = Cause.squash(exit.cause)
+    expect(isProviderRequestTimeoutError(squashed)).toBe(true)
+    if (isProviderRequestTimeoutError(squashed)) {
+      expect(squashed.data.phase).toBe("stream_idle")
+    }
+    expect(abort.signal.aborted).toBe(true)
+  })
+
+  test("B. multi-step without tool: stepStart -> textDelta -> stepFinish -> stepStart (no finish) → stream_idle", async () => {
+    const clock = fakeClock(0)
+    const events: ReadonlyArray<LLMEventType> = [
+      stepStart(),
+      textDelta(),
+      stepFinish(),
+      stepStart(),
+    ]
+    const source = Stream.callback<LLMEventType>((emit) => {
+      for (const event of events) Queue.offerUnsafe(emit, event)
+      return Effect.void
+    }) as Stream.Stream<LLMEventType, never>
+    const { events: collected, exit } = await runWrapper(source, {
+      timeoutMs: 100,
+      clock,
+    })
+    expect(collected.map((e) => e.type)).toStrictEqual([
+      "step-start",
+      "text-delta",
+      "step-finish",
+      "step-start",
+    ])
+    expect(Exit.isFailure(exit)).toBe(true)
+    if (!Exit.isFailure(exit)) return
+    const squashed = Cause.squash(exit.cause)
+    expect(isProviderRequestTimeoutError(squashed)).toBe(true)
+    if (isProviderRequestTimeoutError(squashed)) {
+      expect(squashed.data.phase).toBe("stream_idle")
+    }
+  })
+
+  test("C. no timeout between steps: stream ends naturally while waiting for next step-start", async () => {
+    const clock = fakeClock(0)
+    // stepStart -> toolCall -> stepFinish -> toolResult. No follow-up
+    // stepStart. The source ends naturally (Cause.Done). The wrapper
+    // must NOT fail with `stream_idle` while the watchdog is parked in
+    // `waiting-next-step` — `sawEvent === true` so the done-cause branch
+    // calls `endQueue()` instead of `failTimeout("first_event")`.
+    const events: ReadonlyArray<LLMEventType> = [
+      stepStart(),
+      toolCall("tc1", "bash"), // providerExecuted=false
+      stepFinish(),
+      toolResult("tc1", "bash"),
+    ]
+    const source = Stream.callback<LLMEventType>((emit) => {
+      for (const event of events) Queue.offerUnsafe(emit, event)
+      Queue.endUnsafe(emit)
+      return Effect.void
+    }) as Stream.Stream<LLMEventType, never>
+    const { events: collected, exit, abort } = await runWrapper(source, {
+      timeoutMs: 100,
+      clock,
+    })
+    // Exit must be success and no ProviderRequestTimeoutError must be
+    // squashed from the cause.
+    expect(Exit.isSuccess(exit)).toBe(true)
+    if (!Exit.isSuccess(exit)) return
+    expect(collected.map((e) => e.type)).toStrictEqual(
+      events.map((e) => e.type),
+    )
+    // The user's abort signal must not have been fired: the wrapper
+    // ended cleanly, so onTimeout never ran.
+    expect(abort.signal.aborted).toBe(false)
+  })
+
+  test("D. final finish: stream ends cleanly with finish event, no late timeout", async () => {
+    const clock = fakeClock(0)
+    // stepStart -> textDelta -> stepFinish -> finish. The source ends
+    // naturally after the finish event. The wrapper must exit cleanly
+    // with the finish event delivered to the consumer; no late
+    // `stream_idle` should fire after natural end.
+    const events: ReadonlyArray<LLMEventType> = [
+      stepStart(),
+      textDelta(),
+      stepFinish(),
+      finish(),
+    ]
+    const source = Stream.callback<LLMEventType>((emit) => {
+      for (const event of events) Queue.offerUnsafe(emit, event)
+      Queue.endUnsafe(emit)
+      return Effect.void
+    }) as Stream.Stream<LLMEventType, never>
+    const abort = new AbortController()
+    const { events: collected, exit } = await runWrapper(source, {
+      timeoutMs: 100,
+      clock,
+      abort,
+    })
+    expect(Exit.isSuccess(exit)).toBe(true)
+    if (!Exit.isSuccess(exit)) return
+    expect(collected.map((e) => e.type)).toStrictEqual(
+      events.map((e) => e.type),
+    )
+    // No late timeout / no abort — `runWrapper` already fired the clock
+    // after natural end; the abort signal must remain un-set.
+    expect(abort.signal.aborted).toBe(false)
+  })
+
+  test("E. multiple tool rounds: two local tool round-trips then idle → stream_idle", async () => {
+    const clock = fakeClock(0)
+    const events: ReadonlyArray<LLMEventType> = [
+      stepStart(),
+      toolCall("tc1", "bash"), // providerExecuted=false
+      stepFinish(),
+      toolResult("tc1", "bash"),
+      stepStart(),
+      toolCall("tc2", "bash"), // providerExecuted=false
+      stepFinish(),
+      toolResult("tc2", "bash"),
+      stepStart(),
+    ]
+    const source = Stream.callback<LLMEventType>((emit) => {
+      for (const event of events) Queue.offerUnsafe(emit, event)
+      return Effect.void
+    }) as Stream.Stream<LLMEventType, never>
+    const { events: collected, exit, abort } = await runWrapper(source, {
+      timeoutMs: 100,
+      clock,
+    })
+    // All nine events reach the consumer.
+    expect(collected.map((e) => e.type)).toStrictEqual(
+      events.map((e) => e.type),
+    )
+    expect(Exit.isFailure(exit)).toBe(true)
+    if (!Exit.isFailure(exit)) return
+    const squashed = Cause.squash(exit.cause)
+    expect(isProviderRequestTimeoutError(squashed)).toBe(true)
+    if (isProviderRequestTimeoutError(squashed)) {
+      expect(squashed.data.phase).toBe("stream_idle")
+    }
+    expect(abort.signal.aborted).toBe(true)
   })
 })
 
