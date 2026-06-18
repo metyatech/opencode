@@ -43,7 +43,7 @@ export const Info = Schema.Struct({
     }),
   ),
   variant: Schema.optional(Schema.String),
-  modelSelection: Schema.Literals(["user", "managed"]),
+  modelSelection: Schema.optional(Schema.Literals(["user", "managed"])),
   prompt: Schema.optional(Schema.String),
   options: Schema.Record(Schema.String, Schema.Unknown),
   steps: Schema.optional(Schema.Finite),

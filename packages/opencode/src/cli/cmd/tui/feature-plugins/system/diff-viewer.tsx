@@ -134,7 +134,7 @@ function DiffViewer(props: { api: TuiPluginApi }) {
   const [activePatchFileIndex, setActivePatchFileIndex] = createSignal<number | undefined>()
   const [selectedFileIndex, setSelectedFileIndex] = createSignal<number | undefined>()
   const [reviewedFileNames, setReviewedFileNames] = createSignal<ReadonlySet<string>>(new Set())
-  const patchScrollAcceleration = createMemo(() => getScrollAcceleration(props.api.tuiConfig))
+  const patchScrollAcceleration = createMemo(() => getScrollAcceleration())
   const fileRows = createMemo(() => flattenFileTree(fileTree(), expandedFileNodes()))
   const patchFileIndexes = createMemo(() => orderedPatchFileIndexes(flattenFileTree(fileTree())))
   const focusRunner = (input: Record<DiffViewerFocus, () => void>) => () => input[focus()]()

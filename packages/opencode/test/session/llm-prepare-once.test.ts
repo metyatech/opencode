@@ -11,6 +11,7 @@ import { Permission } from "@/permission"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { MessageV2 } from "../../src/session/message-v2"
 import { SessionID, MessageID } from "../../src/session/schema"
+import { ModelID, ProviderID } from "@/provider/schema"
 import { ModelsDev } from "@opencode-ai/core/models-dev"
 import { testEffect } from "../lib/effect"
 import type { Agent } from "../../src/agent/agent"
@@ -184,8 +185,8 @@ const it = testEffect(
 
 const makeStreamInput = (model: ModelsDev.Model, sessionID = "ses_prepare_once") => {
   const resolved = {
-    providerID: "openai",
-    id: model.id,
+    providerID: ProviderID.make("openai"),
+    id: ModelID.make(model.id),
     api: { id: model.id, npm: "@ai-sdk/openai", url: "https://api.openai.com/v1" },
     name: model.name,
     limit: { context: 128_000, output: 8_000 },
@@ -195,12 +196,15 @@ const makeStreamInput = (model: ModelsDev.Model, sessionID = "ses_prepare_once")
       attachment: false,
       reasoning: true,
       temperature: true,
-      input: { text: true, image: false, audio: false, video: false },
-      output: { text: true, image: false, audio: false, video: false },
+      input: { text: true, image: false, audio: false, video: false, pdf: false },
+      output: { text: true, image: false, audio: false, video: false, pdf: false },
+      interleaved: false,
     },
     options: {},
     headers: {},
-  } as never
+    status: "active" as const,
+    release_date: "2025-01-01",
+  } satisfies Provider.Model
   const agent = {
     name: "test",
     mode: "primary",
@@ -214,7 +218,7 @@ const makeStreamInput = (model: ModelsDev.Model, sessionID = "ses_prepare_once")
       role: "user",
       time: { created: Date.now() },
       agent: agent.name,
-      model: { providerID: "openai", modelID: resolved.id, variant: "high" },
+      model: { providerID: ProviderID.make("openai"), modelID: resolved.id, variant: "high" },
     } satisfies MessageV2.User,
     sessionID,
     model: resolved,

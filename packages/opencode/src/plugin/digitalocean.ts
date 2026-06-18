@@ -312,7 +312,7 @@ export async function DigitalOceanAuthPlugin(input: PluginInput): Promise<Hooks>
             }
             await input.client.auth
               .set({
-                path: { id: "digitalocean" },
+                path: { providerID: "digitalocean" },
                 body: { type: "api", key: ctx.auth.key, metadata: updated },
               })
               .catch((err) => log.warn("failed to persist refreshed routers", { error: err }))
