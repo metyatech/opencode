@@ -105,14 +105,6 @@ export function prepare(
   const current = statusWithFetch(input, fetch)
   if (current.type === "unsupported") return current
 
-  // `nativeTools` only reads `messages` at tool definition time;
-  // the `abort` it asks for is bound to the per-call stream in
-  // `run` below. We pass a never-aborting signal here so the
-  // tool definitions are stable across attempts.
-  const tools = nativeTools(input.tools, {
-    messages: input.messages,
-    abort: new AbortController().signal,
-  })
   const request = LLMNative.request({
     model: input.model,
     apiKey: current.apiKey,
@@ -135,6 +127,10 @@ export function prepare(
     // across attempts because `request` is captured from the
     // cache-relevant inputs that were passed to `prepare`.
     run: (abort: AbortSignal) => {
+      const tools = nativeTools(input.tools, {
+        messages: input.messages,
+        abort,
+      })
       const stream = input.llmClient.stream({
         request,
         tools,

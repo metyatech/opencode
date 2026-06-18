@@ -1848,13 +1848,6 @@ export type SubtaskPartInput = {
   command?: string
 }
 
-export type RetryExactRejectedError = {
-  _tag: "RetryExactRejectedError"
-  reason: string
-  fingerprint?: string
-  promptCacheKey?: string
-}
-
 export type SessionBusyError = {
   _tag: "SessionBusyError"
   sessionID: string
@@ -6938,10 +6931,6 @@ export type SessionRetryExactErrors = {
    * NotFoundError
    */
   404: NotFoundError
-  /**
-   * RetryExactRejectedError
-   */
-  409: RetryExactRejectedError
 }
 
 export type SessionRetryExactError = SessionRetryExactErrors[keyof SessionRetryExactErrors]
@@ -6957,6 +6946,7 @@ export type SessionRetryExactResponses = {
         promptCacheKey?: string
       }
     | {
+        accepted: false
         reason:
           | "no-prepared-invocation"
           | "request-not-latest"

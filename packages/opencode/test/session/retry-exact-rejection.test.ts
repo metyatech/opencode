@@ -60,7 +60,7 @@ describe("SessionRetryExact.Service.canRetry", () => {
           expectedProviderID: "openai",
           expectedModelID: "gpt-5.2",
         })
-        expect(outcome).toEqual({ reason: "no-prepared-invocation" })
+        expect(outcome).toEqual({ accepted: false, reason: "no-prepared-invocation" })
       }),
     ),
   )

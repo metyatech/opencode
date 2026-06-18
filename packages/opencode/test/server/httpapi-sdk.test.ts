@@ -6,6 +6,7 @@ import { ChildProcessSpawner } from "effect/unstable/process"
 import { AppFileSystem } from "@opencode-ai/core/filesystem"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Flag } from "@opencode-ai/core/flag/flag"
+import { createOpencodeClient as createLegacyOpencodeClient } from "@opencode-ai/sdk"
 import { createOpencodeClient } from "@opencode-ai/sdk/v2"
 import { validateSession } from "../../src/cli/cmd/tui/validate-session"
 import { InstanceBootstrap } from "../../src/project/bootstrap-service"
@@ -335,6 +336,37 @@ afterEach(async () => {
 })
 
 describe("HttpApi SDK", () => {
+  httpapi(
+    "uses sessionID path parameter for generated retryExact URLs",
+    Effect.gen(function* () {
+      let captured: URL | undefined
+      const sdk = createLegacyOpencodeClient({
+        baseUrl: "http://localhost",
+        fetch: Object.assign(
+          async (request: RequestInfo | URL, init?: RequestInit) => {
+            const req = request instanceof Request ? request : new Request(request, init)
+            captured = new URL(req.url)
+            return Response.json({ accepted: false, reason: "no-prepared-invocation" })
+          },
+          { preconnect: globalThis.fetch.preconnect },
+        ) satisfies typeof globalThis.fetch,
+      })
+
+      const response = yield* call(() =>
+        sdk.session.retryExact({
+          path: { sessionID: "ses_exact_path" },
+          body: { expectedProviderID: "openai", expectedModelID: "gpt-5.5" },
+        }),
+      )
+
+      expect(response.response.status).toBe(200)
+      expect(response.data).toEqual({ accepted: false, reason: "no-prepared-invocation" })
+      expect(captured?.pathname).toBe("/session/ses_exact_path/retry-exact")
+      expect(captured?.pathname).not.toContain("undefined")
+      expect(captured?.pathname).not.toContain("%7Bid%7D")
+    }),
+  )
+
   httpapi(
     "uses the generated SDK for global and control routes",
     Effect.gen(function* () {

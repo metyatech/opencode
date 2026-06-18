@@ -884,15 +884,6 @@ export const layer = Layer.effect(
         ctx.toolcalls = {}
         ctx.assistantMessage.time.completed = Date.now()
         yield* session.updateMessage(ctx.assistantMessage)
-        // Always restore the session to `idle` on cleanup so callers
-        // that bypass the normal `runLoop` lifecycle (e.g.
-        // `SessionProcessor.processPrepared` invoked by the
-        // `session.retryExact` HTTP handler) leave the session in
-        // a consistent state. The runner's `onIdle` callback
-        // handles this when the call is wrapped in
-        // `SessionRunState.ensureRunning`; the explicit reset
-        // here is the safety net for callers that don't.
-        yield* status.set(ctx.sessionID, { type: "idle" })
       })
 
       const errorText = (error: ReturnType<typeof parse>, fallback: unknown) =>

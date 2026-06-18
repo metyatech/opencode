@@ -44,6 +44,7 @@ export type RetryExactInput = {
 }
 
 export const RetryExactRejection = Schema.Struct({
+  accepted: Schema.Literal(false),
   reason: Schema.Literals(RetryExactRejectionReason.values),
   fingerprint: Schema.optional(Schema.String),
   promptCacheKey: Schema.optional(Schema.String),
@@ -116,6 +117,7 @@ export interface Interface {
    * via `dispatch` before this method runs.
    */
   readonly claim: (input: RetryExactInput) => Effect.Effect<ClaimOutcome, never>
+  readonly release: (sessionID: SessionID) => Effect.Effect<void>
   // Internal hooks used by the processor. Not part of the public surface.
   readonly publish: (inv: LLMInvocation.PreparedInvocation) => Effect.Effect<void>
   readonly invalidate: (
@@ -189,6 +191,16 @@ const live: Layer.Layer<
         yield* LLMInvocationCache.invalidate(state, sessionID, reason)
       })
 
+    const reject = (
+      reason: RetryExactRejectionReason,
+      info: { readonly fingerprint?: string; readonly promptCacheKey?: string } = {},
+    ): RetryExactRejection => ({
+      accepted: false,
+      reason,
+      ...(info.fingerprint ? { fingerprint: info.fingerprint } : {}),
+      ...(info.promptCacheKey ? { promptCacheKey: info.promptCacheKey } : {}),
+    })
+
     const fingerprintOf = (state: LLMInvocationCache.InvocationCacheState, sessionID: SessionID) => {
       const inv = LLMInvocationCache.peek(state, sessionID)
       return inv
@@ -206,38 +218,38 @@ const live: Layer.Layer<
       const now = Date.now()
       const inv = LLMInvocationCache.peek(state, input.sessionID)
       if (!inv) {
-        return { reason: "no-prepared-invocation" as const }
+        return reject("no-prepared-invocation")
       }
       if (now - inv.createdAt > inv.ttlMs) {
         yield* LLMInvocationCache.invalidate(state, input.sessionID, "ttl-expired")
-        return { reason: "invocation-expired" as const, ...fingerprintOf(state, input.sessionID) }
+        return reject("invocation-expired", fingerprintOf(state, input.sessionID))
       }
       if (inv.provider.providerID !== input.expectedProviderID) {
-        return { reason: "model-mismatch" as const, ...fingerprintOf(state, input.sessionID) }
+        return reject("model-mismatch", fingerprintOf(state, input.sessionID))
       }
       if (inv.provider.modelID !== input.expectedModelID) {
-        return { reason: "model-mismatch" as const, ...fingerprintOf(state, input.sessionID) }
+        return reject("model-mismatch", fingerprintOf(state, input.sessionID))
       }
       if (input.expectedVariant !== undefined && inv.provider.variant !== input.expectedVariant) {
-        return { reason: "variant-mismatch" as const, ...fingerprintOf(state, input.sessionID) }
+        return reject("variant-mismatch", fingerprintOf(state, input.sessionID))
       }
       if (inv.provider.variant !== undefined && input.expectedVariant === undefined) {
         // The prepared invocation has a variant but the caller did not
         // declare one — treat as variant mismatch to keep the wire body
         // stable.
-        return { reason: "variant-mismatch" as const, ...fingerprintOf(state, input.sessionID) }
+        return reject("variant-mismatch", fingerprintOf(state, input.sessionID))
       }
 
       // Check live session state for activity since the prepared invocation.
       const session = yield* sessionSvc.get(input.sessionID).pipe(Effect.orElseSucceed(() => undefined))
       if (!session) {
-        return { reason: "session-disposed" as const, ...fingerprintOf(state, input.sessionID) }
+        return reject("session-disposed", fingerprintOf(state, input.sessionID))
       }
 
       // A retry is already in flight?
       const status = yield* statusSvc.get(input.sessionID)
       if (status.type === "busy" || status.type === "retry") {
-        return { reason: "retry-already-running" as const, ...fingerprintOf(state, input.sessionID) }
+        return reject("retry-already-running", fingerprintOf(state, input.sessionID))
       }
       // The run-state's `assertNotBusy` is the canonical "is the runner
       // currently working" check. Calling it as a positive check is fine
@@ -251,7 +263,7 @@ const live: Layer.Layer<
           Effect.orElseSucceed((): boolean => true),
         )
       if (busy) {
-        return { reason: "retry-already-running" as const, ...fingerprintOf(state, input.sessionID) }
+        return reject("retry-already-running", fingerprintOf(state, input.sessionID))
       }
 
       return {
@@ -277,18 +289,31 @@ const live: Layer.Layer<
     // `messageID` that does not match the prepared invocation's
     // `userID` is rejected as `request-not-latest`.
     const claim = Effect.fn("SessionRetryExact.claim")(function* (input: RetryExactInput) {
-      const outcome = yield* checkEligibility(input)
-      if (!("accepted" in outcome)) return outcome
-      const state = yield* getCache()
-      const inv = LLMInvocationCache.peek(state, input.sessionID)
-      if (!inv) return { reason: "no-prepared-invocation" as const }
-      if (input.messageID !== undefined && inv.userID !== input.messageID) {
-        return { reason: "request-not-latest" as const, ...fingerprintOf(state, input.sessionID) }
-      }
-      return { accepted: true as const, prepared: inv }
+      const lock = yield* getLock(input.sessionID)
+      return yield* SynchronizedRef.modifyEffect(
+        lock,
+        (reserved): Effect.Effect<readonly [ClaimOutcome, number]> =>
+          Effect.gen(function* () {
+            if (reserved > 0) return [reject("retry-already-running"), reserved] as const
+            const outcome = yield* checkEligibility(input)
+            if (outcome.accepted === false) return [outcome, reserved] as const
+            const state = yield* getCache()
+            const inv = LLMInvocationCache.peek(state, input.sessionID)
+            if (!inv) return [reject("no-prepared-invocation"), reserved] as const
+            if (input.messageID !== undefined && inv.userID !== input.messageID) {
+              return [reject("request-not-latest", fingerprintOf(state, input.sessionID)), reserved] as const
+            }
+            return [{ accepted: true as const, prepared: inv }, reserved + 1] as const
+          }),
+      )
     })
 
-    return Service.of({ canRetry, claim, publish, invalidate })
+    const release = Effect.fn("SessionRetryExact.release")(function* (sessionID: SessionID) {
+      const lock = yield* getLock(sessionID)
+      yield* SynchronizedRef.update(lock, (reserved) => Math.max(0, reserved - 1))
+    })
+
+    return Service.of({ canRetry, claim, release, publish, invalidate })
   }),
 )
 

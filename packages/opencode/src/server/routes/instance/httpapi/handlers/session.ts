@@ -35,7 +35,6 @@ import {
   PermissionResponsePayload,
   PromptPayload,
   RetryExactPayload,
-  RetryExactRejectedError,
   RetryPayload,
   RevertPayload,
   ShellPayload,
@@ -381,14 +380,21 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
         expectedModelID: ctx.payload.expectedModelID,
         ...(ctx.payload.expectedVariant ? { expectedVariant: ctx.payload.expectedVariant } : {}),
       })
-      if (!("accepted" in claim)) {
+      if (claim.accepted === false) {
         return {
+          accepted: false as const,
           reason: claim.reason,
           ...(claim.fingerprint ? { fingerprint: claim.fingerprint } : {}),
           ...(claim.promptCacheKey ? { promptCacheKey: claim.promptCacheKey } : {}),
         } satisfies SessionRetryExact.RetryExactRejection
       }
       const prepared = claim.prepared
+      const rejected = (reason: SessionRetryExact.RetryExactRejectionReason): SessionRetryExact.RetryExactRejection => ({
+        accepted: false,
+        reason,
+        fingerprint: prepared.fingerprint,
+        ...(prepared.promptCacheKey ? { promptCacheKey: prepared.promptCacheKey } : {}),
+      })
 
       // Look up the user message to anchor the new assistant
       // message. The cache invariant guarantees the message
@@ -397,38 +403,21 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       const userMessage = yield* MessageV2.get({
         sessionID: ctx.params.sessionID,
         messageID: prepared.userID as MessageID,
-      }).pipe(
-        Effect.mapError(
-          () =>
-            new RetryExactRejectedError({
-              reason: "no-prepared-invocation",
-              fingerprint: prepared.fingerprint,
-              ...(prepared.promptCacheKey ? { promptCacheKey: prepared.promptCacheKey } : {}),
-            }),
-        ),
-      )
+      }).pipe(Effect.orElseSucceed(() => undefined))
       if (!userMessage || userMessage.info.role !== "user") {
-        return {
-          reason: "no-prepared-invocation",
-          fingerprint: prepared.fingerprint,
-          ...(prepared.promptCacheKey ? { promptCacheKey: prepared.promptCacheKey } : {}),
-        } satisfies SessionRetryExact.RetryExactRejection
+        yield* retryExactSvc.release(ctx.params.sessionID)
+        return rejected("no-prepared-invocation")
       }
       const model = yield* provider
         .getModel(
           prepared.provider.providerID as ProviderID,
           prepared.provider.modelID as ModelID,
         )
-        .pipe(
-          Effect.mapError(
-            () =>
-              new RetryExactRejectedError({
-                reason: "model-mismatch",
-                fingerprint: prepared.fingerprint,
-                ...(prepared.promptCacheKey ? { promptCacheKey: prepared.promptCacheKey } : {}),
-              }),
-          ),
-        )
+        .pipe(Effect.orElseSucceed(() => undefined))
+      if (!model) {
+        yield* retryExactSvc.release(ctx.params.sessionID)
+        return rejected("model-mismatch")
+      }
 
       // Drive the prepared invocation through the processor
       // pipeline. We do NOT use `SessionRunState.ensureRunning`
@@ -445,16 +434,13 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       // re-check below with `SessionRunState.assertNotBusy` so
       // a concurrent `prompt` / `retry` request cannot race us
       // between the claim and the dispatch.
-      yield* runState
+      const busy = yield* runState
         .assertNotBusy(ctx.params.sessionID)
-        .pipe(
-          Effect.mapError(
-            () =>
-              new RetryExactRejectedError({
-                reason: "retry-already-running",
-              }),
-          ),
-        )
+        .pipe(Effect.map(() => false), Effect.orElseSucceed(() => true))
+      if (busy) {
+        yield* retryExactSvc.release(ctx.params.sessionID)
+        return rejected("retry-already-running")
+      }
 
       const ctxInstance = yield* InstanceState.context
       const now = Date.now()
@@ -503,6 +489,12 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
                 }),
               })
             }),
+          ),
+          Effect.ensuring(
+            Effect.all(
+              [retryExactSvc.release(ctx.params.sessionID), statusSvc.set(ctx.params.sessionID, { type: "idle" })],
+              { discard: true },
+            ),
           ),
         ),
         scope,

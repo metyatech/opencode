@@ -73,16 +73,6 @@ export const RetryExactPayload = Schema.Struct({
   expectedVariant: Schema.optional(Schema.String),
 })
 
-export class RetryExactRejectedError extends Schema.TaggedErrorClass<RetryExactRejectedError>()(
-  "RetryExactRejectedError",
-  {
-    reason: Schema.String,
-    fingerprint: Schema.optional(Schema.String),
-    promptCacheKey: Schema.optional(Schema.String),
-  },
-  { httpApiStatus: 409 },
-) {}
-
 export const CommandPayload = Schema.Struct(Struct.omit(SessionPrompt.CommandInput.fields, ["sessionID"]))
 export const ShellPayload = Schema.Struct(Struct.omit(SessionPrompt.ShellInput.fields, ["sessionID"]))
 export const RevertPayload = Schema.Struct(Struct.omit(SessionRevert.RevertInput.fields, ["sessionID"]))
@@ -391,7 +381,7 @@ export const SessionApi = HttpApi.make("session")
           query: WorkspaceRoutingQuery,
           payload: RetryExactPayload,
           success: described(SessionRetryExact.RetryExactResult, "Exact retry stream started"),
-          error: [HttpApiError.BadRequest, ApiNotFoundError, RetryExactRejectedError],
+          error: [HttpApiError.BadRequest, ApiNotFoundError],
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "session.retryExact",

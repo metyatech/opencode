@@ -94,7 +94,7 @@ describe("session.retryExact integration", () => {
           expectedProviderID: "openai",
           expectedModelID: "gpt-5.2",
         })
-        expect(outcome).toEqual({ reason: "no-prepared-invocation" })
+        expect(outcome).toEqual({ accepted: false, reason: "no-prepared-invocation" })
       }).pipe(Effect.provide(Layer.succeed(Config.Service, { enabled_providers: ["openai"] } as never))),
     ),
   )
@@ -114,8 +114,8 @@ describe("session.retryExact integration", () => {
           expectedProviderID: "openai",
           expectedModelID: "gpt-5.2",
         })
-        expect("accepted" in outcome).toBe(false)
-        if (!("accepted" in outcome)) {
+        expect(outcome.accepted).toBe(false)
+        if (outcome.accepted === false) {
           expect(outcome.reason).toBe("model-mismatch")
         }
       }).pipe(Effect.provide(Layer.succeed(Config.Service, { enabled_providers: ["openai", "anthropic"] } as never))),
@@ -136,8 +136,8 @@ describe("session.retryExact integration", () => {
         // the eligibility check fires session-disposed before the
         // messageID check. This is the correct precedence: a missing
         // session is a stronger rejection than a stale messageID.
-        expect("accepted" in outcome).toBe(false)
-        if (!("accepted" in outcome)) {
+        expect(outcome.accepted).toBe(false)
+        if (outcome.accepted === false) {
           expect(outcome.reason).toBe("session-disposed")
         }
       }).pipe(Effect.provide(Layer.succeed(Config.Service, { enabled_providers: ["openai"] } as never))),
