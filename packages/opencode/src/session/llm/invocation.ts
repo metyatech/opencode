@@ -102,7 +102,7 @@ export type CanonicalRequest = Types.DeepMutable<Schema.Schema.Type<typeof Canon
 export type CanonicalTool = {
   readonly name: string
   readonly description?: string
-  readonly inputSchema: unknown
+  readonly inputSchema?: unknown
 }
 
 export type CanonicalParams = {

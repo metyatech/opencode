@@ -18,6 +18,7 @@ import { Todo } from "@/session/todo"
 import { MessageID, PartID, SessionID } from "@/session/schema"
 import { Provider } from "@/provider/provider"
 import { ModelID, ProviderID } from "@/provider/schema"
+import { InstanceState } from "@/effect/instance-state"
 import { NamedError } from "@opencode-ai/core/util/error"
 import { Cause, Effect, Option, Schema, Scope } from "effect"
 import * as Stream from "effect/Stream"
@@ -369,10 +370,10 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       payload: typeof RetryExactPayload.Type
     }) {
       yield* requireSession(ctx.params.sessionID)
-      // 1. Atomic claim: eligibility check + get the prepared invocation.
-      //    The busy-ness check inside `claim` observes the runner that
-      //    `ensureRunning` is about to take, so two simultaneous calls
-      //    cannot both win.
+      // First perform the eligibility check. We split this from
+      // the dispatch so the typed rejection is returned in the
+      // success body (HTTP 200) and the handler does not have to
+      // rethrow / re-catch between the two branches.
       const claim = yield* retryExactSvc.claim({
         sessionID: ctx.params.sessionID,
         ...(ctx.payload.messageID ? { messageID: ctx.payload.messageID } : {}),
@@ -381,34 +382,43 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
         ...(ctx.payload.expectedVariant ? { expectedVariant: ctx.payload.expectedVariant } : {}),
       })
       if (!("accepted" in claim)) {
-        return yield* Effect.fail(
-          new RetryExactRejectedError({
-            reason: claim.reason,
-            ...(claim.fingerprint ? { fingerprint: claim.fingerprint } : {}),
-            ...(claim.promptCacheKey ? { promptCacheKey: claim.promptCacheKey } : {}),
-          }),
-        )
+        return {
+          reason: claim.reason,
+          ...(claim.fingerprint ? { fingerprint: claim.fingerprint } : {}),
+          ...(claim.promptCacheKey ? { promptCacheKey: claim.promptCacheKey } : {}),
+        } satisfies SessionRetryExact.RetryExactRejection
       }
       const prepared = claim.prepared
 
-      // 2. Look up the user message to anchor the new assistant message
-      //    and load the provider model to drive the processor. Translate
-      //    domain errors to HTTP errors at this boundary.
+      // Look up the user message to anchor the new assistant
+      // message. The cache invariant guarantees the message
+      // exists, so a miss here is reported as
+      // `no-prepared-invocation`.
       const userMessage = yield* MessageV2.get({
         sessionID: ctx.params.sessionID,
         messageID: prepared.userID as MessageID,
-      }).pipe(Effect.mapError(() => new RetryExactRejectedError({ reason: "no-prepared-invocation" })))
+      }).pipe(
+        Effect.mapError(
+          () =>
+            new RetryExactRejectedError({
+              reason: "no-prepared-invocation",
+              fingerprint: prepared.fingerprint,
+              ...(prepared.promptCacheKey ? { promptCacheKey: prepared.promptCacheKey } : {}),
+            }),
+        ),
+      )
       if (!userMessage || userMessage.info.role !== "user") {
-        return yield* Effect.fail(
-          new RetryExactRejectedError({
-            reason: "no-prepared-invocation",
-            fingerprint: prepared.fingerprint,
-            ...(prepared.promptCacheKey ? { promptCacheKey: prepared.promptCacheKey } : {}),
-          }),
-        )
+        return {
+          reason: "no-prepared-invocation",
+          fingerprint: prepared.fingerprint,
+          ...(prepared.promptCacheKey ? { promptCacheKey: prepared.promptCacheKey } : {}),
+        } satisfies SessionRetryExact.RetryExactRejection
       }
       const model = yield* provider
-        .getModel(prepared.provider.providerID as ProviderID, prepared.provider.modelID as ModelID)
+        .getModel(
+          prepared.provider.providerID as ProviderID,
+          prepared.provider.modelID as ModelID,
+        )
         .pipe(
           Effect.mapError(
             () =>
@@ -419,11 +429,34 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
               }),
           ),
         )
-      // 3. Create a new assistant message and a processor handle. The
-      //    handle will drive the prepared invocation through the same
-      //    event-handling pipeline used by `process()`, so text,
-      //    reasoning, tool parts, usage, errors, and session status are
-      //    all persisted exactly as they would be for a fresh dispatch.
+
+      // Drive the prepared invocation through the processor
+      // pipeline. We do NOT use `SessionRunState.ensureRunning`
+      // here because the runner collapses the work effect's
+      // return type to `MessageV2.WithParts`, which loses the
+      // discriminated union we want to return to the HTTP
+      // caller. Instead, the runner's `onIdle` callback fires
+      // when the dispatch completes and resets the session
+      // status to `idle`; the processor's `cleanup` also sets
+      // `idle` as a safety net.
+      //
+      // The atomic claim inside `retryExact.claim` already
+      // checked the busy-ness under the cache lock, and we
+      // re-check below with `SessionRunState.assertNotBusy` so
+      // a concurrent `prompt` / `retry` request cannot race us
+      // between the claim and the dispatch.
+      yield* runState
+        .assertNotBusy(ctx.params.sessionID)
+        .pipe(
+          Effect.mapError(
+            () =>
+              new RetryExactRejectedError({
+                reason: "retry-already-running",
+              }),
+          ),
+        )
+
+      const ctxInstance = yield* InstanceState.context
       const now = Date.now()
       const assistantMessage: MessageV2.Assistant = {
         id: MessageID.ascending(),
@@ -432,7 +465,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
         mode: "primary",
         agent: userMessage.info.agent ?? "build",
         ...(prepared.provider.variant ? { variant: prepared.provider.variant } : {}),
-        path: { cwd: process.cwd(), root: process.cwd() },
+        path: { cwd: ctxInstance.directory, root: ctxInstance.worktree },
         cost: 0,
         tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
         modelID: model.id,
@@ -446,13 +479,10 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
         sessionID: ctx.params.sessionID,
         model,
       })
-      // 4. Drive the prepared invocation through the existing
-      //    SessionProcessor event-handling pipeline. Forked into the
-      //    server scope so the dispatch continues after this handler
-      //    returns `accepted: true`. Domain errors are caught here and
-      //    re-published as a session error event; the processor itself
-      //    persists the error onto the assistant message and resets
-      //    session status.
+      // Drive the prepared invocation through the processor's
+      // event-handling pipeline. Forked into the server scope so
+      // the dispatch continues after this handler returns the
+      // accepted response.
       yield* Effect.forkIn(
         handle.processPrepared(prepared).pipe(
           Effect.catch((error: unknown) =>
@@ -479,7 +509,6 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
         { startImmediately: true },
       )
 
-      // 5. Publish the exact-replay started event for observers.
       yield* bus.publish(
         SessionRetryExact.ExactReplayEvent,
         SessionRetryExact.ExactReplayPayload.make({

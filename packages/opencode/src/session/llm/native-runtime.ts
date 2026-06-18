@@ -14,6 +14,18 @@ import { LLMNative } from "./native-request"
 export type RuntimeStatus =
   | { readonly type: "supported"; readonly apiKey: string; readonly baseURL?: string }
   | { readonly type: "unsupported"; readonly reason: string }
+
+/**
+ * Native runtime handles the prepare/run split for the native LLMClient
+ * path. `prepare` resolves the runtime support and builds the
+ * per-call stream factory; `run` invokes the factory with a fresh
+ * `AbortSignal` and a freshly-resolved HTTP fetch override, so each
+ * attempt produces a new request, a new stream, and a new
+ * AbortSignal — and the body that hits the wire is byte-identical
+ * across attempts because `prepare` captured every cache-relevant
+ * input (model, messages, tools, headers, provider options,
+ * temperature, topP, topK, maxOutputTokens).
+ */
 export type StreamResult =
   | { readonly type: "supported"; readonly stream: Stream.Stream<LLMEvent, unknown> }
   | { readonly type: "unsupported"; readonly reason: string }
@@ -34,6 +46,23 @@ type StreamInput = {
   readonly headers: Record<string, string>
   readonly abort: AbortSignal
 }
+
+/**
+ * Result of `prepare` — captures every cache-relevant input and
+ * exposes a `run(abort)` factory that produces a fresh
+ * `Stream.Stream<LLMEvent>` per call. Each `run` invocation creates
+ * a new HTTP request, so the body is identical but the transport
+ * is not reused.
+ */
+export type PreparedNative =
+  | {
+      readonly type: "supported"
+      readonly apiKey: string
+      readonly baseURL?: string
+      readonly fetch: typeof globalThis.fetch | undefined
+      readonly run: (abort: AbortSignal) => Stream.Stream<LLMEvent, unknown>
+    }
+  | { readonly type: "unsupported"; readonly reason: string }
 
 export function status(input: Pick<StreamInput, "model" | "provider" | "auth">): RuntimeStatus {
   return statusWithFetch(input, providerFetch(input))
@@ -63,42 +92,70 @@ function statusWithFetch(
   }
 }
 
-export function stream(input: StreamInput): StreamResult {
+/**
+ * Resolve the runtime support and capture every cache-relevant
+ * input. The returned `PreparedNative.run` produces a fresh
+ * `Stream.Stream<LLMEvent>` per call so retry attempts each get
+ * their own request body, decoder, and `AbortSignal`.
+ */
+export function prepare(
+  input: Omit<StreamInput, "abort">,
+): PreparedNative {
   const fetch = providerFetch(input)
   const current = statusWithFetch(input, fetch)
   if (current.type === "unsupported") return current
 
-  // Integration point with @opencode-ai/llm: native-request lowers session data
-  // into an LLMRequest, then LLMClient handles route selection and transport.
-  //
-  // ProviderTransform.providerOptions builds AI-SDK-shaped options for the
-  // selected SDK key (e.g. "openai") and the native LLM SDK reads the same
-  // keys via OpenAIOptions.* (store, reasoningEffort, reasoningSummary,
-  // include, textVerbosity, promptCacheKey). Both sides intentionally use
-  // OpenAI's official wire field names, so this is identity, not translation
-  // — if a field ever needs to differ between the two surfaces, the
-  // translation belongs here, not split across both packages.
-  const stream = input.llmClient.stream({
-    request: LLMNative.request({
-      model: input.model,
-      apiKey: current.apiKey,
-      baseURL: current.baseURL,
-      messages: ProviderTransform.message(input.messages, input.model, input.providerOptions ?? {}),
-      toolChoice: input.toolChoice,
-      temperature: input.temperature,
-      topP: input.topP,
-      topK: input.topK,
-      maxOutputTokens: input.maxOutputTokens,
-      providerOptions: ProviderTransform.providerOptions(input.model, input.providerOptions ?? {}),
-      headers: { ...providerHeaders(input.provider.options.headers), ...input.headers },
-    }),
-    tools: nativeTools(input.tools, input),
+  // `nativeTools` only reads `messages` at tool definition time;
+  // the `abort` it asks for is bound to the per-call stream in
+  // `run` below. We pass a never-aborting signal here so the
+  // tool definitions are stable across attempts.
+  const tools = nativeTools(input.tools, {
+    messages: input.messages,
+    abort: new AbortController().signal,
+  })
+  const request = LLMNative.request({
+    model: input.model,
+    apiKey: current.apiKey,
+    baseURL: current.baseURL,
+    messages: ProviderTransform.message(input.messages, input.model, input.providerOptions ?? {}),
+    toolChoice: input.toolChoice,
+    temperature: input.temperature,
+    topP: input.topP,
+    topK: input.topK,
+    maxOutputTokens: input.maxOutputTokens,
+    providerOptions: ProviderTransform.providerOptions(input.model, input.providerOptions ?? {}),
+    headers: { ...providerHeaders(input.provider.options.headers), ...input.headers },
   })
 
   return {
     ...current,
-    stream: fetch ? stream.pipe(Stream.provideService(FetchHttpClient.Fetch, fetch)) : stream,
+    fetch,
+    // Each invocation creates a new `llmClient.stream` call, which
+    // in turn issues a new HTTP request. The body is identical
+    // across attempts because `request` is captured from the
+    // cache-relevant inputs that were passed to `prepare`.
+    run: (abort: AbortSignal) => {
+      const stream = input.llmClient.stream({
+        request,
+        tools,
+      })
+      return fetch
+        ? stream.pipe(Stream.provideService(FetchHttpClient.Fetch, fetch))
+        : stream
+    },
   }
+}
+
+/**
+ * Backwards-compatible wrapper kept for callers that want a
+ * single-shot stream from a one-off `StreamInput`. New callers
+ * MUST use `prepare` + `run` so that retry attempts each get
+ * their own request body.
+ */
+export function stream(input: StreamInput): StreamResult {
+  const prepared = prepare(input)
+  if (prepared.type === "unsupported") return prepared
+  return { ...prepared, stream: prepared.run(input.abort) }
 }
 
 function providerFetch(input: Pick<StreamInput, "provider" | "auth">): typeof globalThis.fetch | undefined {

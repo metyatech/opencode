@@ -7,6 +7,7 @@ import { SessionRevert } from "./revert"
 import * as Session from "./session"
 import { Agent } from "../agent/agent"
 import { Provider } from "@/provider/provider"
+import { Auth } from "@/auth"
 import { ModelID, ProviderID } from "../provider/schema"
 import { type Tool as AITool, tool, jsonSchema } from "ai"
 import type { JSONSchema7 } from "@ai-sdk/provider"
@@ -1520,7 +1521,7 @@ export const layer = Layer.effect(
     const runLoop: (
       sessionID: SessionID,
       transientSystem?: string,
-    ) => Effect.Effect<MessageV2.WithParts> = Effect.fn("SessionPrompt.run")(
+    ) => Effect.Effect<MessageV2.WithParts, Auth.AuthError | Provider.ModelNotFoundError, Scope.Scope> = Effect.fn("SessionPrompt.run")(
       function* (sessionID: SessionID, transientSystem?: string) {
         const ctx = yield* InstanceState.context
         const slog = elog.with({ sessionID })

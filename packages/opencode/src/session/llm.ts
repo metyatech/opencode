@@ -291,9 +291,14 @@ const live: Layer.Layer<
 
       // Decide the runtime ONCE during prepare; the run closure below reuses
       // the same selection so retries land on the same adapter path.
+      // For the native runtime, `prepare` captures every cache-relevant
+      // input and exposes a `run(abort)` factory that issues a new
+      // request, decoder, and stream per call — so each retry attempt
+      // has a fresh AbortSignal and a fresh HTTP request, but the
+      // body that hits the wire is byte-identical.
       let runtime: PreparedRuntime
       if (flags.experimentalNativeLlm) {
-        const native = LLMNativeRuntime.stream({
+        const native = LLMNativeRuntime.prepare({
           model: input.model,
           provider: item,
           auth: info,
@@ -307,11 +312,6 @@ const live: Layer.Layer<
           maxOutputTokens: prepared.params.maxOutputTokens,
           providerOptions: prepared.params.options,
           headers: prepared.headers,
-          // The native runtime branch is itself a stream factory; we wrap
-          // it so the closure receives a per-attempt AbortSignal. The
-          // body that hits the wire is the same on every retry because
-          // all the inputs are captured.
-          abort: new AbortController().signal,
         })
         if (native.type === "supported") {
           yield* Effect.logInfo("llm runtime selected").pipe(
@@ -321,7 +321,10 @@ const live: Layer.Layer<
               "llm.model": input.model.id,
             }),
           )
-          runtime = { type: "native", factory: () => native.stream }
+          // `run(abort)` creates a fresh stream and request per call.
+          // The per-attempt AbortController is owned by the caller
+          // (`drivePreparedStream` below).
+          runtime = { type: "native", factory: native.run }
         } else {
           yield* Effect.logInfo("llm runtime selected").pipe(
             Effect.annotateLogs({
