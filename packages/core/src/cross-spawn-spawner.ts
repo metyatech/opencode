@@ -2,6 +2,7 @@ import type * as Arr from "effect/Array"
 import { NodeFileSystem, NodeSink, NodeStream } from "@effect/platform-node"
 import * as NodePath from "@effect/platform-node/NodePath"
 import * as Deferred from "effect/Deferred"
+import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as FileSystem from "effect/FileSystem"
@@ -92,7 +93,45 @@ const toPlatformError = (
   })
 }
 
-type ExitSignal = Deferred.Deferred<readonly [code: number | null, signal: NodeJS.Signals | null]>
+type ExitInfo = readonly [code: number | null, signal: NodeJS.Signals | null]
+type ExitSignal = Deferred.Deferred<ExitInfo, PlatformError.PlatformError>
+
+/**
+ * Process lifetime and stdio lifetime are tracked separately.
+ *
+ * - `exited` is completed by the Node.js `exit` event. It represents that the
+ *   foreground child process has terminated. Public `handle.exitCode` and
+ *   `handle.isRunning` are derived from this signal.
+ * - `closed` is completed by the Node.js `close` event. It represents that the
+ *   stdio streams connected to the child have been closed. On Windows or when
+ *   descendants keep stdio handles open, this can fire long after `exit`.
+ *   Consumers that need to know "did the process exit?" MUST NOT block on
+ *   `closed`.
+ *
+ * If `exit` never fires (extremely rare, mostly synthetic harnesses), `closed`
+ * is used as a fallback to also complete `exited` so callers do not hang.
+ */
+type ProcessLifecycle = {
+  readonly exited: ExitSignal
+  readonly closed: ExitSignal
+}
+
+const HARD_KILL_GRACE_MS = 1_000
+
+const makeLifecycle = (): ProcessLifecycle => ({
+  exited: Deferred.makeUnsafe<ExitInfo, PlatformError.PlatformError>(),
+  closed: Deferred.makeUnsafe<ExitInfo, PlatformError.PlatformError>(),
+})
+
+const completeOnce = (signal: ExitSignal, value: ExitInfo): void => {
+  if (Deferred.isDoneUnsafe(signal)) return
+  Deferred.doneUnsafe(signal, Exit.succeed(value))
+}
+
+const failOnce = (signal: ExitSignal, err: PlatformError.PlatformError): void => {
+  if (Deferred.isDoneUnsafe(signal)) return
+  Deferred.doneUnsafe(signal, Exit.fail(err))
+}
 
 export const make = Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
@@ -262,36 +301,53 @@ export const make = Effect.gen(function* () {
     return { stdout, stderr, all: Stream.merge(stdout, stderr) }
   }
 
-  const spawn = (command: ChildProcess.StandardCommand, opts: NodeChildProcess.SpawnOptions) =>
-    Effect.callback<readonly [NodeChildProcess.ChildProcess, ExitSignal], PlatformError.PlatformError>((resume) => {
-      const signal = Deferred.makeUnsafe<readonly [code: number | null, signal: NodeJS.Signals | null]>()
-      const proc = launch(command.command, command.args, opts)
-      let end = false
-      let exit: readonly [code: number | null, signal: NodeJS.Signals | null] | undefined
-      proc.on("error", (err) => {
-        resume(Effect.fail(toPlatformError("spawn", err, command)))
-      })
-      proc.on("exit", (...args) => {
-        exit = args
-      })
-      proc.on("close", (...args) => {
-        if (end) return
-        end = true
-        Deferred.doneUnsafe(signal, Exit.succeed(exit ?? args))
-      })
-      proc.on("spawn", () => {
-        resume(Effect.succeed([proc, signal]))
-      })
-      return Effect.sync(() => {
-        proc.kill("SIGTERM")
-      })
-    })
+  const spawn = (
+    command: ChildProcess.StandardCommand,
+    opts: NodeChildProcess.SpawnOptions,
+  ): Effect.Effect<readonly [NodeChildProcess.ChildProcess, ProcessLifecycle], PlatformError.PlatformError> =>
+    Effect.callback<readonly [NodeChildProcess.ChildProcess, ProcessLifecycle], PlatformError.PlatformError>(
+      (resume) => {
+        const lifecycle = makeLifecycle()
+        const proc = launch(command.command, command.args, opts)
+        let lastExit: ExitInfo | undefined
+        proc.on("error", (err) => {
+          // Spawn failure: the child never started. Both `exited` and `closed`
+          // are unresolved because there is no process to emit `exit` or
+          // `close`. Fail both so callers waiting on either do not hang.
+          const platformErr = toPlatformError("spawn", err, command)
+          failOnce(lifecycle.exited, platformErr)
+          failOnce(lifecycle.closed, platformErr)
+          resume(Effect.fail(platformErr))
+        })
+        proc.on("exit", (...args: ExitInfo) => {
+          lastExit = args
+          completeOnce(lifecycle.exited, args)
+        })
+        proc.on("close", (...args: ExitInfo) => {
+          // `close` is the authoritative stdio-closed event. If `exit` somehow
+          // never fired (very rare; mostly synthetic test rigs, or when
+          // `cross-spawn` intercepts the `exit` event on Windows to emit
+          // an `error` for ENOENT), use this payload as the `exited` value
+          // too so callers do not hang.
+          if (lastExit === undefined) {
+            completeOnce(lifecycle.exited, args)
+          }
+          completeOnce(lifecycle.closed, args)
+        })
+        proc.on("spawn", () => {
+          resume(Effect.succeed([proc, lifecycle]))
+        })
+        return Effect.sync(() => {
+          proc.kill("SIGTERM")
+        })
+      },
+    )
 
   const killGroup = (
     command: ChildProcess.StandardCommand,
     proc: NodeChildProcess.ChildProcess,
     signal: NodeJS.Signals,
-  ) => {
+  ): Effect.Effect<void, PlatformError.PlatformError> => {
     if (globalThis.process.platform === "win32") {
       return Effect.callback<void, PlatformError.PlatformError>((resume) => {
         NodeChildProcess.exec(`taskkill /pid ${proc.pid} /T /F`, { windowsHide: true }, (err) => {
@@ -313,32 +369,64 @@ export const make = Effect.gen(function* () {
     command: ChildProcess.StandardCommand,
     proc: NodeChildProcess.ChildProcess,
     signal: NodeJS.Signals,
-  ) =>
+  ): Effect.Effect<void, PlatformError.PlatformError> =>
     Effect.suspend(() => {
       if (proc.kill(signal)) return Effect.void
       return Effect.fail(toPlatformError("kill", new Error("Failed to kill child process"), command))
     })
 
-  const timeout =
-    (
-      proc: NodeChildProcess.ChildProcess,
-      command: ChildProcess.StandardCommand,
-      opts: ChildProcess.KillOptions | undefined,
-    ) =>
-    <A, E, R>(
-      f: (
-        command: ChildProcess.StandardCommand,
-        proc: NodeChildProcess.ChildProcess,
-        signal: NodeJS.Signals,
-      ) => Effect.Effect<A, E, R>,
-    ) => {
-      const signal = opts?.killSignal ?? "SIGTERM"
-      if (Predicate.isUndefined(opts?.forceKillAfter)) return f(command, proc, signal)
-      return Effect.timeoutOrElse(f(command, proc, signal), {
-        duration: opts.forceKillAfter,
-        orElse: () => f(command, proc, "SIGKILL"),
-      })
-    }
+  /**
+   * Wait for `exited` (or `closed` as a fallback) with a hard upper bound.
+   * The hard cap is essential: if a detached descendant inherits stdio,
+   * `closed` may never fire and we must still return. The hard cap does not
+   * weaken correctness because the public contract for `exitCode` and
+   * `isRunning` is based on `exited`, which is what we actually wait for.
+   * `closed` is only used here as a safety net for the rare case where
+   * `exit` never fires.
+   */
+  const waitForExit = (
+    lifecycle: ProcessLifecycle,
+    timeout: Duration.Input,
+  ): Effect.Effect<ExitInfo, never> => {
+    const sentinel: ExitInfo = [null, null]
+    return Deferred.await(lifecycle.exited).pipe(
+      Effect.orElseSucceed(() => sentinel),
+      Effect.timeoutOrElse({
+        duration: timeout,
+        orElse: () =>
+          Deferred.await(lifecycle.closed).pipe(
+            Effect.orElseSucceed(() => sentinel),
+            Effect.timeoutOrElse({
+              duration: timeout,
+              orElse: () => Effect.succeed(sentinel),
+            }),
+          ),
+      }),
+    )
+  }
+
+  const killAndWait = (
+    command: ChildProcess.StandardCommand,
+    proc: NodeChildProcess.ChildProcess,
+    lifecycle: ProcessLifecycle,
+    signal: NodeJS.Signals,
+    timeout: Duration.Input | undefined,
+  ): Effect.Effect<void, PlatformError.PlatformError> => {
+    const send = (s: NodeJS.Signals) =>
+      Effect.catch(killGroup(command, proc, s), () => killOne(command, proc, s))
+    const cap: Duration.Input = timeout ?? `${HARD_KILL_GRACE_MS} millis`
+    return Effect.gen(function* () {
+      yield* send(signal)
+      const info = yield* waitForExit(lifecycle, cap)
+      const [code, sig] = info
+      if (code === null && sig === null) {
+        // Either we hit the hard cap, or `exit`/`close` never fired. Try
+        // SIGKILL once and give the process a final bounded grace window.
+        yield* send("SIGKILL").pipe(Effect.ignore)
+        yield* waitForExit(lifecycle, `${HARD_KILL_GRACE_MS} millis`)
+      }
+    })
+  }
 
   const source = (handle: ChildProcessHandle, from: ChildProcess.PipeFromOption | undefined) => {
     const opt = from ?? "stdout"
@@ -368,7 +456,7 @@ export const make = Effect.gen(function* () {
           const extra = fds(command.options)
           const dir = yield* cwd(command.options)
 
-          const [proc, signal] = yield* Effect.acquireRelease(
+          const handleResources = yield* Effect.acquireRelease(
             spawn(command, {
               cwd: dir,
               env: env(command.options),
@@ -377,28 +465,30 @@ export const make = Effect.gen(function* () {
               shell: command.options.shell,
               windowsHide: process.platform === "win32",
             }),
-            Effect.fnUntraced(function* ([proc, signal]) {
-              const done = yield* Deferred.isDone(signal)
-              const kill = timeout(proc, command, command.options)
-              if (done) {
-                const [code] = yield* Deferred.await(signal)
-                if (process.platform === "win32") return yield* Effect.void
-                if (code !== 0 && Predicate.isNotNull(code)) return yield* Effect.ignore(kill(killGroup))
-                return yield* Effect.void
-              }
-              const send = (s: NodeJS.Signals) =>
-                Effect.catch(killGroup(command, proc, s), () => killOne(command, proc, s))
+            Effect.fnUntraced(function* (res) {
+              const proc = res[0]
+              const lifecycle = res[1]
+              // Scope cleanup. We only wait for `exited` with a bounded grace
+              // window; we never wait for `closed`. If the foreground process
+              // already exited with a non-zero status, we still attempt a
+              // process-tree kill (Unix process group / Windows taskkill /T)
+              // so descendants do not leak past the scope, but we do not hang
+              // on them.
+              const [code] = yield* waitForExit(lifecycle, "0 millis")
               const sig = command.options.killSignal ?? "SIGTERM"
-              const attempt = send(sig).pipe(Effect.andThen(Deferred.await(signal)), Effect.asVoid)
-              const escalated = command.options.forceKillAfter
-                ? Effect.timeoutOrElse(attempt, {
-                    duration: command.options.forceKillAfter,
-                    orElse: () => send("SIGKILL").pipe(Effect.andThen(Deferred.await(signal)), Effect.asVoid),
-                  })
-                : attempt
-              return yield* Effect.ignore(escalated)
+              if (code === 0) return
+              if (code !== null) {
+                // Non-zero exit. Same bounded attempt to reap any descendants.
+                yield* killAndWait(command, proc, lifecycle, sig, `${HARD_KILL_GRACE_MS} millis`).pipe(Effect.ignore)
+                return
+              }
+              // `exited` did not yet resolve. Treat this as a forced shutdown.
+              yield* killAndWait(command, proc, lifecycle, sig, `${HARD_KILL_GRACE_MS} millis`).pipe(Effect.ignore)
             }),
           )
+
+          const proc = handleResources[0]
+          const lifecycle = handleResources[1]
 
           const fd = yield* setupFds(command, proc, extra)
           const out = setupOutput(command, proc, sout, serr)
@@ -411,8 +501,8 @@ export const make = Effect.gen(function* () {
             all: out.all,
             getInputFd: fd.getInputFd,
             getOutputFd: fd.getOutputFd,
-            isRunning: Effect.map(Deferred.isDone(signal), (done) => !done),
-            exitCode: Effect.flatMap(Deferred.await(signal), ([code, signal]) => {
+            isRunning: Effect.map(Deferred.isDone(lifecycle.exited), (done) => !done),
+            exitCode: Effect.flatMap(Deferred.await(lifecycle.exited), ([code, signal]) => {
               if (Predicate.isNotNull(code)) return Effect.succeed(ExitCode(code))
               return Effect.fail(
                 toPlatformError(
@@ -424,14 +514,7 @@ export const make = Effect.gen(function* () {
             }),
             kill: (opts?: ChildProcess.KillOptions) => {
               const sig = opts?.killSignal ?? "SIGTERM"
-              const send = (s: NodeJS.Signals) =>
-                Effect.catch(killGroup(command, proc, s), () => killOne(command, proc, s))
-              const attempt = send(sig).pipe(Effect.andThen(Deferred.await(signal)), Effect.asVoid)
-              if (!opts?.forceKillAfter) return attempt
-              return Effect.timeoutOrElse(attempt, {
-                duration: opts.forceKillAfter,
-                orElse: () => send("SIGKILL").pipe(Effect.andThen(Deferred.await(signal)), Effect.asVoid),
-              })
+              return killAndWait(command, proc, lifecycle, sig, opts?.forceKillAfter)
             },
             unref: Effect.sync(() => {
               if (ref) {

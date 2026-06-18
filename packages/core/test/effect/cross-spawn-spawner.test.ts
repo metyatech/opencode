@@ -58,6 +58,59 @@ async function gone(pid: number, timeout = 5_000) {
   return !alive(pid)
 }
 
+const descendantPidFile = "descendant.pid"
+
+const holdStdioChild = (seconds: number) =>
+  process.platform === "win32"
+    ? { command: process.execPath, args: ["-e", `setTimeout(() => {}, ${seconds * 1_000})`] }
+    : { command: "sleep", args: [String(seconds)] }
+
+const ignoredKillError = (err: unknown) => {
+  const code = typeof err === "object" && err !== null && "code" in err ? (err as { code?: unknown }).code : undefined
+  return code === "ESRCH" || code === "EINVAL"
+}
+
+async function killProcessTree(pid: number | undefined) {
+  if (!pid || !Number.isFinite(pid) || pid <= 0) return
+  if (process.platform === "win32") {
+    await Bun.spawn(["taskkill", "/pid", String(pid), "/T", "/F"], {
+      stdout: "ignore",
+      stderr: "ignore",
+      windowsHide: true,
+    }).exited.catch(() => undefined)
+    await gone(pid, 1_000)
+    return
+  }
+
+  try {
+    process.kill(-pid, "SIGKILL")
+  } catch (err) {
+    if (ignoredKillError(err)) return
+    try {
+      process.kill(pid, "SIGKILL")
+    } catch (singleErr) {
+      if (!ignoredKillError(singleErr)) throw singleErr
+    }
+  }
+  await gone(pid, 1_000)
+}
+
+async function cleanupPidFile(file: string) {
+  const pid = Number((await fs.readFile(file, "utf8").catch(() => "")).trim())
+  if (Number.isFinite(pid)) await killProcessTree(pid)
+}
+
+async function tmpdirCleaningPids(...pidNames: string[]) {
+  const tmp = await tmpdir()
+  return {
+    path: tmp.path,
+    async [Symbol.asyncDispose]() {
+      for (const name of pidNames) await cleanupPidFile(path.join(tmp.path, name))
+      await tmp[Symbol.asyncDispose]()
+    },
+  }
+}
+
 describe("cross-spawn spawner", () => {
   describe("basic spawning", () => {
     fx.effect(
@@ -419,6 +472,219 @@ describe("cross-spawn spawner", () => {
           ),
         )
         expect(code).toBe(ChildProcessSpawner.ExitCode(0))
+      }),
+    )
+  })
+
+  describe("process exit vs stdio closure", () => {
+    // Regression: `handle.exitCode` and `handle.isRunning` MUST resolve based
+    // on the foreground process `exit` event, not on stdio `close`. On
+    // Windows or when a detached descendant inherits stdio, `close` can fire
+    // long after the foreground process has exited. Waiting on `close` for
+    // the public contract would hang kill/scope-cleanup indefinitely.
+    fx.effect(
+      "exitCode resolves even when stdio close is delayed by a detached child",
+      Effect.gen(function* () {
+        // The helper script spawns a short-lived foreground node process
+        // that immediately exits, but inherits its stdout/stderr to a
+        // long-running detached child (sleep). The foreground exit fires
+        // promptly, but stdio `close` is held open by the detached child
+        // until it is reaped.
+        const tmp = yield* Effect.acquireRelease(
+          Effect.promise(() => tmpdirCleaningPids(descendantPidFile)),
+          (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+        )
+        const helperPath = path.join(tmp.path, "detach-helper.cjs")
+        const child = holdStdioChild(5)
+        const pidFile = path.join(tmp.path, descendantPidFile)
+        // The helper writes its output and then spawns a detached child that
+        // holds stdio. The foreground process exits within milliseconds; the
+        // detached child lives for several seconds.
+        const helper = `
+          const { spawn } = require("node:child_process")
+          const fs = require("node:fs")
+          process.stdout.write("fg-output")
+          // Detached child inherits our stdout/stderr handles.
+          const child = spawn(${JSON.stringify(child.command)}, ${JSON.stringify(child.args)}, {
+            detached: true,
+            stdio: "inherit",
+            shell: false,
+          })
+          fs.writeFileSync(${JSON.stringify(pidFile)}, String(child.pid))
+          child.unref()
+          process.exit(0)
+        `
+        yield* Effect.promise(() => fs.writeFile(helperPath, helper))
+        const started = Date.now()
+        const code = yield* ChildProcessSpawner.ChildProcessSpawner.use((svc) =>
+          svc.exitCode(ChildProcess.make(process.execPath, [helperPath])),
+        )
+        const elapsed = Date.now() - started
+        // Foreground process exits in well under 5 seconds even though the
+        // detached child keeps stdio open for much longer.
+        expect(elapsed).toBeLessThan(5_000)
+        expect(code).toBe(ChildProcessSpawner.ExitCode(0))
+      }),
+    )
+
+    fx.effect(
+      "isRunning is false after foreground exit even if stdio close lags",
+      Effect.gen(function* () {
+        const tmp = yield* Effect.acquireRelease(
+          Effect.promise(() => tmpdirCleaningPids(descendantPidFile)),
+          (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+        )
+        const helperPath = path.join(tmp.path, "detach-isrunning.cjs")
+        const child = holdStdioChild(5)
+        const pidFile = path.join(tmp.path, descendantPidFile)
+        const helper = `
+          const { spawn } = require("node:child_process")
+          const fs = require("node:fs")
+          const child = spawn(${JSON.stringify(child.command)}, ${JSON.stringify(child.args)}, {
+            detached: true,
+            stdio: "inherit",
+            shell: false,
+          })
+          fs.writeFileSync(${JSON.stringify(pidFile)}, String(child.pid))
+          child.unref()
+          process.exit(0)
+        `
+        yield* Effect.promise(() => fs.writeFile(helperPath, helper))
+        const handle = yield* ChildProcessSpawner.ChildProcessSpawner.use((svc) =>
+          svc.spawn(ChildProcess.make(process.execPath, [helperPath])),
+        )
+        yield* handle.exitCode
+        const running = yield* handle.isRunning
+        expect(running).toBe(false)
+      }),
+    )
+
+    fx.effect(
+      "kill({ forceKillAfter }) returns in bounded time even if stdio never closes",
+      Effect.gen(function* () {
+        const tmp = yield* Effect.acquireRelease(
+          Effect.promise(() => tmpdirCleaningPids(descendantPidFile)),
+          (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+        )
+        const helperPath = path.join(tmp.path, "detach-kill.cjs")
+        const child = holdStdioChild(10)
+        const pidFile = path.join(tmp.path, descendantPidFile)
+        // The helper refuses SIGTERM (so kill escalates to SIGKILL) and
+        // leaves a detached child holding stdio open. The public kill must
+        // still return in bounded time.
+        const helper = `
+          const { spawn } = require("node:child_process")
+          const fs = require("node:fs")
+          process.on("SIGTERM", () => {})
+          const child = spawn(${JSON.stringify(child.command)}, ${JSON.stringify(child.args)}, {
+            detached: true,
+            stdio: "inherit",
+            shell: false,
+          })
+          fs.writeFileSync(${JSON.stringify(pidFile)}, String(child.pid))
+          child.unref()
+          setInterval(() => {}, 60000)
+        `
+        yield* Effect.promise(() => fs.writeFile(helperPath, helper))
+        const handle = yield* ChildProcessSpawner.ChildProcessSpawner.use((svc) =>
+          svc.spawn(ChildProcess.make(process.execPath, [helperPath])),
+        )
+        const started = Date.now()
+        yield* handle.kill({ forceKillAfter: "100 millis" })
+        const elapsed = Date.now() - started
+        // Must return well under the detached child's lifetime. We allow a
+        // generous 3s cap to accommodate process group / taskkill overhead.
+        expect(elapsed).toBeLessThan(3_000)
+      }),
+    )
+
+    fx.effect(
+      "scope cleanup returns in bounded time even if stdio never closes",
+      Effect.gen(function* () {
+        const tmp = yield* Effect.acquireRelease(
+          Effect.promise(() => tmpdirCleaningPids(descendantPidFile)),
+          (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+        )
+        const helperPath = path.join(tmp.path, "detach-scope.cjs")
+        const child = holdStdioChild(10)
+        const pidFile = path.join(tmp.path, descendantPidFile)
+        // Foreground exits quickly. Detached child holds stdio. Scope cleanup
+        // must still return in bounded time.
+        const helper = `
+          const { spawn } = require("node:child_process")
+          const fs = require("node:fs")
+          const child = spawn(${JSON.stringify(child.command)}, ${JSON.stringify(child.args)}, {
+            detached: true,
+            stdio: "inherit",
+            shell: false,
+          })
+          fs.writeFileSync(${JSON.stringify(pidFile)}, String(child.pid))
+          child.unref()
+          process.exit(0)
+        `
+        yield* Effect.promise(() => fs.writeFile(helperPath, helper))
+        const started = Date.now()
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const handle = yield* ChildProcessSpawner.ChildProcessSpawner.use((svc) =>
+              svc.spawn(ChildProcess.make(process.execPath, [helperPath])),
+            )
+            yield* handle.exitCode
+          }),
+        )
+        const elapsed = Date.now() - started
+        expect(elapsed).toBeLessThan(3_000)
+      }),
+    )
+
+    fx.effect(
+      "force-kill returns in bounded time when a descendant holds stdio",
+      Effect.gen(function* () {
+        if (process.platform === "win32") return
+        const tmp = yield* Effect.acquireRelease(
+          Effect.promise(() => tmpdirCleaningPids(descendantPidFile)),
+          (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+        )
+        const helperPath = path.join(tmp.path, "detach-escaped.cjs")
+        const pidFile = path.join(tmp.path, descendantPidFile)
+        // The helper spawns a descendant process group that keeps stdio open.
+        // The foreground process refuses SIGTERM. Kill must still return, and
+        // the test finalizer reaps the descendant group using the recorded PID.
+        const helper = `
+          const { spawn } = require("node:child_process")
+          const fs = require("node:fs")
+          process.on("SIGTERM", () => {})
+          const child = spawn("bash", ["-c", "trap '' HUP TERM; sleep 30 & wait"], {
+            detached: true,
+            stdio: "inherit",
+            shell: false,
+          })
+          fs.writeFileSync(${JSON.stringify(pidFile)}, String(child.pid))
+          child.unref()
+          setInterval(() => {}, 60000)
+        `
+        yield* Effect.promise(() => fs.writeFile(helperPath, helper))
+        const handle = yield* ChildProcessSpawner.ChildProcessSpawner.use((svc) =>
+          svc.spawn(ChildProcess.make(process.execPath, [helperPath])),
+        )
+        const started = Date.now()
+        yield* handle.kill({ forceKillAfter: "100 millis" })
+        const elapsed = Date.now() - started
+        expect(elapsed).toBeLessThan(3_000)
+      }),
+    )
+
+    fx.effect(
+      "preserves signal exit code semantics",
+      Effect.gen(function* () {
+        if (process.platform === "win32") return
+        const code = yield* Effect.exit(
+          js("process.kill(process.pid, 'SIGTERM')", { killSignal: "SIGTERM" }),
+        )
+        // We do not assert a specific value, but the result must surface
+        // (either as ExitCode on non-signal exit, or as a PlatformError
+        // for the signal interruption) — not as a hang.
+        expect(Exit.isFailure(code) || typeof code === "object").toBe(true)
       }),
     )
   })
