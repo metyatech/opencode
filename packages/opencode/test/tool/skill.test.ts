@@ -59,7 +59,7 @@ Use this skill.
         )
 
         const registry = yield* ToolRegistry.Service
-        const agent = { name: "build", mode: "primary" as const, permission: [], options: {} }
+        const agent = { name: "build", mode: "primary" as const, modelSelection: "user" as const, permission: [], options: {} }
         const tool = (yield* registry.tools({
           providerID: "opencode" as any,
           modelID: "gpt-5" as any,
@@ -103,7 +103,7 @@ Use this skill.
         )
 
         const registry = yield* ToolRegistry.Service
-        const agent = { name: "build", mode: "primary" as const, permission: [], options: {} }
+        const agent = { name: "build", mode: "primary" as const, modelSelection: "user" as const, permission: [], options: {} }
         const tool = (yield* registry.tools({
           providerID: "opencode" as any,
           modelID: "gpt-5" as any,
