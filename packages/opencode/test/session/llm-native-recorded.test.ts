@@ -375,6 +375,7 @@ const driveToolLoop = (scenario: RecordedScenario) =>
     const agent = {
       name: "test",
       mode: "primary",
+      modelSelection: "user",
       prompt: "Answer using tools when appropriate.",
       options: {},
       permission: [{ permission: "*", pattern: "*", action: "allow" }],

@@ -95,6 +95,7 @@ function agent(): Agent.Info {
   return {
     name: "build",
     mode: "primary",
+    modelSelection: "user",
     options: {},
     permission: [{ permission: "*", pattern: "*", action: "allow" }],
   }

@@ -719,6 +719,7 @@ describe("session.llm.stream", () => {
         const agent = {
           name: "test",
           mode: "primary",
+          modelSelection: "user",
           options: {},
           permission: [{ permission: "*", pattern: "*", action: "allow" }],
           temperature: 0.4,
@@ -793,6 +794,7 @@ describe("session.llm.stream", () => {
         const agent = {
           name: "test",
           mode: "primary",
+          modelSelection: "user",
           options: {},
           permission: [{ permission: "*", pattern: "*", action: "allow" }],
         } satisfies Agent.Info
@@ -861,6 +863,7 @@ describe("session.llm.stream", () => {
         const agent = {
           name: "test",
           mode: "primary",
+          modelSelection: "user",
           options: {},
           permission: [{ permission: "question", pattern: "*", action: "deny" }],
         } satisfies Agent.Info
@@ -963,6 +966,7 @@ describe("session.llm.stream", () => {
         const agent = {
           name: "test",
           mode: "primary",
+          modelSelection: "user",
           options: {},
           permission: [{ permission: "*", pattern: "*", action: "allow" }],
           temperature: 0.2,
@@ -1068,6 +1072,7 @@ describe("session.llm.stream", () => {
         const agent = {
           name: "test",
           mode: "primary",
+          modelSelection: "user",
           options: {},
           permission: [{ permission: "*", pattern: "*", action: "allow" }],
         } satisfies Agent.Info
@@ -1138,6 +1143,7 @@ describe("session.llm.stream", () => {
         const agent = {
           name: "test",
           mode: "primary",
+          modelSelection: "user",
           options: {},
           permission: [{ permission: "*", pattern: "*", action: "allow" }],
           temperature: 0.2,
@@ -1222,6 +1228,7 @@ describe("session.llm.stream", () => {
         const agent = {
           name: "test",
           mode: "primary",
+          modelSelection: "user",
           options: {},
           permission: [{ permission: "*", pattern: "*", action: "allow" }],
         } satisfies Agent.Info
@@ -1310,6 +1317,7 @@ describe("session.llm.stream", () => {
         const agent = {
           name: "test",
           mode: "primary",
+          modelSelection: "user",
           options: {},
           permission: [{ permission: "*", pattern: "*", action: "allow" }],
         } satisfies Agent.Info
@@ -1436,6 +1444,7 @@ describe("session.llm.stream", () => {
         const agent = {
           name: "test",
           mode: "primary",
+          modelSelection: "user",
           options: {},
           permission: [{ permission: "*", pattern: "*", action: "allow" }],
         } satisfies Agent.Info
@@ -1526,6 +1535,7 @@ describe("session.llm.stream", () => {
         const agent = {
           name: "test",
           mode: "primary",
+          modelSelection: "user",
           options: {},
           permission: [{ permission: "*", pattern: "*", action: "allow" }],
           temperature: 0.4,
@@ -1620,6 +1630,7 @@ describe("session.llm.stream", () => {
         const agent = {
           name: "test",
           mode: "primary",
+          modelSelection: "user",
           options: {},
           permission: [{ permission: "*", pattern: "*", action: "allow" }],
         } satisfies Agent.Info
@@ -1819,6 +1830,7 @@ describe("session.llm.stream", () => {
         const agent = {
           name: "test",
           mode: "primary",
+          modelSelection: "user",
           options: {},
           permission: [{ permission: "*", pattern: "*", action: "allow" }],
           temperature: 0.3,
