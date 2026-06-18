@@ -37,6 +37,7 @@ import { PtyTicket } from "@/pty/ticket"
 import { Question } from "@/question"
 import { Session } from "@/session/session"
 import { SessionCompaction } from "@/session/compaction"
+import { SessionProcessor } from "@/session/processor"
 import { SessionPrompt } from "@/session/prompt"
 import { SessionRetryExact } from "@/session/retry-exact"
 import { LLM } from "@/session/llm"
@@ -220,6 +221,7 @@ export function createRoutes(
       RuntimeFlags.defaultLayer,
       Session.defaultLayer,
       SessionCompaction.defaultLayer,
+      SessionProcessor.defaultLayer,
       SessionPrompt.defaultLayer,
       SessionRevert.defaultLayer,
       SessionRetryExact.defaultLayer,

@@ -32,11 +32,7 @@ import { SyncEvent } from "@/sync"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { LLMEvent, Usage } from "@opencode-ai/llm"
-import {
-  isOverflow as rawIsOverflow,
-  tokenTotal as rawTokenTotal,
-  usage as rawUsage,
-} from "../../src/session/overflow"
+import { isOverflow as rawIsOverflow, tokenTotal as rawTokenTotal, usage as rawUsage } from "../../src/session/overflow"
 
 void Log.init({ print: false })
 
@@ -212,6 +208,7 @@ function fake(
     updateToolCall: Effect.fn("TestSessionProcessor.updateToolCall")(() => Effect.succeed(undefined)),
     completeToolCall: Effect.fn("TestSessionProcessor.completeToolCall")(() => Effect.void),
     process: Effect.fn("TestSessionProcessor.process")(() => Effect.succeed(result)),
+    processPrepared: Effect.fn("TestSessionProcessor.processPrepared")(() => Effect.succeed(result)),
   } satisfies SessionProcessorModule.SessionProcessor.Handle
 }
 
@@ -1296,9 +1293,7 @@ describe("session.compaction.process", () => {
       const msgs = yield* ssn.messages({ sessionID: session.id })
       const parent = msgs.at(-1)?.info.id
       expect(parent).toBeTruthy()
-      const stalePart = msgs
-        .at(-1)
-        ?.parts.find((item): item is MessageV2.CompactionPart => item.type === "compaction")
+      const stalePart = msgs.at(-1)?.parts.find((item): item is MessageV2.CompactionPart => item.type === "compaction")
       expect(stalePart?.type).toBe("compaction")
       yield* ssn.updatePart({ ...stalePart!, tail_start_id: keep.id })
       const staleMsgs = yield* ssn.messages({ sessionID: session.id })

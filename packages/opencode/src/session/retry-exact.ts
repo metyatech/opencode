@@ -1,4 +1,4 @@
-import { Context, Effect, Layer, Schema } from "effect"
+import { Context, Effect, Layer, Schema, Scope } from "effect"
 import * as Stream from "effect/Stream"
 import { Bus } from "@/bus"
 import { BusEvent } from "@/bus/bus-event"
@@ -10,6 +10,9 @@ import { InstanceState } from "@/effect/instance-state"
 import { SessionID, MessageID } from "@/session/schema"
 import { SessionRunState } from "./run-state"
 import { SessionStatus } from "./status"
+import { Auth } from "@/auth"
+import { Provider } from "@/provider/provider"
+import { MessageV2 } from "./message-v2"
 
 // Rejection reasons. These are the values the public `canRetry` returns
 // and the values the HTTP layer surfaces to the caller.
@@ -75,20 +78,36 @@ export type ExactReplayPayload = Schema.Schema.Type<typeof ExactReplayPayload>
 
 export const ExactReplayEvent = BusEvent.define("session.exactReplay", ExactReplayPayload)
 
-export type RetryExactStreamOutcome =
+/**
+ * Result of an atomic claim attempt. The HTTP handler calls `claim`
+ * after a successful `SessionRunState.ensureRunning` block; the
+ * busy-ness check inside the eligibility gate observes the claim and
+ * prevents two simultaneous exact replays.
+ */
+export type ClaimOutcome =
+  | { readonly accepted: true; readonly prepared: LLMInvocation.PreparedInvocation }
   | RetryExactRejection
-  | RetryExactAccepted
-  | (RetryExactAccepted & { readonly stream: Stream.Stream<unknown, never> })
 
 export interface Interface {
+  /**
+   * Pure decision: is the prepared invocation eligible for an exact
+   * replay? Performs the cache lookup, TTL check, provider/model
+   * comparison, variant comparison, session check, and status / busy
+   * check. Does NOT check the messageID. Does NOT claim the runner.
+   */
   readonly canRetry: (input: RetryExactInput) => Effect.Effect<RetryExactOutcome, never>
-  readonly run: (input: RetryExactInput, abort: AbortSignal) => Effect.Effect<RetryExactStreamOutcome, never>
+  /**
+   * Atomic claim: full eligibility check + return the
+   * `PreparedInvocation` to drive. The HTTP layer MUST wrap this in
+   * `SessionRunState.ensureRunning` so the busy-ness check observes
+   * the claim. The messageID check is enforced here: a caller-supplied
+   * `messageID` that does not match the prepared invocation's
+   * userID is rejected as `request-not-latest`.
+   */
+  readonly claim: (input: RetryExactInput) => Effect.Effect<ClaimOutcome, never>
   // Internal hooks used by the processor. Not part of the public surface.
   readonly publish: (inv: LLMInvocation.PreparedInvocation) => Effect.Effect<void>
-  readonly invalidate: (
-    sessionID: SessionID,
-    reason: LLMInvocationCache.InvalidReason,
-  ) => Effect.Effect<void>
+  readonly invalidate: (sessionID: SessionID, reason: LLMInvocationCache.InvalidReason) => Effect.Effect<void>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionRetryExact") {}
@@ -96,11 +115,7 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/Se
 const live: Layer.Layer<
   Service,
   never,
-  | LLM.Service
-  | Session.Service
-  | SessionStatus.Service
-  | SessionRunState.Service
-  | Bus.Service
+  LLM.Service | Session.Service | SessionStatus.Service | SessionRunState.Service | Bus.Service
 > = Layer.effect(
   Service,
   Effect.gen(function* () {
@@ -129,10 +144,7 @@ const live: Layer.Layer<
         yield* LLMInvocationCache.publish(state, inv)
       })
 
-    const invalidate = (
-      sessionID: SessionID,
-      reason: LLMInvocationCache.InvalidReason,
-    ): Effect.Effect<void> =>
+    const invalidate = (sessionID: SessionID, reason: LLMInvocationCache.InvalidReason): Effect.Effect<void> =>
       Effect.gen(function* () {
         const state = yield* getCache()
         yield* LLMInvocationCache.invalidate(state, sessionID, reason)
@@ -148,11 +160,7 @@ const live: Layer.Layer<
         : {}
     }
 
-    // --- canRetry (pure decision) ------------------------------------------
-    // Returns either an `accepted` outcome (carrying the cached invocation
-    // and its fingerprint) or a typed rejection. No HTTP traffic happens
-    // here — `run` is the action side.
-    const canRetry = Effect.fn("SessionRetryExact.canRetry")(function* (input: RetryExactInput) {
+    const checkEligibility = Effect.fn("SessionRetryExact.checkEligibility")(function* (input: RetryExactInput) {
       const state = yield* getCache()
       const now = Date.now()
       const inv = LLMInvocationCache.peek(state, input.sessionID)
@@ -195,9 +203,10 @@ const live: Layer.Layer<
       // — it succeeds if the session is idle, fails with `BusyError`
       // otherwise. We don't want to fail `canRetry` if the runner is
       // idle, so we catch the busy case and treat it as a rejection.
-      const busy = yield* runStateSvc
-        .assertNotBusy(input.sessionID)
-        .pipe(Effect.map((): boolean => false), Effect.orElseSucceed((): boolean => true))
+      const busy = yield* runStateSvc.assertNotBusy(input.sessionID).pipe(
+        Effect.map((): boolean => false),
+        Effect.orElseSucceed((): boolean => true),
+      )
       if (busy) {
         return { reason: "retry-already-running" as const, ...fingerprintOf(state, input.sessionID) }
       }
@@ -206,47 +215,37 @@ const live: Layer.Layer<
         accepted: true as const,
         fingerprint: inv.fingerprint,
         ...(inv.promptCacheKey ? { promptCacheKey: inv.promptCacheKey } : {}),
-      }
+      } as RetryExactOutcome
     })
 
-    // --- run (action) ------------------------------------------------------
-    // On success, replays the prepared invocation's stream. Emits a
-    // `session.exactReplay` event on the bus and invalidates the cache
-    // after the attempt finishes.
-    const run: Interface["run"] = Effect.fn("SessionRetryExact.run")(function* (
-      input: RetryExactInput,
-      abort: AbortSignal,
-    ) {
-      const outcome: RetryExactOutcome = yield* canRetry(input)
+    // --- canRetry (pure decision) ------------------------------------------
+    // Public contract for `canRetry`. Returns either an `accepted` outcome
+    // (carrying the fingerprint) or a typed rejection. No HTTP traffic
+    // happens here.
+    const canRetry = Effect.fn("SessionRetryExact.canRetry")(function* (input: RetryExactInput) {
+      return yield* checkEligibility(input)
+    })
+
+    // --- claim (atomic) ----------------------------------------------------
+    // Full eligibility check + return the `PreparedInvocation`. The HTTP
+    // layer MUST wrap this in `SessionRunState.ensureRunning` so the
+    // busy-ness check observes the claim. The messageID check is
+    // enforced here: a caller-supplied `messageID` that does not match
+    // the prepared invocation's `userID` is rejected as
+    // `request-not-latest`.
+    const claim = Effect.fn("SessionRetryExact.claim")(function* (input: RetryExactInput) {
+      const outcome = yield* checkEligibility(input)
       if (!("accepted" in outcome)) return outcome
       const state = yield* getCache()
       const inv = LLMInvocationCache.peek(state, input.sessionID)
-      if (!inv) {
-        return { reason: "no-prepared-invocation" as const }
+      if (!inv) return { reason: "no-prepared-invocation" as const }
+      if (input.messageID !== undefined && inv.userID !== input.messageID) {
+        return { reason: "request-not-latest" as const, ...fingerprintOf(state, input.sessionID) }
       }
-      const stream = llm.streamPrepared(inv, abort)
-      // Emit a single bus event up front so observers see the replay
-      // begin. A second "finished" event is left to the processor / caller
-      // because it owns the abort lifecycle.
-      yield* bus.publish(ExactReplayEvent, {
-        sessionID: input.sessionID,
-        ...(input.messageID ? { messageID: input.messageID } : {}),
-        providerID: inv.provider.providerID,
-        modelID: inv.provider.modelID,
-        ...(inv.provider.variant ? { variant: inv.provider.variant } : {}),
-        fingerprint: inv.fingerprint,
-        ...(inv.promptCacheKey ? { promptCacheKey: inv.promptCacheKey } : {}),
-        attempt: 1,
-      })
-      return {
-        accepted: true as const,
-        fingerprint: inv.fingerprint,
-        ...(inv.promptCacheKey ? { promptCacheKey: inv.promptCacheKey } : {}),
-        stream,
-      }
+      return { accepted: true as const, prepared: inv }
     })
 
-    return Service.of({ canRetry, run, publish, invalidate })
+    return Service.of({ canRetry, claim, publish, invalidate })
   }),
 )
 

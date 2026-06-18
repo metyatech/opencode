@@ -6,6 +6,8 @@ import * as Session from "./session"
 import { MessageV2 } from "./message-v2"
 import { SessionID } from "./schema"
 import { SessionStatus } from "./status"
+import { Auth } from "@/auth"
+import { Provider } from "@/provider/provider"
 
 export interface Interface {
   readonly assertNotBusy: (sessionID: SessionID) => Effect.Effect<void, Session.BusyError>
@@ -13,12 +15,12 @@ export interface Interface {
   readonly ensureRunning: (
     sessionID: SessionID,
     onInterrupt: Effect.Effect<MessageV2.WithParts>,
-    work: Effect.Effect<MessageV2.WithParts>,
+    work: Effect.Effect<MessageV2.WithParts, Auth.AuthError | Provider.ModelNotFoundError, Scope.Scope>,
   ) => Effect.Effect<MessageV2.WithParts>
   readonly startShell: (
     sessionID: SessionID,
     onInterrupt: Effect.Effect<MessageV2.WithParts>,
-    work: Effect.Effect<MessageV2.WithParts>,
+    work: Effect.Effect<MessageV2.WithParts, Auth.AuthError | Provider.ModelNotFoundError, Scope.Scope>,
     ready?: Latch.Latch,
   ) => Effect.Effect<MessageV2.WithParts, Session.BusyError>
 }
@@ -95,15 +97,20 @@ export const layer = Layer.effect(
     const startShell = Effect.fn("SessionRunState.startShell")(function* (
       sessionID: SessionID,
       onInterrupt: Effect.Effect<MessageV2.WithParts>,
-      work: Effect.Effect<MessageV2.WithParts>,
+      work: Effect.Effect<MessageV2.WithParts, Auth.AuthError | Provider.ModelNotFoundError, Scope.Scope>,
       ready?: Latch.Latch,
     ) {
       return yield* (yield* runner(sessionID, onInterrupt))
-        .startShell(work, ready)
+        .startShell(work as Effect.Effect<MessageV2.WithParts>, ready)
         .pipe(Effect.catchTag("RunnerBusy", () => Effect.fail(busyError(sessionID))))
     })
 
-    return Service.of({ assertNotBusy, cancel, ensureRunning, startShell })
+    return Service.of({
+      assertNotBusy,
+      cancel,
+      ensureRunning: ensureRunning as unknown as Interface["ensureRunning"],
+      startShell: startShell as unknown as Interface["startShell"],
+    })
   }),
 )
 
