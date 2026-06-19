@@ -157,8 +157,12 @@ export interface Interface {
 }
 
 export interface StreamMethod {
-  (request: LLMRequest): Stream.Stream<LLMEvent, LLMError>
+  (request: LLMRequest, options?: StreamRequestOptions): Stream.Stream<LLMEvent, LLMError>
   <T extends Tools>(options: ToolRuntime.RunOptions<T>): Stream.Stream<LLMEvent, LLMError>
+}
+
+export interface StreamRequestOptions {
+  readonly abortSignal?: AbortSignal
 }
 
 export interface GenerateMethod {
@@ -368,21 +372,50 @@ const prepareWith = Effect.fn("LLMClient.prepare")(function* (request: LLMReques
   })
 })
 
-const streamRequestWith = (runtime: TransportRuntime) => (request: LLMRequest) =>
-  Stream.unwrap(
-    Effect.gen(function* () {
-      const compiled = yield* compile(request)
-      return compiled.route.streamPrepared(compiled.prepared, compiled.request, runtime)
-    }),
-  )
+const abortToEffect = (signal: AbortSignal): Effect.Effect<void> =>
+  Effect.callback<void>((resume) => {
+    if (signal.aborted) {
+      resume(Effect.void)
+      return
+    }
+    const onAbort = () => resume(Effect.void)
+    signal.addEventListener("abort", onAbort, { once: true })
+    return Effect.sync(() => signal.removeEventListener("abort", onAbort))
+  })
+
+const interruptOnAbort = <A, E, R>(stream: Stream.Stream<A, E, R>, signal: AbortSignal | undefined) =>
+  signal ? stream.pipe(Stream.interruptWhen(abortToEffect(signal))) : stream
+
+const streamRequestWith =
+  (runtime: TransportRuntime) =>
+  (request: LLMRequest, options?: StreamRequestOptions) =>
+    interruptOnAbort(
+      Stream.unwrap(
+        Effect.gen(function* () {
+          const compiled = yield* compile(request)
+          return compiled.route.streamPrepared(compiled.prepared, compiled.request, runtime)
+        }),
+      ),
+      options?.abortSignal,
+    )
 
 const isToolRunOptions = (input: LLMRequest | ToolRuntime.RunOptions<Tools>): input is ToolRuntime.RunOptions<Tools> =>
   "request" in input && "tools" in input
 
-const streamWith = (streamRequest: (request: LLMRequest) => Stream.Stream<LLMEvent, LLMError>): StreamMethod =>
-  ((input: LLMRequest | ToolRuntime.RunOptions<Tools>) => {
-    if (isToolRunOptions(input)) return ToolRuntime.stream({ ...input, stream: streamRequest })
-    return streamRequest(input)
+const streamWith = (
+  streamRequest: (request: LLMRequest, options?: StreamRequestOptions) => Stream.Stream<LLMEvent, LLMError>,
+): StreamMethod =>
+  ((input: LLMRequest | ToolRuntime.RunOptions<Tools>, options?: StreamRequestOptions) => {
+    if (isToolRunOptions(input))
+      return interruptOnAbort(
+        ToolRuntime.stream({
+          ...input,
+          stream: (request, requestOptions) =>
+            streamRequest(request, { abortSignal: requestOptions?.abortSignal ?? input.abortSignal }),
+        }),
+        input.abortSignal,
+      )
+    return streamRequest(input, options)
   }) as StreamMethod
 
 const generateWith = (stream: Interface["stream"]) =>
@@ -404,12 +437,12 @@ const generateWith = (stream: Interface["stream"]) =>
 export const prepare = <Body = unknown>(request: LLMRequest) =>
   prepareWith(request) as Effect.Effect<PreparedRequestOf<Body>, LLMError>
 
-export function stream(request: LLMRequest): Stream.Stream<LLMEvent, LLMError>
+export function stream(request: LLMRequest, options?: StreamRequestOptions): Stream.Stream<LLMEvent, LLMError>
 export function stream<T extends Tools>(options: ToolRuntime.RunOptions<T>): Stream.Stream<LLMEvent, LLMError>
-export function stream(input: LLMRequest | ToolRuntime.RunOptions<Tools>) {
+export function stream(input: LLMRequest | ToolRuntime.RunOptions<Tools>, options?: StreamRequestOptions) {
   return Stream.unwrap(
     Effect.gen(function* () {
-      return (yield* Service).stream(input as never)
+      return (yield* Service).stream(input as never, options as never)
     }),
   )
 }

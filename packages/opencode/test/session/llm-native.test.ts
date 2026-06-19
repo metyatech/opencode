@@ -2,13 +2,13 @@ import { describe, expect, test } from "bun:test"
 import { ToolFailure } from "@opencode-ai/llm"
 import { LLMClient, RequestExecutor, WebSocketExecutor } from "@opencode-ai/llm/route"
 import { jsonSchema, tool, type ModelMessage, type Tool } from "ai"
-import { Effect, Layer, Stream } from "effect"
+import { Effect, Fiber, Layer, Stream } from "effect"
 import { LLMNative } from "@/session/llm/native-request"
 import { LLMNativeRuntime } from "@/session/llm/native-runtime"
 import type { Provider } from "@/provider/provider"
 import { ModelID, ProviderID } from "@/provider/schema"
 import { OAUTH_DUMMY_KEY } from "@/auth"
-import { testEffect } from "../lib/effect"
+import { awaitWithTimeout, testEffect } from "../lib/effect"
 
 const baseModel: Provider.Model = {
   id: ModelID.make("gpt-5-mini"),
@@ -693,6 +693,55 @@ describe("session.llm-native.request", () => {
           expect.objectContaining({ type: "finish" }),
         ]),
       )
+    }),
+  )
+
+  it.live("passes the attempt AbortSignal through the native LLMClient stream to provider fetch", () =>
+    Effect.gen(function* () {
+      let markStarted: () => void = () => {}
+      let markAborted: () => void = () => {}
+      const started = new Promise<void>((resolve) => {
+        markStarted = resolve
+      })
+      const aborted = new Promise<void>((resolve) => {
+        markAborted = resolve
+      })
+      const ctrl = new AbortController()
+      const customFetch = Object.assign(
+        (input: Parameters<typeof fetch>[0], init: Parameters<typeof fetch>[1]) => {
+          const request = input instanceof Request ? input : new Request(input, init)
+          markStarted()
+          return new Promise<Response>((_, reject) => {
+            const onAbort = () => {
+              markAborted()
+              reject(new DOMException("Aborted", "AbortError"))
+            }
+            if (request.signal.aborted) onAbort()
+            else request.signal.addEventListener("abort", onAbort, { once: true })
+          })
+        },
+        { preconnect: () => undefined },
+      ) satisfies typeof fetch
+
+      const llmClient = yield* LLMClient.Service
+      const native = LLMNativeRuntime.stream({
+        model: baseModel,
+        provider: { ...providerInfo, options: { apiKey: OAUTH_DUMMY_KEY, fetch: customFetch } },
+        auth: { type: "oauth", refresh: "refresh", access: "access", expires: Date.now() + 60_000 },
+        llmClient,
+        messages: [{ role: "user", content: "hello" }],
+        tools: {},
+        headers: {},
+        abort: ctrl.signal,
+      })
+      expect(native.type).toBe("supported")
+      if (native.type === "unsupported") throw new Error(native.reason)
+
+      const fiber = yield* Stream.runDrain(native.stream).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(Effect.promise(() => started), "provider fetch was not started")
+      ctrl.abort()
+      yield* awaitWithTimeout(Effect.promise(() => aborted), "provider fetch did not receive abort signal")
+      yield* awaitWithTimeout(Fiber.await(fiber), "native stream did not finish after abort")
     }),
   )
 })

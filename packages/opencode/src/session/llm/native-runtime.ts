@@ -143,6 +143,7 @@ export function prepare(
         .stream({
           request,
           tools,
+          abortSignal: abort,
         })
         .pipe(Stream.interruptWhen(abortToEffect(abort)))
       return fetch
