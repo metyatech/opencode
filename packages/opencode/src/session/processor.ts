@@ -7,6 +7,7 @@ import { Config } from "@/config/config"
 import { Permission } from "@/permission"
 import { Plugin } from "@/plugin"
 import { Snapshot } from "@/snapshot"
+import { Auth } from "@/auth"
 import * as Session from "./session"
 import { LLM } from "./llm"
 import { MessageV2 } from "./message-v2"
@@ -14,6 +15,7 @@ import { isOverflow } from "./overflow"
 import { PartID } from "./schema"
 import type { SessionID } from "./schema"
 import { SessionRetry } from "./retry"
+import { SessionRetryExact } from "./retry-exact"
 import { SessionStatus } from "./status"
 import { SessionSummary } from "./summary"
 import type { Provider } from "@/provider/provider"
@@ -28,6 +30,7 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import * as DateTime from "effect/DateTime"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Usage, type LLMEvent } from "@opencode-ai/llm"
+import { LLMInvocation } from "./llm/invocation"
 
 const DOOM_LOOP_THRESHOLD = 3
 const log = Log.create({ service: "session.processor" })
@@ -72,7 +75,20 @@ export interface Handle {
       attachments?: MessageV2.FilePart[]
     },
   ) => Effect.Effect<void>
-  readonly process: (streamInput: LLM.StreamInput) => Effect.Effect<Result>
+  readonly process: (
+    streamInput: LLM.StreamInput,
+  ) => Effect.Effect<Result, Auth.AuthError | Provider.ModelNotFoundError, Scope.Scope>
+  /**
+   * Replay a pre-prepared invocation through the same event-handling pipeline
+   * as `process()`. The body sent to the provider is byte-identical to the
+   * original attempt because the prepared invocation is reused verbatim;
+   * the caller does not re-derive any of the inputs (system, tools, headers,
+   * params, prompt cache key). Used by `session.retryExact` to re-issue a
+   * request that already qualifies as prompt-cache eligible.
+   */
+  readonly processPrepared: (
+    prepared: LLMInvocation.PreparedInvocation,
+  ) => Effect.Effect<Result, Auth.AuthError | Provider.ModelNotFoundError, Scope.Scope>
 }
 
 type Input = {
@@ -125,6 +141,7 @@ export const layer = Layer.effect(
     const image = yield* Image.Service
     const events = yield* EventV2Bridge.Service
     const flags = yield* RuntimeFlags.Service
+    const retryExact = yield* SessionRetryExact.Service
 
     const create = Effect.fn("SessionProcessor.create")(function* (input: Input) {
       // Pre-capture snapshot before the LLM stream starts. The AI SDK
@@ -462,6 +479,11 @@ export const layer = Layer.effect(
             if (ctx.assistantMessage.summary) {
               throw new Error(`Tool call not allowed while generating summary: ${value.name}`)
             }
+            // The first tool call invalidates the retry-exact cache: a
+            // tool side-effect may have produced state that an exact
+            // retry would miss. Subsequent retries are forced to go
+            // through the normal session path.
+            yield* retryExact.invalidate(ctx.sessionID, "tool-started")
             yield* ensureToolCall(value)
             return
 
@@ -601,6 +623,10 @@ export const layer = Layer.effect(
                 timestamp: DateTime.makeUnsafe(Date.now()),
               })
             }
+            // Recording a tool result invalidates the retry-exact cache
+            // because the assistant's surface has now diverged from the
+            // prepared invocation's view.
+            yield* retryExact.invalidate(ctx.sessionID, "tool-result")
             yield* completeToolCall(value.id, output)
             return
           }
@@ -721,6 +747,10 @@ export const layer = Layer.effect(
           }
 
           case "text-start":
+            // The first text delta invalidates the retry-exact cache:
+            // the assistant has produced visible output that a retry
+            // would duplicate.
+            yield* retryExact.invalidate(ctx.sessionID, "assistant-activity")
             if (!ctx.assistantMessage.summary) {
               // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
               if (flags.experimentalEventSystem) {
@@ -917,6 +947,73 @@ export const layer = Layer.effect(
         yield* halt(new DOMException("Aborted", "AbortError"))
       })
 
+      const drivePreparedStream = Effect.fn("SessionProcessor.drivePreparedStream")(function* (
+        prepared: LLMInvocation.PreparedInvocation,
+      ) {
+        yield* Effect.gen(function* () {
+          ctx.currentText = undefined
+          ctx.reasoningMap = {}
+          retryError = undefined
+          yield* status.set(ctx.sessionID, { type: "busy" })
+          // Per-attempt AbortController. The controller is owned by
+          // this generator and is wired into both the LLM call AND
+          // the fiber interrupt path so a consumer-level cancel reaches
+          // the in-flight request immediately.
+          const ctrl = yield* Effect.acquireRelease(
+            Effect.sync(() => new AbortController()),
+            (ctrl) => Effect.sync(() => ctrl.abort()),
+          )
+          const stream = llm.streamPrepared(prepared, ctrl.signal)
+
+          yield* stream.pipe(
+            Stream.tap((event) => handleEvent(event)),
+            Stream.takeUntil(() => ctx.needsCompaction),
+            Stream.runDrain,
+          )
+        }).pipe(
+          Effect.onInterrupt(interrupt),
+          Effect.catchCauseIf(
+            (cause) => !Cause.hasInterruptsOnly(cause),
+            (cause) => Effect.fail(Cause.squash(cause)),
+          ),
+          Effect.retry(
+            SessionRetry.policy({
+              provider: input.model.providerID,
+              parse,
+              set: (info) => {
+                retryError = info.error
+                // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
+                const event = flags.experimentalEventSystem
+                  ? events.publish(SessionEvent.Retried, {
+                      sessionID: ctx.sessionID,
+                      attempt: info.attempt,
+                      error: {
+                        message: info.message,
+                        isRetryable: true,
+                      },
+                      timestamp: DateTime.makeUnsafe(Date.now()),
+                    })
+                  : Effect.void
+                return event.pipe(
+                  Effect.andThen(
+                    status.set(ctx.sessionID, {
+                      type: "retry",
+                      attempt: info.attempt,
+                      message: info.message,
+                      action: info.action,
+                      next: info.next,
+                    }),
+                  ),
+                )
+              },
+            }),
+          ),
+          Effect.onInterrupt(interrupt),
+          Effect.catch(halt),
+          Effect.ensuring(cleanup()),
+        )
+      })
+
       const process = Effect.fn("SessionProcessor.process")(function* (streamInput: LLM.StreamInput) {
         slog.info("process")
         ctx.needsCompaction = false
@@ -924,61 +1021,36 @@ export const layer = Layer.effect(
         retryError = undefined
 
         return yield* Effect.gen(function* () {
-          yield* Effect.gen(function* () {
-            ctx.currentText = undefined
-            ctx.reasoningMap = {}
-            retryError = undefined
-            yield* status.set(ctx.sessionID, { type: "busy" })
-            const stream = llm.stream(streamInput)
+          const prepared = yield* llm.prepare(streamInput)
+          yield* retryExact.publish(prepared)
+          yield* drivePreparedStream(prepared)
+          if (ctx.needsCompaction) return "compact"
+          if (ctx.blocked || ctx.assistantMessage.error) return "stop"
+          return "continue"
+        })
+      })
 
-            yield* stream.pipe(
-              Stream.tap((event) => handleEvent(event)),
-              Stream.takeUntil(() => ctx.needsCompaction),
-              Stream.runDrain,
-            )
-          }).pipe(
-            Effect.onInterrupt(interrupt),
-            Effect.catchCauseIf(
-              (cause) => !Cause.hasInterruptsOnly(cause),
-              (cause) => Effect.fail(Cause.squash(cause)),
-            ),
-            Effect.retry(
-              SessionRetry.policy({
-                provider: input.model.providerID,
-                parse,
-                set: (info) => {
-                  retryError = info.error
-                  // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
-                  const event = flags.experimentalEventSystem
-                    ? events.publish(SessionEvent.Retried, {
-                        sessionID: ctx.sessionID,
-                        attempt: info.attempt,
-                        error: {
-                          message: info.message,
-                          isRetryable: true,
-                        },
-                        timestamp: DateTime.makeUnsafe(Date.now()),
-                      })
-                    : Effect.void
-                  return event.pipe(
-                    Effect.andThen(
-                      status.set(ctx.sessionID, {
-                        type: "retry",
-                        attempt: info.attempt,
-                        message: info.message,
-                        action: info.action,
-                        next: info.next,
-                      }),
-                    ),
-                  )
-                },
-              }),
-            ),
-            Effect.onInterrupt(interrupt),
-            Effect.catch(halt),
-            Effect.ensuring(cleanup()),
-          )
-
+      // Replay path used by `session.retryExact`. The caller (the HTTP
+      // handler) has already gated eligibility and atomically claimed the
+      // runner via `SessionRunState.ensureRunning`. The prepared invocation
+      // is the one the previous attempt published into
+      // `SessionRetryExact.publish`, so the body that hits the provider is
+      // byte-identical to the previous attempt.
+      const processPrepared = Effect.fn("SessionProcessor.processPrepared")(function* (
+        prepared: LLMInvocation.PreparedInvocation,
+      ) {
+        slog.info("processPrepared", {
+          fingerprint: prepared.fingerprint,
+          ...(prepared.promptCacheKey ? { promptCacheKey: prepared.promptCacheKey } : {}),
+        })
+        ctx.needsCompaction = false
+        ctx.shouldBreak = (yield* config.get()).experimental?.continue_loop_on_deny !== true
+        retryError = undefined
+        // The prepared invocation is already in the cache. Do NOT re-publish
+        // ? the cache must contain the original fingerprint so the next
+        // `canRetry` can still match against it.
+        return yield* Effect.gen(function* () {
+          yield* drivePreparedStream(prepared)
           if (ctx.needsCompaction) return "compact"
           if (ctx.blocked || ctx.assistantMessage.error) return "stop"
           return "continue"
@@ -993,6 +1065,7 @@ export const layer = Layer.effect(
         updateToolCall,
         completeToolCall,
         process,
+        processPrepared,
       } satisfies Handle
     })
 
@@ -1015,6 +1088,7 @@ export const defaultLayer = Layer.suspend(() =>
     Layer.provide(Config.defaultLayer),
     Layer.provide(RuntimeFlags.defaultLayer),
     Layer.provide(EventV2Bridge.defaultLayer),
+    Layer.provide(SessionRetryExact.defaultLayer),
   ),
 )
 

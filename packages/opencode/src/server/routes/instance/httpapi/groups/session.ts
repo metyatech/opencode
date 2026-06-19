@@ -5,6 +5,7 @@ import { Session } from "@/session/session"
 import { MessageV2 } from "@/session/message-v2"
 import { SessionPrompt } from "@/session/prompt"
 import { SessionRevert } from "@/session/revert"
+import { SessionRetryExact } from "@/session/retry-exact"
 import { SessionStatus } from "@/session/status"
 import { SessionSummary } from "@/session/summary"
 import { Todo } from "@/session/todo"
@@ -65,6 +66,13 @@ export const SummarizePayload = Schema.Struct({
 })
 export const PromptPayload = Schema.Struct(Struct.omit(SessionPrompt.PromptInput.fields, ["sessionID"]))
 export const RetryPayload = Schema.Struct(Struct.omit(SessionPrompt.RetryInput.fields, ["sessionID", "messageID"]))
+export const RetryExactPayload = Schema.Struct({
+  messageID: Schema.optional(MessageID),
+  expectedProviderID: Schema.String,
+  expectedModelID: Schema.String,
+  expectedVariant: Schema.optional(Schema.String),
+})
+
 export const CommandPayload = Schema.Struct(Struct.omit(SessionPrompt.CommandInput.fields, ["sessionID"]))
 export const ShellPayload = Schema.Struct(Struct.omit(SessionPrompt.ShellInput.fields, ["sessionID"]))
 export const RevertPayload = Schema.Struct(Struct.omit(SessionRevert.RevertInput.fields, ["sessionID"]))
@@ -93,6 +101,7 @@ export const SessionPaths = {
   promptAsync: `${root}/:sessionID/prompt_async`,
   retry: `${root}/:sessionID/message/:messageID/retry`,
   retryAsync: `${root}/:sessionID/message/:messageID/retry_async`,
+  retryExact: `${root}/:sessionID/retry-exact`,
   command: `${root}/:sessionID/command`,
   shell: `${root}/:sessionID/shell`,
   revert: `${root}/:sessionID/revert`,
@@ -365,6 +374,20 @@ export const SessionApi = HttpApi.make("session")
             summary: "Retry message asynchronously",
             description:
               "Retry the latest user message asynchronously with a different model or agent, reusing the existing prompt parts instead of creating a new user turn.",
+          }),
+        ),
+        HttpApiEndpoint.post("retryExact", SessionPaths.retryExact, {
+          params: { sessionID: SessionID },
+          query: WorkspaceRoutingQuery,
+          payload: RetryExactPayload,
+          success: described(SessionRetryExact.RetryExactResult, "Exact retry stream started"),
+          error: [HttpApiError.BadRequest, ApiNotFoundError],
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "session.retryExact",
+            summary: "Retry exact",
+            description:
+              "Replay the latest prepared LLM invocation without rebuilding the request. Returns a typed rejection if the prepared invocation is no longer eligible (stale model, new user message, in-flight retry, etc.).",
           }),
         ),
         HttpApiEndpoint.post("command", SessionPaths.command, {

@@ -8,6 +8,7 @@ import { Session } from "@/session/session"
 import { SessionCompaction } from "@/session/compaction"
 import { MessageV2 } from "@/session/message-v2"
 import { SessionPrompt } from "@/session/prompt"
+import { SessionRetryExactDispatch } from "@/session/retry-exact-dispatch"
 import { SessionRevert } from "@/session/revert"
 import { SessionRunState } from "@/session/run-state"
 import { SessionStatus } from "@/session/status"
@@ -29,6 +30,7 @@ import {
   MessagesQuery,
   PermissionResponsePayload,
   PromptPayload,
+  RetryExactPayload,
   RetryPayload,
   RevertPayload,
   ShellPayload,
@@ -79,6 +81,8 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
     const requireSession = Effect.fn("SessionHttpApi.requireSession")(function* (sessionID: SessionID) {
       return yield* SessionError.mapStorageNotFound(session.get(sessionID))
     })
+
+    const retryExactDispatch = yield* SessionRetryExactDispatch.Service
 
     const get = Effect.fn("SessionHttpApi.get")(function* (ctx: { params: { sessionID: SessionID } }) {
       return yield* requireSession(ctx.params.sessionID)
@@ -354,6 +358,24 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       return HttpApiSchema.NoContent.make()
     })
 
+    const retryExact = Effect.fn("SessionHttpApi.retryExact")(function* (ctx: {
+      params: { sessionID: SessionID }
+      payload: typeof RetryExactPayload.Type
+    }) {
+      yield* requireSession(ctx.params.sessionID)
+      // Eligibility, the atomic per-session runner claim, assistant-message
+      // creation, processor wiring, and release cleanup all live inside
+      // `dispatch`. The handler just surfaces the typed accepted/rejected
+      // union in the HTTP 200 body.
+      return yield* retryExactDispatch.dispatch({
+        sessionID: ctx.params.sessionID,
+        ...(ctx.payload.messageID ? { messageID: ctx.payload.messageID } : {}),
+        expectedProviderID: ctx.payload.expectedProviderID,
+        expectedModelID: ctx.payload.expectedModelID,
+        ...(ctx.payload.expectedVariant ? { expectedVariant: ctx.payload.expectedVariant } : {}),
+      })
+    })
+
     const command = Effect.fn("SessionHttpApi.command")(function* (ctx: {
       params: { sessionID: SessionID }
       payload: typeof CommandPayload.Type
@@ -458,6 +480,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       .handle("promptAsync", promptAsync)
       .handle("retry", retry)
       .handle("retryAsync", retryAsync)
+      .handle("retryExact", retryExact)
       .handle("command", command)
       .handle("shell", shell)
       .handle("revert", revert)

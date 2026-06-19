@@ -1,3 +1,4 @@
+$ bun run --conditions=browser ./src/index.ts generate
 {
   "openapi": "3.1.0",
   "info": {
@@ -6017,6 +6018,9 @@
                   "system": {
                     "type": "string"
                   },
+                  "transientSystem": {
+                    "type": "string"
+                  },
                   "variant": {
                     "type": "string"
                   },
@@ -6899,6 +6903,9 @@
                   "system": {
                     "type": "string"
                   },
+                  "transientSystem": {
+                    "type": "string"
+                  },
                   "variant": {
                     "type": "string"
                   },
@@ -6942,27 +6949,11 @@
         "operationId": "session.retry",
         "parameters": [
           {
-            "name": "directory",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "workspace",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
             "name": "sessionID",
             "in": "path",
             "schema": {
               "type": "string",
-              "pattern": "^ses.*"
+              "pattern": "^ses"
             },
             "required": true
           },
@@ -6971,9 +6962,25 @@
             "in": "path",
             "schema": {
               "type": "string",
-              "pattern": "^msg.*"
+              "pattern": "^msg"
             },
             "required": true
+          },
+          {
+            "name": "directory",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "workspace",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
           }
         ],
         "responses": {
@@ -7002,17 +7009,24 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "BadRequest | InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestError"
+                    }
+                  ]
                 }
               }
             }
           },
           "404": {
-            "description": "Not found",
+            "description": "NotFoundError",
             "content": {
               "application/json": {
                 "schema": {
@@ -7048,6 +7062,12 @@
                   },
                   "variant": {
                     "type": "string"
+                  },
+                  "system": {
+                    "type": "string"
+                  },
+                  "transientSystem": {
+                    "type": "string"
                   }
                 },
                 "required": ["model"],
@@ -7070,27 +7090,11 @@
         "operationId": "session.retry_async",
         "parameters": [
           {
-            "name": "directory",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "workspace",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
             "name": "sessionID",
             "in": "path",
             "schema": {
               "type": "string",
-              "pattern": "^ses.*"
+              "pattern": "^ses"
             },
             "required": true
           },
@@ -7099,9 +7103,25 @@
             "in": "path",
             "schema": {
               "type": "string",
-              "pattern": "^msg.*"
+              "pattern": "^msg"
             },
             "required": true
+          },
+          {
+            "name": "directory",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "workspace",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
           }
         ],
         "responses": {
@@ -7109,17 +7129,24 @@
             "description": "Retry accepted"
           },
           "400": {
-            "description": "Bad request",
+            "description": "BadRequest | InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestError"
+                    }
+                  ]
                 }
               }
             }
           },
           "404": {
-            "description": "Not found",
+            "description": "NotFoundError",
             "content": {
               "application/json": {
                 "schema": {
@@ -7155,6 +7182,12 @@
                   },
                   "variant": {
                     "type": "string"
+                  },
+                  "system": {
+                    "type": "string"
+                  },
+                  "transientSystem": {
+                    "type": "string"
                   }
                 },
                 "required": ["model"],
@@ -7167,6 +7200,169 @@
           {
             "lang": "js",
             "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.session.retry_async({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/session/{sessionID}/retry-exact": {
+      "post": {
+        "tags": ["session"],
+        "operationId": "session.retryExact",
+        "parameters": [
+          {
+            "name": "sessionID",
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "pattern": "^ses"
+            },
+            "required": true
+          },
+          {
+            "name": "directory",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "workspace",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Exact retry stream started",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "type": "object",
+                      "properties": {
+                        "accepted": {
+                          "type": "boolean",
+                          "enum": [true]
+                        },
+                        "fingerprint": {
+                          "type": "string"
+                        },
+                        "promptCacheKey": {
+                          "type": "string"
+                        }
+                      },
+                      "required": ["accepted", "fingerprint"],
+                      "additionalProperties": false
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "reason": {
+                          "type": "string",
+                          "enum": [
+                            "no-prepared-invocation",
+                            "request-not-latest",
+                            "model-mismatch",
+                            "variant-mismatch",
+                            "invocation-expired",
+                            "new-user-message",
+                            "assistant-activity-observed",
+                            "tool-side-effect-risk",
+                            "retry-already-running",
+                            "session-disposed"
+                          ]
+                        },
+                        "fingerprint": {
+                          "type": "string"
+                        },
+                        "promptCacheKey": {
+                          "type": "string"
+                        }
+                      },
+                      "required": ["reason"],
+                      "additionalProperties": false
+                    }
+                  ],
+                  "description": "Exact retry stream started"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "BadRequest | InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "NotFoundError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "RetryExactRejectedError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RetryExactRejectedError"
+                }
+              }
+            }
+          }
+        },
+        "description": "Replay the latest prepared LLM invocation without rebuilding the request. Returns a typed rejection if the prepared invocation is no longer eligible (stale model, new user message, in-flight retry, etc.).",
+        "summary": "Retry exact",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "messageID": {
+                    "type": "string",
+                    "pattern": "^msg"
+                  },
+                  "expectedProviderID": {
+                    "type": "string"
+                  },
+                  "expectedModelID": {
+                    "type": "string"
+                  },
+                  "expectedVariant": {
+                    "type": "string"
+                  }
+                },
+                "required": ["expectedProviderID", "expectedModelID"],
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.session.retryExact({\n  ...\n})"
           }
         ]
       }
@@ -10751,6 +10947,12 @@
             "$ref": "#/components/schemas/EventMessagePartDelta"
           },
           {
+            "$ref": "#/components/schemas/EventSessionStatus"
+          },
+          {
+            "$ref": "#/components/schemas/EventSessionIdle"
+          },
+          {
             "$ref": "#/components/schemas/EventPermissionAsked"
           },
           {
@@ -10775,10 +10977,7 @@
             "$ref": "#/components/schemas/EventTodoUpdated"
           },
           {
-            "$ref": "#/components/schemas/EventSessionStatus"
-          },
-          {
-            "$ref": "#/components/schemas/EventSessionIdle"
+            "$ref": "#/components/schemas/EventSessionExactReplay1"
           },
           {
             "$ref": "#/components/schemas/EventMcpToolsChanged"
@@ -11267,6 +11466,79 @@
         "required": ["id", "type", "properties"],
         "additionalProperties": false
       },
+      "SessionStatus": {
+        "anyOf": [
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": ["idle"]
+              }
+            },
+            "required": ["type"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": ["retry"]
+              },
+              "attempt": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "message": {
+                "type": "string"
+              },
+              "action": {
+                "type": "object",
+                "properties": {
+                  "reason": {
+                    "type": "string"
+                  },
+                  "provider": {
+                    "type": "string"
+                  },
+                  "title": {
+                    "type": "string"
+                  },
+                  "message": {
+                    "type": "string"
+                  },
+                  "label": {
+                    "type": "string"
+                  },
+                  "link": {
+                    "type": "string"
+                  }
+                },
+                "required": ["reason", "provider", "title", "message", "label"],
+                "additionalProperties": false
+              },
+              "next": {
+                "type": "integer",
+                "minimum": 0
+              }
+            },
+            "required": ["type", "attempt", "message", "next"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": ["busy"]
+              }
+            },
+            "required": ["type"],
+            "additionalProperties": false
+          }
+        ]
+      },
       "PermissionRequest": {
         "type": "object",
         "properties": {
@@ -11655,79 +11927,6 @@
         },
         "required": ["content", "status", "priority"],
         "additionalProperties": false
-      },
-      "SessionStatus": {
-        "anyOf": [
-          {
-            "type": "object",
-            "properties": {
-              "type": {
-                "type": "string",
-                "enum": ["idle"]
-              }
-            },
-            "required": ["type"],
-            "additionalProperties": false
-          },
-          {
-            "type": "object",
-            "properties": {
-              "type": {
-                "type": "string",
-                "enum": ["retry"]
-              },
-              "attempt": {
-                "type": "integer",
-                "minimum": 0
-              },
-              "message": {
-                "type": "string"
-              },
-              "action": {
-                "type": "object",
-                "properties": {
-                  "reason": {
-                    "type": "string"
-                  },
-                  "provider": {
-                    "type": "string"
-                  },
-                  "title": {
-                    "type": "string"
-                  },
-                  "message": {
-                    "type": "string"
-                  },
-                  "label": {
-                    "type": "string"
-                  },
-                  "link": {
-                    "type": "string"
-                  }
-                },
-                "required": ["reason", "provider", "title", "message", "label"],
-                "additionalProperties": false
-              },
-              "next": {
-                "type": "integer",
-                "minimum": 0
-              }
-            },
-            "required": ["type", "attempt", "message", "next"],
-            "additionalProperties": false
-          },
-          {
-            "type": "object",
-            "properties": {
-              "type": {
-                "type": "string",
-                "enum": ["busy"]
-              }
-            },
-            "required": ["type"],
-            "additionalProperties": false
-          }
-        ]
       },
       "Project": {
         "type": "object",
@@ -13177,6 +13376,12 @@
                 "$ref": "#/components/schemas/EventMessagePartDelta"
               },
               {
+                "$ref": "#/components/schemas/EventSessionStatus"
+              },
+              {
+                "$ref": "#/components/schemas/EventSessionIdle"
+              },
+              {
                 "$ref": "#/components/schemas/EventPermissionAsked"
               },
               {
@@ -13201,10 +13406,7 @@
                 "$ref": "#/components/schemas/EventTodoUpdated"
               },
               {
-                "$ref": "#/components/schemas/EventSessionStatus"
-              },
-              {
-                "$ref": "#/components/schemas/EventSessionIdle"
+                "$ref": "#/components/schemas/EventSessionExactReplay"
               },
               {
                 "$ref": "#/components/schemas/EventMcpToolsChanged"
@@ -13772,6 +13974,10 @@
           },
           "permission": {
             "$ref": "#/components/schemas/PermissionConfig"
+          },
+          "model_selection": {
+            "type": "string",
+            "enum": ["user", "managed"]
           }
         },
         "additionalProperties": {}
@@ -15548,6 +15754,10 @@
           "variant": {
             "type": "string"
           },
+          "modelSelection": {
+            "type": "string",
+            "enum": ["user", "managed"]
+          },
           "prompt": {
             "type": "string"
           },
@@ -15558,7 +15768,7 @@
             "type": "number"
           }
         },
-        "required": ["name", "mode", "permission", "options"],
+        "required": ["name", "mode", "permission", "modelSelection", "options"],
         "additionalProperties": false
       },
       "LSPStatus": {
@@ -16114,6 +16324,26 @@
           }
         },
         "required": ["type", "prompt", "description", "agent"],
+        "additionalProperties": false
+      },
+      "RetryExactRejectedError": {
+        "type": "object",
+        "properties": {
+          "_tag": {
+            "type": "string",
+            "enum": ["RetryExactRejectedError"]
+          },
+          "reason": {
+            "type": "string"
+          },
+          "fingerprint": {
+            "type": "string"
+          },
+          "promptCacheKey": {
+            "type": "string"
+          }
+        },
+        "required": ["_tag", "reason"],
         "additionalProperties": false
       },
       "SessionBusyError": {
@@ -18554,6 +18784,59 @@
         "required": ["id", "type", "properties"],
         "additionalProperties": false
       },
+      "EventSessionStatus": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "enum": ["session.status"]
+          },
+          "properties": {
+            "type": "object",
+            "properties": {
+              "sessionID": {
+                "type": "string",
+                "pattern": "^ses"
+              },
+              "status": {
+                "$ref": "#/components/schemas/SessionStatus"
+              }
+            },
+            "required": ["sessionID", "status"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["id", "type", "properties"],
+        "additionalProperties": false
+      },
+      "EventSessionIdle": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "enum": ["session.idle"]
+          },
+          "properties": {
+            "type": "object",
+            "properties": {
+              "sessionID": {
+                "type": "string",
+                "pattern": "^ses"
+              }
+            },
+            "required": ["sessionID"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["id", "type", "properties"],
+        "additionalProperties": false
+      },
       "EventPermissionAsked": {
         "type": "object",
         "properties": {
@@ -18651,6 +18934,33 @@
               "sessionID": {
                 "type": "string",
                 "pattern": "^ses"
+              },
+              "messageID": {
+                "type": "string",
+                "pattern": "^msg"
+              },
+              "parentID": {
+                "type": "string",
+                "pattern": "^msg"
+              },
+              "agent": {
+                "type": "string"
+              },
+              "model": {
+                "type": "object",
+                "properties": {
+                  "providerID": {
+                    "type": "string"
+                  },
+                  "modelID": {
+                    "type": "string"
+                  },
+                  "variant": {
+                    "type": "string"
+                  }
+                },
+                "required": ["providerID", "modelID"],
+                "additionalProperties": false
               },
               "error": {
                 "anyOf": [
@@ -18766,7 +19076,7 @@
         "required": ["id", "type", "properties"],
         "additionalProperties": false
       },
-      "EventSessionStatus": {
+      "EventSessionExactReplay": {
         "type": "object",
         "properties": {
           "id": {
@@ -18774,7 +19084,7 @@
           },
           "type": {
             "type": "string",
-            "enum": ["session.status"]
+            "enum": ["session.exactReplay"]
           },
           "properties": {
             "type": "object",
@@ -18783,36 +19093,50 @@
                 "type": "string",
                 "pattern": "^ses"
               },
-              "status": {
-                "$ref": "#/components/schemas/SessionStatus"
-              }
-            },
-            "required": ["sessionID", "status"],
-            "additionalProperties": false
-          }
-        },
-        "required": ["id", "type", "properties"],
-        "additionalProperties": false
-      },
-      "EventSessionIdle": {
-        "type": "object",
-        "properties": {
-          "id": {
-            "type": "string"
-          },
-          "type": {
-            "type": "string",
-            "enum": ["session.idle"]
-          },
-          "properties": {
-            "type": "object",
-            "properties": {
-              "sessionID": {
+              "messageID": {
                 "type": "string",
-                "pattern": "^ses"
+                "pattern": "^msg"
+              },
+              "providerID": {
+                "type": "string"
+              },
+              "modelID": {
+                "type": "string"
+              },
+              "variant": {
+                "type": "string"
+              },
+              "fingerprint": {
+                "type": "string"
+              },
+              "promptCacheKey": {
+                "type": "string"
+              },
+              "attempt": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "string",
+                    "enum": ["NaN"]
+                  },
+                  {
+                    "type": "string",
+                    "enum": ["Infinity"]
+                  },
+                  {
+                    "type": "string",
+                    "enum": ["-Infinity"]
+                  },
+                  {
+                    "type": "string",
+                    "enum": ["Infinity", "-Infinity", "NaN"]
+                  }
+                ]
               }
             },
-            "required": ["sessionID"],
+            "required": ["sessionID", "providerID", "modelID", "fingerprint", "attempt"],
             "additionalProperties": false
           }
         },
@@ -22020,6 +22344,69 @@
               }
             },
             "required": ["message", "variant"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["id", "type", "properties"],
+        "additionalProperties": false
+      },
+      "EventSessionExactReplay1": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "enum": ["session.exactReplay"]
+          },
+          "properties": {
+            "type": "object",
+            "properties": {
+              "sessionID": {
+                "type": "string",
+                "pattern": "^ses"
+              },
+              "messageID": {
+                "type": "string",
+                "pattern": "^msg"
+              },
+              "providerID": {
+                "type": "string"
+              },
+              "modelID": {
+                "type": "string"
+              },
+              "variant": {
+                "type": "string"
+              },
+              "fingerprint": {
+                "type": "string"
+              },
+              "promptCacheKey": {
+                "type": "string"
+              },
+              "attempt": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "string",
+                    "enum": ["NaN"]
+                  },
+                  {
+                    "type": "string",
+                    "enum": ["Infinity"]
+                  },
+                  {
+                    "type": "string",
+                    "enum": ["-Infinity"]
+                  }
+                ]
+              }
+            },
+            "required": ["sessionID", "providerID", "modelID", "fingerprint", "attempt"],
             "additionalProperties": false
           }
         },

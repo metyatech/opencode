@@ -27,6 +27,7 @@ export type Event =
   | EventQuestionReplied
   | EventQuestionRejected
   | EventTodoUpdated
+  | EventSessionExactReplay1
   | EventMcpToolsChanged
   | EventMcpBrowserOpenFailed
   | EventCommandExecuted
@@ -840,6 +841,7 @@ export type GlobalEvent = {
     | EventQuestionReplied
     | EventQuestionRejected
     | EventTodoUpdated
+    | EventSessionExactReplay
     | EventMcpToolsChanged
     | EventMcpBrowserOpenFailed
     | EventCommandExecuted
@@ -2684,6 +2686,21 @@ export type EventTodoUpdated = {
   }
 }
 
+export type EventSessionExactReplay = {
+  id: string
+  type: "session.exactReplay"
+  properties: {
+    sessionID: string
+    messageID?: string
+    providerID: string
+    modelID: string
+    variant?: string
+    fingerprint: string
+    promptCacheKey?: string
+    attempt: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  }
+}
+
 export type EventMcpToolsChanged = {
   id: string
   type: "mcp.tools.changed"
@@ -3745,6 +3762,21 @@ export type EventTuiToastShow1 = {
     message: string
     variant: "info" | "success" | "warning" | "error"
     duration?: number
+  }
+}
+
+export type EventSessionExactReplay1 = {
+  id: string
+  type: "session.exactReplay"
+  properties: {
+    sessionID: string
+    messageID?: string
+    providerID: string
+    modelID: string
+    variant?: string
+    fingerprint: string
+    promptCacheKey?: string
+    attempt: number | "NaN" | "Infinity" | "-Infinity"
   }
 }
 
@@ -6886,6 +6918,66 @@ export type SessionRetryAsyncResponses = {
 }
 
 export type SessionRetryAsyncResponse = SessionRetryAsyncResponses[keyof SessionRetryAsyncResponses]
+
+export type SessionRetryExactData = {
+  body?: {
+    messageID?: string
+    expectedProviderID: string
+    expectedModelID: string
+    expectedVariant?: string
+  }
+  path: {
+    sessionID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/retry-exact"
+}
+
+export type SessionRetryExactErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type SessionRetryExactError = SessionRetryExactErrors[keyof SessionRetryExactErrors]
+
+export type SessionRetryExactResponses = {
+  /**
+   * Exact retry stream started
+   */
+  200:
+    | {
+        accepted: true
+        fingerprint: string
+        promptCacheKey?: string
+      }
+    | {
+        accepted: false
+        reason:
+          | "no-prepared-invocation"
+          | "request-not-latest"
+          | "model-mismatch"
+          | "variant-mismatch"
+          | "invocation-expired"
+          | "new-user-message"
+          | "assistant-activity-observed"
+          | "tool-side-effect-risk"
+          | "retry-already-running"
+          | "session-disposed"
+        fingerprint?: string
+        promptCacheKey?: string
+      }
+}
+
+export type SessionRetryExactResponse = SessionRetryExactResponses[keyof SessionRetryExactResponses]
 
 export type SessionCommandData = {
   body?: {

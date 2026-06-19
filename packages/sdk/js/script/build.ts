@@ -58,6 +58,43 @@ if (sseTypesPatched === sseTypesSource) {
 }
 await Bun.write(sseTypesPath, sseTypesPatched)
 
+// Regenerate the legacy `src/gen` SDK too. Plugins are loaded with
+// `createOpencodeClient` (in `src/client.ts`) which returns
+// `OpencodeClient` from `gen/sdk.gen.ts`. The plugin's `client.session`
+// is therefore defined by this output, NOT by the v2 output. Any new
+// HTTP endpoint (e.g. `session.retryExact`) is unreachable from the
+// plugin until the legacy gen is regenerated.
+//
+// The legacy gen keeps the older `paramsStructure: "flat"` (default
+// for the @hey-api/sdk 0.x style) so the plugin's existing call sites
+// (`client.session.retryExact({ path: { id }, body: { ... }, query: { ... } })`)
+// continue to typecheck.
+await createClient({
+  input: "./openapi.json",
+  output: {
+    path: "./src/gen",
+    tsConfigPath: path.join(dir, "tsconfig.json"),
+    clean: true,
+  },
+  plugins: [
+    {
+      name: "@hey-api/typescript",
+      exportFromIndex: false,
+    },
+    {
+      name: "@hey-api/sdk",
+      instance: "OpencodeClient",
+      exportFromIndex: false,
+      auth: false,
+    },
+    {
+      name: "@hey-api/client-fetch",
+      exportFromIndex: false,
+      baseUrl: "http://localhost:4096",
+    },
+  ],
+})
+
 await $`bun prettier --write src/gen`
 await $`bun prettier --write src/v2`
 await $`rm -rf dist`

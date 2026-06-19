@@ -28,6 +28,7 @@ export type ToolExecution = "auto" | "none"
 
 interface RunOptionsBase {
   readonly request: LLMRequest
+  readonly abortSignal?: AbortSignal
   readonly concurrency?: Concurrency
   readonly stopWhen?: StopCondition
 }
@@ -48,7 +49,7 @@ export interface RunOptionsNone<T extends Tools> extends RunOptionsBase {
 }
 
 export type StreamOptions<T extends Tools> = RunOptions<T> & {
-  readonly stream: (request: LLMRequest) => Stream.Stream<LLMEvent, LLMError>
+  readonly stream: (request: LLMRequest, options?: { readonly abortSignal?: AbortSignal }) => Stream.Stream<LLMEvent, LLMError>
 }
 
 export const stepCountIs =
@@ -91,7 +92,7 @@ export const stream = <T extends Tools>(options: StreamOptions<T>): Stream.Strea
         }
 
         const modelStream = options
-          .stream(request)
+          .stream(request, { abortSignal: options.abortSignal })
           .pipe(Stream.map((event) => indexStep(event, step)))
           .pipe(Stream.tap((event) => Effect.sync(() => accumulate(state, event))))
           .pipe(Stream.filter((event) => event.type !== "finish"))

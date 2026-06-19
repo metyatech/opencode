@@ -191,6 +191,8 @@ import type {
   SessionRetryAsyncErrors,
   SessionRetryAsyncResponses,
   SessionRetryErrors,
+  SessionRetryExactErrors,
+  SessionRetryExactResponses,
   SessionRetryResponses,
   SessionRevertErrors,
   SessionRevertResponses,
@@ -3922,6 +3924,51 @@ export class Session2 extends HeyApiClient {
     )
     return (options?.client ?? this.client).post<SessionRetryAsyncResponses, SessionRetryAsyncErrors, ThrowOnError>({
       url: "/session/{sessionID}/message/{messageID}/retry_async",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Retry exact
+   *
+   * Replay the latest prepared LLM invocation without rebuilding the request. Returns a typed rejection if the prepared invocation is no longer eligible (stale model, new user message, in-flight retry, etc.).
+   */
+  public retryExact<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      directory?: string
+      workspace?: string
+      messageID?: string
+      expectedProviderID?: string
+      expectedModelID?: string
+      expectedVariant?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "body", key: "messageID" },
+            { in: "body", key: "expectedProviderID" },
+            { in: "body", key: "expectedModelID" },
+            { in: "body", key: "expectedVariant" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<SessionRetryExactResponses, SessionRetryExactErrors, ThrowOnError>({
+      url: "/session/{sessionID}/retry-exact",
       ...options,
       ...params,
       headers: {

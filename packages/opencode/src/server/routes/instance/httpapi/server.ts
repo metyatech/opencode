@@ -37,7 +37,11 @@ import { PtyTicket } from "@/pty/ticket"
 import { Question } from "@/question"
 import { Session } from "@/session/session"
 import { SessionCompaction } from "@/session/compaction"
+import { SessionProcessor } from "@/session/processor"
 import { SessionPrompt } from "@/session/prompt"
+import { SessionRetryExact } from "@/session/retry-exact"
+import { SessionRetryExactDispatch } from "@/session/retry-exact-dispatch"
+import { LLM } from "@/session/llm"
 import { SessionRevert } from "@/session/revert"
 import { SessionRunState } from "@/session/run-state"
 import { SessionStatus } from "@/session/status"
@@ -203,6 +207,7 @@ export function createRoutes(
       Format.defaultLayer,
       LSP.defaultLayer,
       Installation.defaultLayer,
+      LLM.defaultLayer,
       MCP.defaultLayer,
       ModelsDev.defaultLayer,
       Permission.defaultLayer,
@@ -217,8 +222,11 @@ export function createRoutes(
       RuntimeFlags.defaultLayer,
       Session.defaultLayer,
       SessionCompaction.defaultLayer,
+      SessionProcessor.defaultLayer,
       SessionPrompt.defaultLayer,
       SessionRevert.defaultLayer,
+      SessionRetryExact.defaultLayer,
+      SessionRetryExactDispatch.defaultLayer,
       SessionShare.defaultLayer,
       SessionRunState.defaultLayer,
       SessionStatus.defaultLayer,
