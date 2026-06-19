@@ -93,7 +93,7 @@ app.message(async ({ message, say }) => {
     session = { client, server, sessionId: createResult.data.id, channel, thread }
     sessions.set(sessionKey, session)
 
-    const shareResult = await client.session.share({ path: { id: createResult.data.id } })
+    const shareResult = await client.session.share({ path: { sessionID: createResult.data.id } })
     if (!shareResult.error && shareResult.data) {
       const sessionUrl = shareResult.data.share?.url
       console.log("🔗 Session shared:", sessionUrl)
@@ -103,7 +103,7 @@ app.message(async ({ message, say }) => {
 
   console.log("📝 Sending to opencode:", message.text)
   const result = await session.client.session.prompt({
-    path: { id: session.sessionId },
+    path: { sessionID: session.sessionId },
     body: { parts: [{ type: "text", text: message.text }] },
   })
 
