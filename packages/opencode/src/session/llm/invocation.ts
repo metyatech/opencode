@@ -140,6 +140,8 @@ export type PreparedInvocation = {
   readonly promptCacheKey?: string
   readonly createdAt: number
   readonly ttlMs: number
+  // Low-level request factory. Do not call directly outside LLM.streamPrepared();
+  // streamPrepared owns abort, provider request watchdog, and timeout-to-error conversion.
   readonly run: (abort: AbortSignal) => Stream.Stream<LLMEvent, unknown>
   readonly canonical: CanonicalCanonical
 }

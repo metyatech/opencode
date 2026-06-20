@@ -373,7 +373,7 @@ function llm() {
             },
           } as unknown as LLM.PreparedInvocation)
         },
-        streamPrepared: (prepared, abort) => prepared.run(abort),
+        streamPrepared: (prepared) => prepared.run(new AbortController().signal),
       }),
     ),
   }

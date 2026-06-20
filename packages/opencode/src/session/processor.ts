@@ -955,15 +955,12 @@ export const layer = Layer.effect(
           ctx.reasoningMap = {}
           retryError = undefined
           yield* status.set(ctx.sessionID, { type: "busy" })
-          // Per-attempt AbortController. The controller is owned by
-          // this generator and is wired into both the LLM call AND
-          // the fiber interrupt path so a consumer-level cancel reaches
-          // the in-flight request immediately.
-          const ctrl = yield* Effect.acquireRelease(
-            Effect.sync(() => new AbortController()),
-            (ctrl) => Effect.sync(() => ctrl.abort()),
-          )
-          const stream = llm.streamPrepared(prepared, ctrl.signal)
+          // `llm.streamPrepared` owns the per-attempt AbortController,
+          // the provider request watchdog, and timeout-to-error
+          // conversion. This generator only consumes the resulting
+          // event stream; a consumer-level cancel reaches the in-flight
+          // request through `streamPrepared`'s own scope cleanup.
+          const stream = llm.streamPrepared(prepared)
 
           yield* stream.pipe(
             Stream.tap((event) => handleEvent(event)),

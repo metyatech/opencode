@@ -245,8 +245,8 @@ describe("session.llm.prepare + streamPrepared", () => {
         const svc = yield* LLM.Service
         const input = makeStreamInput(model)
         const prepared = yield* svc.prepare(input)
-        yield* svc.streamPrepared(prepared, new AbortController().signal).pipe(Stream.runDrain)
-        yield* svc.streamPrepared(prepared, new AbortController().signal).pipe(Stream.runDrain)
+        yield* svc.streamPrepared(prepared).pipe(Stream.runDrain)
+        yield* svc.streamPrepared(prepared).pipe(Stream.runDrain)
         expect(state.captures.length).toBe(2)
         const [a, b] = state.captures
         // The two bodies must match. prompt_cache_key is intentionally
@@ -269,8 +269,8 @@ describe("session.llm.prepare + streamPrepared", () => {
         const svc = yield* LLM.Service
         const input = makeStreamInput(model)
         const prepared = yield* svc.prepare(input)
-        yield* svc.streamPrepared(prepared, new AbortController().signal).pipe(Stream.runDrain)
-        yield* svc.streamPrepared(prepared, new AbortController().signal).pipe(Stream.runDrain)
+        yield* svc.streamPrepared(prepared).pipe(Stream.runDrain)
+        yield* svc.streamPrepared(prepared).pipe(Stream.runDrain)
         expect(state.captures.length).toBe(2)
         const sessionID = input.sessionID
         for (const cap of state.captures) {

@@ -64,7 +64,7 @@ export interface Interface {
   readonly prepare: (
     input: StreamInput,
   ) => Effect.Effect<PreparedInvocation, Auth.AuthError | Provider.ModelNotFoundError, never>
-  readonly streamPrepared: (prepared: PreparedInvocation, abort: AbortSignal) => Stream.Stream<LLMEvent, unknown>
+  readonly streamPrepared: (prepared: PreparedInvocation) => Stream.Stream<LLMEvent, unknown>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/LLM") {}
@@ -323,8 +323,8 @@ const live: Layer.Layer<
             }),
           )
           // `run(abort)` creates a fresh stream and request per call.
-          // The per-attempt AbortController is owned by the caller
-          // (`drivePreparedStream` below).
+          // The per-attempt AbortController is owned by `streamPrepared`
+          // below.
           runtime = { type: "native", factory: native.run }
         } else {
           yield* Effect.logInfo("llm runtime selected").pipe(
@@ -390,26 +390,21 @@ const live: Layer.Layer<
     })
 
     // --- streamPrepared -------------------------------------------------------
-    // Re-runs the HTTP stream with the caller's per-attempt AbortSignal.
-    // The body is identical to the original attempt because the closure
-    // was built from the captured configuration. Adapter state (e.g.
-    // counters) is per-attempt. The caller is responsible for owning the
-    // AbortSignal's lifecycle — when the consumer fiber is interrupted,
-    // the caller's signal aborts and the underlying streamText cancels
-    // its in-flight request.
-    const streamPrepared = (
-      prepared: PreparedInvocation,
-      abort: AbortSignal,
-    ): Stream.Stream<LLMEvent, unknown> => prepared.run(abort)
-
-    // --- stream (back-compat) -------------------------------------------------
-    // For callers that want a one-shot stream (not retries) we provide the
-    // historical `stream(input)` entry point. It internally uses
-    // `prepare` + `streamPrepared`. The per-attempt abort controller is
-    // owned by the `Stream.scoped` wrap, so the consumer's fiber
-    // interrupt propagates to the in-flight `streamText` request via the
-    // scope's cleanup.
-    const stream: Interface["stream"] = (input) =>
+    // The only safe entry point for executing a `PreparedInvocation`. Owns
+    // the full per-attempt lifecycle:
+    //   - a fresh `AbortController` per call (released — and therefore
+    //     aborted — when the returned stream's scope closes, so a consumer
+    //     fiber interrupt always reaches the in-flight provider request),
+    //   - the provider request watchdog, which converts a silent stall
+    //     (e.g. after a provider quota error) into a typed
+    //     `ProviderRequestTimeoutError` stream failure instead of hanging
+    //     forever,
+    //   - `prepared.run(...)`'s raw stream, which is otherwise a low-level
+    //     request factory and must not be invoked directly by callers.
+    // Every caller — normal prompts, exact replay, and any future prepared
+    // replay path — goes through this function and therefore always gets
+    // watchdog coverage.
+    const streamPrepared: Interface["streamPrepared"] = (prepared) =>
       Stream.scoped(
         Stream.unwrap(
           Effect.gen(function* () {
@@ -419,15 +414,27 @@ const live: Layer.Layer<
             )
             const cfg = yield* config.get()
             const timeoutMs = cfg.experimental?.provider_request_timeout_ms ?? 0
-            const prepared = yield* prepare(input)
-            return withProviderRequestWatchdog(streamPrepared(prepared, ctrl.signal), {
-              providerID: input.model.providerID,
-              modelID: input.model.id,
+            return withProviderRequestWatchdog(prepared.run(ctrl.signal), {
+              providerID: prepared.provider.providerID,
+              modelID: prepared.provider.modelID,
               timeoutMs,
               abort: ctrl,
             })
           }),
         ),
+      )
+
+    // --- stream (back-compat) -------------------------------------------------
+    // For callers that want a one-shot stream (not retries) we provide the
+    // historical `stream(input)` entry point. It is a thin wrapper over
+    // `prepare` + `streamPrepared`; watchdog/abort ownership lives entirely
+    // in `streamPrepared`, so this must not duplicate any of it.
+    const stream: Interface["stream"] = (input) =>
+      Stream.unwrap(
+        Effect.gen(function* () {
+          const prepared = yield* prepare(input)
+          return streamPrepared(prepared)
+        }),
       )
 
     return Service.of({ stream, prepare, streamPrepared })

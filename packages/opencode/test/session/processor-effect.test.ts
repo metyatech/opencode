@@ -1126,3 +1126,203 @@ it.live("session.processor effect tests mark interruptions aborted without manua
     { config: (url) => providerCfg(url) },
   ),
 )
+
+// ---------------------------------------------------------------------------
+// Prepared-invocation watchdog regression tests.
+//
+// These cover the fix for the dev-branch regression where
+// `SessionProcessor.drivePreparedStream` called `llm.streamPrepared(prepared,
+// ctrl.signal)` directly, bypassing the provider request watchdog that
+// `LLM.stream()` used to apply. `llm.hang()` makes the test provider accept
+// the request and then never finish the SSE stream — exactly the
+// "silent stall after a provider error" shape the watchdog exists to catch.
+// With `experimental.provider_request_timeout_ms` set, the watchdog inside
+// `LLM.streamPrepared` must fire on its own (no manual `Fiber.interrupt`)
+// and turn the stall into a typed `ProviderRequestTimeoutError`.
+// ---------------------------------------------------------------------------
+
+function providerCfgWithTimeout(url: string, timeoutMs: number) {
+  return {
+    ...providerCfg(url),
+    experimental: { provider_request_timeout_ms: timeoutMs },
+  }
+}
+
+it.live("session.processor effect tests fail with ProviderRequestTimeoutError when process() stalls silently", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        const bus = yield* Bus.Service
+        const sts = yield* SessionStatus.Service
+
+        yield* llm.hang
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "watchdog")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const errs: string[] = []
+        const off = yield* bus.subscribeCallback(Session.Event.Error, (evt) => {
+          if (evt.properties.sessionID !== chat.id) return
+          if (!evt.properties.error) return
+          errs.push(evt.properties.error.name)
+        })
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+        })
+
+        const value = yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies MessageV2.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "watchdog" }],
+          tools: {},
+        })
+
+        yield* waitFor(
+          Effect.sync(() => (errs.length > 0 ? true : undefined)),
+          "timed out waiting for session error event",
+        )
+        off()
+        const state = yield* sts.get(chat.id)
+
+        expect(value).toBe("stop")
+        expect(handle.message.error?.name).toBe("ProviderRequestTimeoutError")
+        expect(state).toMatchObject({ type: "idle" })
+        expect(errs).toContain("ProviderRequestTimeoutError")
+      }),
+    { config: (url) => providerCfgWithTimeout(url, 150) },
+  ),
+)
+
+it.live(
+  "session.processor effect tests fail with ProviderRequestTimeoutError when processPrepared() (exact replay) stalls silently",
+  () =>
+    provideTmpdirServer(
+      ({ dir, llm }) =>
+        Effect.gen(function* () {
+          const { processors, session, provider } = yield* boot()
+          const bus = yield* Bus.Service
+          const sts = yield* SessionStatus.Service
+          const llmSvc = yield* LLM.Service
+
+          yield* llm.hang
+
+          const chat = yield* session.create({})
+          const parent = yield* user(chat.id, "watchdog replay")
+          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+          const errs: string[] = []
+          const off = yield* bus.subscribeCallback(Session.Event.Error, (evt) => {
+            if (evt.properties.sessionID !== chat.id) return
+            if (!evt.properties.error) return
+            errs.push(evt.properties.error.name)
+          })
+          const handle = yield* processors.create({
+            assistantMessage: msg,
+            sessionID: chat.id,
+            model: mdl,
+          })
+
+          const input = {
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies MessageV2.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "watchdog replay" }],
+            tools: {},
+          } satisfies LLM.StreamInput
+
+          // `prepare()` only builds the request closure; it does not issue
+          // the HTTP call, so it does not consume the queued `llm.hang()`
+          // response. The actual request — and therefore the stall — only
+          // happens once `processPrepared` drives the stream.
+          const prepared = yield* llmSvc.prepare(input)
+          const value = yield* handle.processPrepared(prepared)
+
+          yield* waitFor(
+            Effect.sync(() => (errs.length > 0 ? true : undefined)),
+            "timed out waiting for session error event",
+          )
+          off()
+          const state = yield* sts.get(chat.id)
+
+          expect(value).toBe("stop")
+          expect(handle.message.error?.name).toBe("ProviderRequestTimeoutError")
+          expect(state).toMatchObject({ type: "idle" })
+          expect(errs).toContain("ProviderRequestTimeoutError")
+        }),
+      { config: (url) => providerCfgWithTimeout(url, 150) },
+    ),
+)
+
+it.live(
+  "session.processor effect tests complete normally through process() with the provider request watchdog enabled",
+  () =>
+    provideTmpdirServer(
+      ({ dir, llm }) =>
+        Effect.gen(function* () {
+          const { processors, session, provider } = yield* boot()
+
+          yield* llm.text("hello")
+
+          const chat = yield* session.create({})
+          const parent = yield* user(chat.id, "hi")
+          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+          const handle = yield* processors.create({
+            assistantMessage: msg,
+            sessionID: chat.id,
+            model: mdl,
+          })
+
+          const value = yield* handle.process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies MessageV2.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "hi" }],
+            tools: {},
+          })
+
+          const parts = MessageV2.parts(msg.id)
+
+          expect(value).toBe("continue")
+          expect(handle.message.error).toBeUndefined()
+          expect(parts.some((part) => part.type === "text" && part.text === "hello")).toBe(true)
+          expect(parts.some((part) => part.type === "step-finish")).toBe(true)
+        }),
+      // A generous timeout that the normal, fast-completing stream never
+      // gets close to — proves the watchdog wiring does not regress the
+      // happy path.
+      { config: (url) => providerCfgWithTimeout(url, 5000) },
+    ),
+)
