@@ -17,7 +17,6 @@ import { Session as SessionNs } from "@/session/session"
 import { MessageV2 } from "../../src/session/message-v2"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
 import { SessionStatus } from "../../src/session/status"
-import { SessionRetryExact } from "../../src/session/retry-exact"
 import { SessionSummary } from "../../src/session/summary"
 import { SessionV2 } from "../../src/v2/session"
 import { ModelID, ProviderID } from "../../src/provider/schema"
@@ -208,7 +207,6 @@ function fake(
     updateToolCall: Effect.fn("TestSessionProcessor.updateToolCall")(() => Effect.succeed(undefined)),
     completeToolCall: Effect.fn("TestSessionProcessor.completeToolCall")(() => Effect.void),
     process: Effect.fn("TestSessionProcessor.process")(() => Effect.succeed(result)),
-    processPrepared: Effect.fn("TestSessionProcessor.processPrepared")(() => Effect.succeed(result)),
   } satisfies SessionProcessorModule.SessionProcessor.Handle
 }
 
@@ -272,7 +270,6 @@ function compactionProcessLayer(options?: CompactionProcessOptions) {
         Layer.provide(Image.defaultLayer),
         Layer.provide(RuntimeFlags.layer({ experimentalEventSystem: true })),
         Layer.provideMerge(status),
-        Layer.provideMerge(SessionRetryExact.defaultLayer),
       )
     : layer(options?.result ?? "continue")
   return Layer.mergeAll(
@@ -280,7 +277,6 @@ function compactionProcessLayer(options?: CompactionProcessOptions) {
     processor,
     bus,
     status,
-    SessionRetryExact.defaultLayer,
   ).pipe(
     Layer.provide(SessionNs.defaultLayer),
     Layer.provide((options?.provider ?? wide()).layer),

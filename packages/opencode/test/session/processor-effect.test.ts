@@ -15,7 +15,6 @@ import { Provider } from "@/provider/provider"
 import { ModelID, ProviderID } from "../../src/provider/schema"
 import { Session } from "@/session/session"
 import { LLM } from "../../src/session/llm"
-import { SessionRetryExact } from "../../src/session/retry-exact"
 import { MessageV2 } from "../../src/session/message-v2"
 import { SessionProcessor } from "../../src/session/processor"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
@@ -185,7 +184,6 @@ const deps = Layer.mergeAll(
   status,
   SyncEvent.defaultLayer,
   EventV2Bridge.defaultLayer,
-  SessionRetryExact.defaultLayer,
 ).pipe(Layer.provideMerge(infra))
 const env = Layer.mergeAll(
   TestLLMServer.layer,
@@ -1205,75 +1203,6 @@ it.live("session.processor effect tests fail with ProviderRequestTimeoutError wh
       }),
     { config: (url) => providerCfgWithTimeout(url, 150) },
   ),
-)
-
-it.live(
-  "session.processor effect tests fail with ProviderRequestTimeoutError when processPrepared() (exact replay) stalls silently",
-  () =>
-    provideTmpdirServer(
-      ({ dir, llm }) =>
-        Effect.gen(function* () {
-          const { processors, session, provider } = yield* boot()
-          const bus = yield* Bus.Service
-          const sts = yield* SessionStatus.Service
-          const llmSvc = yield* LLM.Service
-
-          yield* llm.hang
-
-          const chat = yield* session.create({})
-          const parent = yield* user(chat.id, "watchdog replay")
-          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
-          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
-          const errs: string[] = []
-          const off = yield* bus.subscribeCallback(Session.Event.Error, (evt) => {
-            if (evt.properties.sessionID !== chat.id) return
-            if (!evt.properties.error) return
-            errs.push(evt.properties.error.name)
-          })
-          const handle = yield* processors.create({
-            assistantMessage: msg,
-            sessionID: chat.id,
-            model: mdl,
-          })
-
-          const input = {
-            user: {
-              id: parent.id,
-              sessionID: chat.id,
-              role: "user",
-              time: parent.time,
-              agent: parent.agent,
-              model: { providerID: ref.providerID, modelID: ref.modelID },
-            } satisfies MessageV2.User,
-            sessionID: chat.id,
-            model: mdl,
-            agent: agent(),
-            system: [],
-            messages: [{ role: "user", content: "watchdog replay" }],
-            tools: {},
-          } satisfies LLM.StreamInput
-
-          // `prepare()` only builds the request closure; it does not issue
-          // the HTTP call, so it does not consume the queued `llm.hang()`
-          // response. The actual request — and therefore the stall — only
-          // happens once `processPrepared` drives the stream.
-          const prepared = yield* llmSvc.prepare(input)
-          const value = yield* handle.processPrepared(prepared)
-
-          yield* waitFor(
-            Effect.sync(() => (errs.length > 0 ? true : undefined)),
-            "timed out waiting for session error event",
-          )
-          off()
-          const state = yield* sts.get(chat.id)
-
-          expect(value).toBe("stop")
-          expect(handle.message.error?.name).toBe("ProviderRequestTimeoutError")
-          expect(state).toMatchObject({ type: "idle" })
-          expect(errs).toContain("ProviderRequestTimeoutError")
-        }),
-      { config: (url) => providerCfgWithTimeout(url, 150) },
-    ),
 )
 
 it.live(

@@ -21,11 +21,10 @@ export interface Interface {
    * Atomically claim this session's runner for an exclusive detached run.
    * Returns `true` if the runner was Idle and the work was forked into the
    * runner scope (transitioning to Running); returns `false` if the runner
-   * was already busy with a prompt/retry/shell or another exact retry. The
-   * work runs to completion in the runner scope and the runner resets to
-   * idle on its own (`onIdle`); the caller does not await the result. Used
-   * by `session.retryExact` so exact replays share the same runner
-   * exclusion as every other session operation.
+   * was already busy with a prompt/retry/shell. The work runs to completion
+   * in the runner scope and the runner resets to idle on its own
+   * (`onIdle`); the caller does not await the result. A detached exclusive
+   * run shares the same runner exclusion as every other session operation.
    */
   readonly claimExclusive: (
     sessionID: SessionID,

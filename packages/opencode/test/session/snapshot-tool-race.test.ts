@@ -17,7 +17,6 @@ import { FetchHttpClient } from "effect/unstable/http"
 import fs from "fs/promises"
 import path from "path"
 import { Session } from "@/session/session"
-import { SessionRetryExact } from "../../src/session/retry-exact"
 import { LLM } from "../../src/session/llm"
 import { SessionPrompt } from "../../src/session/prompt"
 import { SessionRevert } from "../../src/session/revert"
@@ -133,7 +132,6 @@ function makeHttp() {
     status,
     SyncEvent.defaultLayer,
     EventV2Bridge.defaultLayer,
-    SessionRetryExact.defaultLayer,
   ).pipe(Layer.provideMerge(infra))
   const question = Question.layer.pipe(Layer.provideMerge(deps))
   const todo = Todo.layer.pipe(Layer.provideMerge(deps))

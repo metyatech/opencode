@@ -261,9 +261,6 @@ import type {
   SessionRetryAsyncResponses,
   SessionRetryData,
   SessionRetryErrors,
-  SessionRetryExactData,
-  SessionRetryExactErrors,
-  SessionRetryExactResponses,
   SessionRetryResponses,
   SessionRevertData,
   SessionRevertErrors,
@@ -1920,22 +1917,6 @@ export class Session2 extends HeyApiClient {
   public retryAsync<ThrowOnError extends boolean = false>(options: Options<SessionRetryAsyncData, ThrowOnError>) {
     return (options.client ?? this.client).post<SessionRetryAsyncResponses, SessionRetryAsyncErrors, ThrowOnError>({
       url: "/session/{sessionID}/message/{messageID}/retry_async",
-      ...options,
-      headers: {
-        "Content-Type": "application/json",
-        ...options.headers,
-      },
-    })
-  }
-
-  /**
-   * Retry exact
-   *
-   * Replay the latest prepared LLM invocation without rebuilding the request. Returns a typed rejection if the prepared invocation is no longer eligible (stale model, new user message, in-flight retry, etc.).
-   */
-  public retryExact<ThrowOnError extends boolean = false>(options: Options<SessionRetryExactData, ThrowOnError>) {
-    return (options.client ?? this.client).post<SessionRetryExactResponses, SessionRetryExactErrors, ThrowOnError>({
-      url: "/session/{sessionID}/retry-exact",
       ...options,
       headers: {
         "Content-Type": "application/json",

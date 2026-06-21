@@ -27,7 +27,6 @@ export type Event =
   | EventQuestionReplied
   | EventQuestionRejected
   | EventTodoUpdated
-  | EventSessionExactReplay1
   | EventMcpToolsChanged
   | EventMcpBrowserOpenFailed
   | EventCommandExecuted
@@ -243,6 +242,17 @@ export type MessageOutputLengthError = {
   }
 }
 
+export type ProviderRequestTimeoutError = {
+  name: "ProviderRequestTimeoutError"
+  data: {
+    message: string
+    phase: "first_event" | "stream_idle"
+    timeoutMs: number
+    providerID: string
+    modelID: string
+  }
+}
+
 export type MessageAbortedError = {
   name: "MessageAbortedError"
   data: {
@@ -440,6 +450,7 @@ export type AssistantMessage = {
     | ProviderAuthError
     | UnknownError
     | MessageOutputLengthError
+    | ProviderRequestTimeoutError
     | MessageAbortedError
     | StructuredOutputError
     | ContextOverflowError
@@ -829,7 +840,6 @@ export type GlobalEvent = {
     | EventQuestionReplied
     | EventQuestionRejected
     | EventTodoUpdated
-    | EventSessionExactReplay
     | EventMcpToolsChanged
     | EventMcpBrowserOpenFailed
     | EventCommandExecuted
@@ -1321,6 +1331,7 @@ export type Config = {
     primary_tools?: Array<string>
     continue_loop_on_deny?: boolean
     mcp_timeout?: number
+    provider_request_timeout_ms?: number
   }
 }
 
@@ -1650,7 +1661,7 @@ export type Agent = {
     providerID: string
   }
   variant?: string
-  modelSelection: "user" | "managed"
+  modelSelection?: "user" | "managed"
   prompt?: string
   options: {
     [key: string]: unknown
@@ -2638,6 +2649,7 @@ export type EventSessionError = {
       | ProviderAuthError
       | UnknownError
       | MessageOutputLengthError
+      | ProviderRequestTimeoutError
       | MessageAbortedError
       | StructuredOutputError
       | ContextOverflowError
@@ -2669,21 +2681,6 @@ export type EventTodoUpdated = {
   properties: {
     sessionID: string
     todos: Array<Todo>
-  }
-}
-
-export type EventSessionExactReplay = {
-  id: string
-  type: "session.exactReplay"
-  properties: {
-    sessionID: string
-    messageID?: string
-    providerID: string
-    modelID: string
-    variant?: string
-    fingerprint: string
-    promptCacheKey?: string
-    attempt: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
   }
 }
 
@@ -3748,21 +3745,6 @@ export type EventTuiToastShow1 = {
     message: string
     variant: "info" | "success" | "warning" | "error"
     duration?: number
-  }
-}
-
-export type EventSessionExactReplay1 = {
-  id: string
-  type: "session.exactReplay"
-  properties: {
-    sessionID: string
-    messageID?: string
-    providerID: string
-    modelID: string
-    variant?: string
-    fingerprint: string
-    promptCacheKey?: string
-    attempt: number | "NaN" | "Infinity" | "-Infinity"
   }
 }
 
@@ -6904,66 +6886,6 @@ export type SessionRetryAsyncResponses = {
 }
 
 export type SessionRetryAsyncResponse = SessionRetryAsyncResponses[keyof SessionRetryAsyncResponses]
-
-export type SessionRetryExactData = {
-  body?: {
-    messageID?: string
-    expectedProviderID: string
-    expectedModelID: string
-    expectedVariant?: string
-  }
-  path: {
-    sessionID: string
-  }
-  query?: {
-    directory?: string
-    workspace?: string
-  }
-  url: "/session/{sessionID}/retry-exact"
-}
-
-export type SessionRetryExactErrors = {
-  /**
-   * BadRequest | InvalidRequestError
-   */
-  400: EffectHttpApiErrorBadRequest | InvalidRequestError
-  /**
-   * NotFoundError
-   */
-  404: NotFoundError
-}
-
-export type SessionRetryExactError = SessionRetryExactErrors[keyof SessionRetryExactErrors]
-
-export type SessionRetryExactResponses = {
-  /**
-   * Exact retry stream started
-   */
-  200:
-    | {
-        accepted: true
-        fingerprint: string
-        promptCacheKey?: string
-      }
-    | {
-        accepted: false
-        reason:
-          | "no-prepared-invocation"
-          | "request-not-latest"
-          | "model-mismatch"
-          | "variant-mismatch"
-          | "invocation-expired"
-          | "new-user-message"
-          | "assistant-activity-observed"
-          | "tool-side-effect-risk"
-          | "retry-already-running"
-          | "session-disposed"
-        fingerprint?: string
-        promptCacheKey?: string
-      }
-}
-
-export type SessionRetryExactResponse = SessionRetryExactResponses[keyof SessionRetryExactResponses]
 
 export type SessionCommandData = {
   body?: {

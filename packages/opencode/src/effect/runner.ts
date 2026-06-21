@@ -10,11 +10,10 @@ export interface Runner<A, E = never> {
    * like `ensureRunning`'s Idle branch) and the runner transitions to
    * `Running`; returns `true` without awaiting completion. If the runner
    * is in any non-Idle state, the work is NOT started and `false` is
-   * returned. This is the claim-or-fail primitive used by
-   * `session.retryExact`: unlike `ensureRunning` it never joins an
-   * in-flight run, so a concurrent normal prompt/retry/shell or another
-   * exact retry deterministically loses the race instead of silently
-   * attaching to the existing run.
+   * returned. This is the claim-or-fail primitive for detached exclusive
+   * runs: unlike `ensureRunning` it never joins an in-flight run, so a
+   * concurrent normal prompt/retry/shell deterministically loses the race
+   * instead of silently attaching to the existing run.
    */
   readonly tryStart: (work: Effect.Effect<A, E>) => Effect.Effect<boolean>
   readonly startShell: (work: Effect.Effect<A, E>, ready?: Latch.Latch) => Effect.Effect<A, E | Busy>

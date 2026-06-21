@@ -163,7 +163,7 @@ export const computeFingerprint = (canonical: CanonicalCanonical): string => {
 }
 
 // Helper used by `llm.ts` to assemble the canonical request from the opencode
-// session view. Kept here so both `prepare` and the `retry-exact` canary use
+// session view. Kept here so every caller derives the canonical request with
 // the same exact logic.
 export const buildCanonical = (input: {
   readonly model: { providerID: string; modelID: string; apiID: string; variant?: string }

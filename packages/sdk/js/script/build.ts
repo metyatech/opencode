@@ -62,12 +62,12 @@ await Bun.write(sseTypesPath, sseTypesPatched)
 // `createOpencodeClient` (in `src/client.ts`) which returns
 // `OpencodeClient` from `gen/sdk.gen.ts`. The plugin's `client.session`
 // is therefore defined by this output, NOT by the v2 output. Any new
-// HTTP endpoint (e.g. `session.retryExact`) is unreachable from the
-// plugin until the legacy gen is regenerated.
+// HTTP endpoint is unreachable from the plugin until the legacy gen is
+// regenerated.
 //
 // The legacy gen keeps the older `paramsStructure: "flat"` (default
 // for the @hey-api/sdk 0.x style) so the plugin's existing call sites
-// (`client.session.retryExact({ path: { id }, body: { ... }, query: { ... } })`)
+// (`client.session.retry({ path: { sessionID, messageID }, body: { ... } })`)
 // continue to typecheck.
 await createClient({
   input: "./openapi.json",

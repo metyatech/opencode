@@ -33,9 +33,13 @@ import {
   type CanonicalCanonical,
   type PreparedInvocation,
 } from "./llm/invocation"
-import { DEFAULT_TTL_MS } from "./llm/invocation-cache"
 
 export type { PreparedInvocation } from "./llm/invocation"
+
+// Default lifetime stamped onto a `PreparedInvocation` for observability of how
+// long a prepared stream remains meaningful. Not enforced by `prepare` /
+// `streamPrepared` themselves.
+const DEFAULT_TTL_MS = 30 * 60 * 1000
 
 const log = Log.create({ service: "llm" })
 export const OUTPUT_TOKEN_MAX = ProviderTransform.OUTPUT_TOKEN_MAX
@@ -73,8 +77,7 @@ export const use = serviceUse(Service)
 
 // Provider families that use a session-stable `prompt_cache_key` for implicit
 // prompt caching. Resolved by the opencode provider in `LLMRequestPrep` and
-// re-exposed on the `PreparedInvocation` for visibility to the retry-exact
-// canary and to downstream observers.
+// re-exposed on the `PreparedInvocation` for visibility to downstream observers.
 const SESSION_AFFINITY_HEADER = "x-session-affinity"
 
 const resolvePromptCacheKey = (
@@ -570,7 +573,7 @@ export const hasToolCalls = LLMRequestPrep.hasToolCalls
 // The existing namespace contract is preserved through the self-reexport at
 // the bottom of this file (`export * as LLM from "./llm"`). The new prepare
 // / streamPrepared surface lives on the `LLM.Service` interface and the
-// `PreparedInvocation` type / cache is available via direct imports from
-// `@/session/llm/invocation` and `@/session/llm/invocation-cache`.
+// `PreparedInvocation` type is available via a direct import from
+// `@/session/llm/invocation`.
 
 export * as LLM from "./llm"

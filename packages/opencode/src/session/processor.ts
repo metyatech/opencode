@@ -15,7 +15,6 @@ import { isOverflow } from "./overflow"
 import { PartID } from "./schema"
 import type { SessionID } from "./schema"
 import { SessionRetry } from "./retry"
-import { SessionRetryExact } from "./retry-exact"
 import { SessionStatus } from "./status"
 import { SessionSummary } from "./summary"
 import type { Provider } from "@/provider/provider"
@@ -78,17 +77,6 @@ export interface Handle {
   readonly process: (
     streamInput: LLM.StreamInput,
   ) => Effect.Effect<Result, Auth.AuthError | Provider.ModelNotFoundError, Scope.Scope>
-  /**
-   * Replay a pre-prepared invocation through the same event-handling pipeline
-   * as `process()`. The body sent to the provider is byte-identical to the
-   * original attempt because the prepared invocation is reused verbatim;
-   * the caller does not re-derive any of the inputs (system, tools, headers,
-   * params, prompt cache key). Used by `session.retryExact` to re-issue a
-   * request that already qualifies as prompt-cache eligible.
-   */
-  readonly processPrepared: (
-    prepared: LLMInvocation.PreparedInvocation,
-  ) => Effect.Effect<Result, Auth.AuthError | Provider.ModelNotFoundError, Scope.Scope>
 }
 
 type Input = {
@@ -141,7 +129,6 @@ export const layer = Layer.effect(
     const image = yield* Image.Service
     const events = yield* EventV2Bridge.Service
     const flags = yield* RuntimeFlags.Service
-    const retryExact = yield* SessionRetryExact.Service
 
     const create = Effect.fn("SessionProcessor.create")(function* (input: Input) {
       // Pre-capture snapshot before the LLM stream starts. The AI SDK
@@ -479,11 +466,6 @@ export const layer = Layer.effect(
             if (ctx.assistantMessage.summary) {
               throw new Error(`Tool call not allowed while generating summary: ${value.name}`)
             }
-            // The first tool call invalidates the retry-exact cache: a
-            // tool side-effect may have produced state that an exact
-            // retry would miss. Subsequent retries are forced to go
-            // through the normal session path.
-            yield* retryExact.invalidate(ctx.sessionID, "tool-started")
             yield* ensureToolCall(value)
             return
 
@@ -623,10 +605,6 @@ export const layer = Layer.effect(
                 timestamp: DateTime.makeUnsafe(Date.now()),
               })
             }
-            // Recording a tool result invalidates the retry-exact cache
-            // because the assistant's surface has now diverged from the
-            // prepared invocation's view.
-            yield* retryExact.invalidate(ctx.sessionID, "tool-result")
             yield* completeToolCall(value.id, output)
             return
           }
@@ -747,10 +725,6 @@ export const layer = Layer.effect(
           }
 
           case "text-start":
-            // The first text delta invalidates the retry-exact cache:
-            // the assistant has produced visible output that a retry
-            // would duplicate.
-            yield* retryExact.invalidate(ctx.sessionID, "assistant-activity")
             if (!ctx.assistantMessage.summary) {
               // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
               if (flags.experimentalEventSystem) {
@@ -1019,34 +993,6 @@ export const layer = Layer.effect(
 
         return yield* Effect.gen(function* () {
           const prepared = yield* llm.prepare(streamInput)
-          yield* retryExact.publish(prepared)
-          yield* drivePreparedStream(prepared)
-          if (ctx.needsCompaction) return "compact"
-          if (ctx.blocked || ctx.assistantMessage.error) return "stop"
-          return "continue"
-        })
-      })
-
-      // Replay path used by `session.retryExact`. The caller (the HTTP
-      // handler) has already gated eligibility and atomically claimed the
-      // runner via `SessionRunState.ensureRunning`. The prepared invocation
-      // is the one the previous attempt published into
-      // `SessionRetryExact.publish`, so the body that hits the provider is
-      // byte-identical to the previous attempt.
-      const processPrepared = Effect.fn("SessionProcessor.processPrepared")(function* (
-        prepared: LLMInvocation.PreparedInvocation,
-      ) {
-        slog.info("processPrepared", {
-          fingerprint: prepared.fingerprint,
-          ...(prepared.promptCacheKey ? { promptCacheKey: prepared.promptCacheKey } : {}),
-        })
-        ctx.needsCompaction = false
-        ctx.shouldBreak = (yield* config.get()).experimental?.continue_loop_on_deny !== true
-        retryError = undefined
-        // The prepared invocation is already in the cache. Do NOT re-publish
-        // ? the cache must contain the original fingerprint so the next
-        // `canRetry` can still match against it.
-        return yield* Effect.gen(function* () {
           yield* drivePreparedStream(prepared)
           if (ctx.needsCompaction) return "compact"
           if (ctx.blocked || ctx.assistantMessage.error) return "stop"
@@ -1062,7 +1008,6 @@ export const layer = Layer.effect(
         updateToolCall,
         completeToolCall,
         process,
-        processPrepared,
       } satisfies Handle
     })
 
@@ -1085,7 +1030,6 @@ export const defaultLayer = Layer.suspend(() =>
     Layer.provide(Config.defaultLayer),
     Layer.provide(RuntimeFlags.defaultLayer),
     Layer.provide(EventV2Bridge.defaultLayer),
-    Layer.provide(SessionRetryExact.defaultLayer),
   ),
 )
 

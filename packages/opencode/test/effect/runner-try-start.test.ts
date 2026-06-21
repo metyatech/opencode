@@ -3,14 +3,14 @@ import { Deferred, Effect, Exit, Layer, Ref, Scope } from "effect"
 import { testEffect, pollWithTimeout, awaitWithTimeout } from "../lib/effect"
 import { Runner } from "@/effect/runner"
 
-// `Runner.tryStart` is the atomic claim-or-fail primitive that underpins
-// `session.retryExact`'s integration with the per-session runner. The
-// normal prompt path (`ensureRunning`) and the exact-retry path
+// `Runner.tryStart` is the atomic claim-or-fail primitive for detached
+// exclusive runs on the per-session runner. The normal prompt path
+// (`ensureRunning`) and the detached claim path
 // (`SessionRunState.claimExclusive` -> `tryStart`) both occupy the SAME
 // `Running` state on the SAME per-session runner, so proving that
 // `tryStart` refuses to start a second run while the runner is busy
-// proves both exact-vs-exact and exact-vs-normal-prompt mutual exclusion
-// at the authoritative gate.
+// proves mutual exclusion against a concurrent prompt at the
+// authoritative gate.
 const it = testEffect(Layer.empty)
 
 describe("Runner.tryStart", () => {

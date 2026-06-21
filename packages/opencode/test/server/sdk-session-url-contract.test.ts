@@ -32,10 +32,6 @@ describe("workspace SDK session path contract", () => {
     await client.session.retryAsync({ path: { sessionID, messageID }, body: { model } })
     await client.session.summarize({ path: { sessionID }, body: { ...model } })
     await client.session.abort({ path: { sessionID } })
-    await client.session.retryExact({
-      path: { sessionID },
-      body: { messageID, expectedProviderID: model.providerID, expectedModelID: model.modelID },
-    })
 
     expect(requests).toEqual([
       { method: "GET", pathname: "/session/ses_contract/message" },
@@ -45,7 +41,6 @@ describe("workspace SDK session path contract", () => {
       { method: "POST", pathname: "/session/ses_contract/message/msg_contract/retry_async" },
       { method: "POST", pathname: "/session/ses_contract/summarize" },
       { method: "POST", pathname: "/session/ses_contract/abort" },
-      { method: "POST", pathname: "/session/ses_contract/retry-exact" },
     ])
     expect(requests.every((request) => !request.pathname.includes("undefined"))).toBe(true)
   })

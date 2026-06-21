@@ -32,7 +32,6 @@ import { Instruction } from "../../src/session/instruction"
 import { SessionProcessor } from "../../src/session/processor"
 import { SessionPrompt } from "../../src/session/prompt"
 import { SessionRevert } from "../../src/session/revert"
-import { SessionRetryExact } from "../../src/session/retry-exact"
 import { SessionRunState } from "../../src/session/run-state"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
 import { SessionStatus } from "../../src/session/status"
@@ -211,7 +210,6 @@ function makePrompt(input?: { processor?: "blocking" }) {
     status,
     SyncEvent.defaultLayer,
     EventV2Bridge.defaultLayer,
-    SessionRetryExact.defaultLayer,
   ).pipe(Layer.provideMerge(infra))
   const question = Question.layer.pipe(Layer.provideMerge(deps))
   const todo = Todo.layer.pipe(Layer.provideMerge(deps))
