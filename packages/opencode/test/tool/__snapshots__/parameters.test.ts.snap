@@ -20,6 +20,12 @@ exports[`tool parameters JSON Schema (wire shape) bash 1`] = `
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "properties": {
+    "background_after_ms": {
+      "description": "If the command is still running after this many milliseconds, return a background process handle instead of waiting for completion. 0 disables background promotion. Defaults to 10000ms. The hard \`timeout\` still applies as the overall deadline; once backgrounded, the manager enforces it.",
+      "maximum": 60000,
+      "minimum": 0,
+      "type": "integer",
+    },
     "command": {
       "description": "The command to execute",
       "type": "string",
