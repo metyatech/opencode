@@ -100,6 +100,16 @@ async function cleanupPidFile(file: string) {
   if (Number.isFinite(pid)) await killProcessTree(pid)
 }
 
+async function waitForPidFile(file: string, timeout = 5_000) {
+  const end = Date.now() + timeout
+  while (Date.now() < end) {
+    const pid = Number((await fs.readFile(file, "utf8").catch(() => "")).trim())
+    if (Number.isFinite(pid) && pid > 0) return pid
+    await new Promise((resolve) => setTimeout(resolve, 50))
+  }
+  throw new Error(`Timed out waiting for pid file: ${file}`)
+}
+
 async function tmpdirCleaningPids(...pidNames: string[]) {
   const tmp = await tmpdir()
   return {
@@ -110,6 +120,18 @@ async function tmpdirCleaningPids(...pidNames: string[]) {
     },
   }
 }
+
+const sigtermIgnoringDescendant = (pidFile: string) => `
+  const { spawn } = require("node:child_process")
+  const fs = require("node:fs")
+  const child = spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 60000)"], {
+    stdio: "inherit",
+    shell: false,
+  })
+  fs.writeFileSync(${JSON.stringify(pidFile)}, String(child.pid))
+  child.unref()
+  setInterval(() => {}, 60000)
+`
 
 describe("cross-spawn spawner", () => {
   describe("basic spawning", () => {
@@ -519,11 +541,13 @@ describe("cross-spawn spawner", () => {
         const code = yield* ChildProcessSpawner.ChildProcessSpawner.use((svc) =>
           svc.exitCode(ChildProcess.make(process.execPath, [helperPath])),
         )
+        const descendantPid = yield* Effect.promise(() => waitForPidFile(pidFile))
         const elapsed = Date.now() - started
         // Foreground process exits in well under 5 seconds even though the
         // detached child keeps stdio open for much longer.
         expect(elapsed).toBeLessThan(5_000)
         expect(code).toBe(ChildProcessSpawner.ExitCode(0))
+        expect(alive(descendantPid)).toBe(true)
       }),
     )
 
@@ -599,6 +623,51 @@ describe("cross-spawn spawner", () => {
     )
 
     fx.effect(
+      "kill({ forceKillAfter }) force-kills SIGTERM-ignoring descendants after foreground exit",
+      Effect.gen(function* () {
+        if (process.platform === "win32") return
+
+        const tmp = yield* Effect.acquireRelease(
+          Effect.promise(() => tmpdirCleaningPids(descendantPidFile)),
+          (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+        )
+        const helperPath = path.join(tmp.path, "descendant-kill.cjs")
+        const pidFile = path.join(tmp.path, descendantPidFile)
+        yield* Effect.promise(() => fs.writeFile(helperPath, sigtermIgnoringDescendant(pidFile)))
+        const handle = yield* ChildProcessSpawner.ChildProcessSpawner.use((svc) =>
+          svc.spawn(ChildProcess.make(process.execPath, [helperPath])),
+        )
+        const descendantPid = yield* Effect.promise(() => waitForPidFile(pidFile))
+        const started = Date.now()
+        yield* handle.kill({ forceKillAfter: "100 millis" })
+        const elapsed = Date.now() - started
+
+        expect(elapsed).toBeLessThan(3_000)
+        expect(yield* Effect.promise(() => gone(descendantPid, 2_000))).toBe(true)
+      }),
+    )
+
+    fx.effect(
+      "forceKillAfter is not spent once for exit and again for close",
+      Effect.gen(function* () {
+        if (process.platform === "win32") return
+
+        const started = Date.now()
+        const exit = yield* Effect.exit(
+          Effect.gen(function* () {
+            const handle = yield* js('process.on("SIGTERM", () => {}); setInterval(() => {}, 60000)')
+            yield* handle.kill({ forceKillAfter: "750 millis" })
+            return yield* handle.exitCode
+          }),
+        )
+        const elapsed = Date.now() - started
+
+        expect(elapsed).toBeLessThan(1_400)
+        expect(Exit.isFailure(exit) ? true : exit.value !== ChildProcessSpawner.ExitCode(0)).toBe(true)
+      }),
+    )
+
+    fx.effect(
       "scope cleanup returns in bounded time even if stdio never closes",
       Effect.gen(function* () {
         const tmp = yield* Effect.acquireRelease(
@@ -634,6 +703,71 @@ describe("cross-spawn spawner", () => {
         )
         const elapsed = Date.now() - started
         expect(elapsed).toBeLessThan(3_000)
+      }),
+    )
+
+    fx.effect(
+      "abort/interrupted scope cleanup force-kills SIGTERM-ignoring descendants",
+      Effect.gen(function* () {
+        if (process.platform === "win32") return
+
+        const tmp = yield* Effect.acquireRelease(
+          Effect.promise(() => tmpdirCleaningPids(descendantPidFile)),
+          (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+        )
+        const helperPath = path.join(tmp.path, "descendant-abort.cjs")
+        const pidFile = path.join(tmp.path, descendantPidFile)
+        yield* Effect.promise(() => fs.writeFile(helperPath, sigtermIgnoringDescendant(pidFile)))
+        const started = Date.now()
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* ChildProcessSpawner.ChildProcessSpawner.use((svc) =>
+              svc.spawn(ChildProcess.make(process.execPath, [helperPath])),
+            )
+            yield* Effect.promise(() => waitForPidFile(pidFile))
+            return yield* Effect.never.pipe(Effect.raceFirst(Effect.sleep("100 millis").pipe(Effect.as("aborted"))))
+          }),
+        )
+        const descendantPid = yield* Effect.promise(() => waitForPidFile(pidFile))
+        const elapsed = Date.now() - started
+
+        expect(result).toBe("aborted")
+        expect(elapsed).toBeLessThan(3_000)
+        expect(yield* Effect.promise(() => gone(descendantPid, 2_000))).toBe(true)
+      }),
+    )
+
+    fx.effect(
+      "timeout scope cleanup force-kills SIGTERM-ignoring descendants",
+      Effect.gen(function* () {
+        if (process.platform === "win32") return
+
+        const tmp = yield* Effect.acquireRelease(
+          Effect.promise(() => tmpdirCleaningPids(descendantPidFile)),
+          (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+        )
+        const helperPath = path.join(tmp.path, "descendant-timeout.cjs")
+        const pidFile = path.join(tmp.path, descendantPidFile)
+        yield* Effect.promise(() => fs.writeFile(helperPath, sigtermIgnoringDescendant(pidFile)))
+        const started = Date.now()
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* ChildProcessSpawner.ChildProcessSpawner.use((svc) =>
+              svc.spawn(ChildProcess.make(process.execPath, [helperPath])),
+            )
+            yield* Effect.promise(() => waitForPidFile(pidFile))
+            return yield* Effect.timeoutOrElse(Effect.never, {
+              duration: "100 millis",
+              orElse: () => Effect.succeed("timeout"),
+            })
+          }),
+        )
+        const descendantPid = yield* Effect.promise(() => waitForPidFile(pidFile))
+        const elapsed = Date.now() - started
+
+        expect(result).toBe("timeout")
+        expect(elapsed).toBeLessThan(3_000)
+        expect(yield* Effect.promise(() => gone(descendantPid, 2_000))).toBe(true)
       }),
     )
 
@@ -678,13 +812,14 @@ describe("cross-spawn spawner", () => {
       "preserves signal exit code semantics",
       Effect.gen(function* () {
         if (process.platform === "win32") return
-        const code = yield* Effect.exit(
-          js("process.kill(process.pid, 'SIGTERM')", { killSignal: "SIGTERM" }),
-        )
-        // We do not assert a specific value, but the result must surface
-        // (either as ExitCode on non-signal exit, or as a PlatformError
-        // for the signal interruption) — not as a hang.
-        expect(Exit.isFailure(code) || typeof code === "object").toBe(true)
+        const code = yield* Effect.exit(js("process.kill(process.pid, 'SIGTERM')", { killSignal: "SIGTERM" }))
+        // Signal termination must produce a concrete failure with signal info,
+        // not a successful exit or a null-like value.
+        expect(Exit.isFailure(code)).toBe(true)
+        if (Exit.isFailure(code)) {
+          const errorMessage = (code.cause as unknown as { error: PlatformError.PlatformError }).error.message
+          expect(errorMessage).toContain("signal")
+        }
       }),
     )
   })

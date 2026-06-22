@@ -133,6 +133,9 @@ const failOnce = (signal: ExitSignal, err: PlatformError.PlatformError): void =>
   Deferred.doneUnsafe(signal, Exit.fail(err))
 }
 
+const isNoSuchProcessError = (err: unknown) =>
+  typeof err === "object" && err !== null && "code" in err && err.code === "ESRCH"
+
 export const make = Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const path = yield* Path.Path
@@ -365,6 +368,24 @@ export const make = Effect.gen(function* () {
     })
   }
 
+  const processSignalTarget = (command: ChildProcess.StandardCommand, proc: NodeChildProcess.ChildProcess) => {
+    if (Predicate.isUndefined(proc.pid)) return undefined
+    if (globalThis.process.platform !== "win32" && (command.options.detached ?? true)) return -proc.pid
+    return proc.pid
+  }
+
+  const processTreeRunning = (command: ChildProcess.StandardCommand, proc: NodeChildProcess.ChildProcess) => {
+    const target = processSignalTarget(command, proc)
+    if (Predicate.isUndefined(target)) return false
+    try {
+      globalThis.process.kill(target, 0)
+      return true
+    } catch (err) {
+      if (isNoSuchProcessError(err)) return false
+      return true
+    }
+  }
+
   const killOne = (
     command: ChildProcess.StandardCommand,
     proc: NodeChildProcess.ChildProcess,
@@ -384,26 +405,54 @@ export const make = Effect.gen(function* () {
    * `closed` is only used here as a safety net for the rare case where
    * `exit` never fires.
    */
-  const waitForExit = (
-    lifecycle: ProcessLifecycle,
-    timeout: Duration.Input,
-  ): Effect.Effect<ExitInfo, never> => {
+  const waitForExit = (lifecycle: ProcessLifecycle, timeout: Duration.Input): Effect.Effect<ExitInfo> => {
     const sentinel: ExitInfo = [null, null]
     return Deferred.await(lifecycle.exited).pipe(
       Effect.orElseSucceed(() => sentinel),
+      Effect.raceFirst(Deferred.await(lifecycle.closed).pipe(Effect.orElseSucceed(() => sentinel))),
       Effect.timeoutOrElse({
         duration: timeout,
-        orElse: () =>
-          Deferred.await(lifecycle.closed).pipe(
-            Effect.orElseSucceed(() => sentinel),
-            Effect.timeoutOrElse({
-              duration: timeout,
-              orElse: () => Effect.succeed(sentinel),
-            }),
-          ),
+        orElse: () => Effect.succeed(sentinel),
       }),
     )
   }
+
+  const waitForProcessTreeExit = (
+    command: ChildProcess.StandardCommand,
+    proc: NodeChildProcess.ChildProcess,
+    timeout: Duration.Input,
+  ): Effect.Effect<boolean> =>
+    Effect.suspend(() => {
+      const poll = (): Effect.Effect<boolean> =>
+        Effect.sync(() => !processTreeRunning(command, proc)).pipe(
+          Effect.flatMap((done) => {
+            if (done) return Effect.succeed(true)
+            return Effect.sleep("50 millis").pipe(Effect.flatMap(() => poll()))
+          }),
+        )
+
+      return poll().pipe(
+        Effect.timeoutOrElse({
+          duration: timeout,
+          orElse: () => Effect.succeed(false),
+        }),
+      )
+    })
+
+  const waitForExitAndCleanup = (
+    command: ChildProcess.StandardCommand,
+    proc: NodeChildProcess.ChildProcess,
+    lifecycle: ProcessLifecycle,
+    timeout: Duration.Input,
+    cleanupObserved: boolean,
+  ) =>
+    Effect.all(
+      [
+        waitForExit(lifecycle, timeout),
+        cleanupObserved ? Effect.succeed(true) : waitForProcessTreeExit(command, proc, timeout),
+      ] as const,
+      { concurrency: 2 },
+    )
 
   const killAndWait = (
     command: ChildProcess.StandardCommand,
@@ -413,17 +462,26 @@ export const make = Effect.gen(function* () {
     timeout: Duration.Input | undefined,
   ): Effect.Effect<void, PlatformError.PlatformError> => {
     const send = (s: NodeJS.Signals) =>
-      Effect.catch(killGroup(command, proc, s), () => killOne(command, proc, s))
+      Effect.catch(killGroup(command, proc, s).pipe(Effect.as(globalThis.process.platform === "win32")), () =>
+        killOne(command, proc, s).pipe(Effect.as(false)),
+      )
     const cap: Duration.Input = timeout ?? `${HARD_KILL_GRACE_MS} millis`
     return Effect.gen(function* () {
-      yield* send(signal)
-      const info = yield* waitForExit(lifecycle, cap)
+      const cleanupObserved = yield* send(signal).pipe(Effect.orElseSucceed(() => false))
+      const [info, cleaned] = yield* waitForExitAndCleanup(command, proc, lifecycle, cap, cleanupObserved)
       const [code, sig] = info
-      if (code === null && sig === null) {
-        // Either we hit the hard cap, or `exit`/`close` never fired. Try
-        // SIGKILL once and give the process a final bounded grace window.
-        yield* send("SIGKILL").pipe(Effect.ignore)
-        yield* waitForExit(lifecycle, `${HARD_KILL_GRACE_MS} millis`)
+      if ((code === null && sig === null) || !cleaned) {
+        // Either the foreground process did not exit, or descendants in the
+        // process group/tree were still alive after the same grace window. Try
+        // SIGKILL once and give cleanup a separate final bounded grace window.
+        const forceCleanupObserved = yield* send("SIGKILL").pipe(Effect.orElseSucceed(() => false))
+        yield* waitForExitAndCleanup(
+          command,
+          proc,
+          lifecycle,
+          `${HARD_KILL_GRACE_MS} millis`,
+          forceCleanupObserved,
+        ).pipe(Effect.ignore)
       }
     })
   }

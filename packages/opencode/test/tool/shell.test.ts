@@ -79,6 +79,7 @@ const quote = (text: string) => `"${text}"`
 const squote = (text: string) => `'${text}'`
 const projectRoot = path.join(__dirname, "../..")
 const bin = quote(process.execPath.replaceAll("\\", "/"))
+const nodeTestBin = Bun.which("node")
 const bash = (() => {
   const shell = Shell.acceptable()
   if (Shell.name(shell) === "bash") return shell
@@ -113,6 +114,28 @@ const fill = (mode: "lines" | "bytes", n: number) => {
   const text = `${bin} -e ${evalarg(code)} ${n}`
   if (PS.has(sh())) return `& ${text}`
   return text
+}
+const lineMarker = (index: number) => `LINE-${String(index).padStart(6, "0")}`
+const markerLines = (count: number) => Array.from({ length: count }, (_, i) => lineMarker(i + 1))
+const markerOutput = (count: number) => markerLines(count).join("\n") + "\n"
+const fillMarkers = (count: number) => {
+  const code =
+    "console.log(Array.from({length:Number(Bun.argv[1])},(_,i)=>String.fromCharCode(76,73,78,69,45)+String(i+1).padStart(6,String.fromCharCode(48))).join(String.fromCharCode(10)))"
+  const text = `${bin} -e ${evalarg(code)} ${count}`
+  if (PS.has(sh())) return `& ${text}`
+  return text
+}
+const parseLineMarkers = (text: string) => text.split(/\r?\n/).filter((line) => /^LINE-\d{6}$/.test(line))
+const stripAnsi = (text: string) => text.replace(/\u001B\[[0-9;]*m/g, "")
+const expectExactMarkers = (text: string, count: number) => {
+  const expected = markerLines(count)
+  const actual = parseLineMarkers(text)
+  const duplicates = actual.filter((line, i) => actual.indexOf(line) !== i)
+  const missing = expected.filter((line) => !actual.includes(line))
+  expect(actual.length).toBe(count)
+  expect(duplicates).toEqual([])
+  expect(missing).toEqual([])
+  expect(actual).toEqual(expected)
 }
 const nodeEval = (code: string) => {
   const text = `${bin} -e ${evalarg(code)}`
@@ -996,13 +1019,15 @@ describe("tool.shell permissions", () => {
     Effect.gen(function* () {
       const tmp = yield* tmpdirScoped()
       yield* Effect.promise(() => Bun.write(path.join(tmp, "tmpfile"), "x"))
+      yield* Effect.promise(() => fs.mkdir(path.join(tmp, "nested")))
       yield* runIn(
         tmp,
         Effect.gen(function* () {
           const requests: Array<Omit<Permission.Request, "id" | "sessionID" | "tool">> = []
+          const nested = path.join(tmp, "nested")
           yield* run(
             {
-              command: `rm -rf ${path.join(tmp, "nested")}`,
+              command: sh() === "cmd" ? `rmdir /s /q ${quote(nested)}` : `rm -rf ${nested}`,
               description: "Remove nested dir",
             },
             capture(requests),
@@ -1086,10 +1111,11 @@ describe("tool.shell permissions", () => {
         tmp,
         Effect.gen(function* () {
           const requests: Array<Omit<Permission.Request, "id" | "sessionID" | "tool">> = []
-          yield* run({ command: "ls -la", description: "List" }, capture(requests))
+          const command = sh() === "cmd" ? "dir" : "ls -la"
+          yield* run({ command, description: "List" }, capture(requests))
           const bashReq = requests.find((r) => r.permission === "bash")
           expect(bashReq).toBeDefined()
-          expect(bashReq!.always[0]).toBe("ls *")
+          expect(bashReq!.always[0]).toBe(sh() === "cmd" ? "dir *" : "ls *")
         }),
       )
     }),
@@ -1202,6 +1228,41 @@ describe("tool.shell abort", () => {
     ),
   )
 
+  it.live("surfaces signal exit failure instead of converting it to null", () =>
+    process.platform === "win32"
+      ? Effect.void
+      : runIn(
+          projectRoot,
+          Effect.gen(function* () {
+            const error = yield* fail({
+              command: "kill -TERM $$",
+              description: "Signal exit",
+            })
+            expect(error.message).toContain("Process interrupted due to receipt of signal")
+            expect(error.message).toContain("SIGTERM")
+          }),
+        ),
+  )
+
+  it.live("spawn ENOENT is not reported as timeout", () =>
+    Effect.gen(function* () {
+      const tmp = yield* tmpdirScoped()
+      const started = Date.now()
+      const error = yield* runIn(
+        tmp,
+        fail({
+          command: "echo should-not-run",
+          description: "Missing cwd spawn",
+          workdir: path.join(tmp, "missing-cwd"),
+          timeout: 500,
+        }),
+      )
+      expect(Date.now() - started).toBeLessThan(5_000)
+      expect(error.message).not.toContain("shell tool terminated command after exceeding timeout")
+      expect(error.message.toLowerCase()).toMatch(/enoent|not found|no such file|cwd/)
+    }),
+  )
+
   it.live("streams metadata updates progressively", () =>
     runIn(
       projectRoot,
@@ -1266,12 +1327,15 @@ describe("tool.shell truncation", () => {
     runIn(
       projectRoot,
       Effect.gen(function* () {
+        const lineCount = 3
         const result = yield* run({
-          command: fill("lines", 1),
-          description: "Generate one line",
+          command: fillMarkers(lineCount),
+          description: "Generate marker lines",
         })
         expect((result.metadata as { truncated?: boolean }).truncated).toBe(false)
-        expect(result.output).toContain("1")
+        expect((result.metadata as { outputPath?: string }).outputPath).toBeUndefined()
+        expect(result.output).toBe(markerOutput(lineCount))
+        expectExactMarkers(result.output, lineCount)
       }),
     ),
   )
@@ -1282,7 +1346,7 @@ describe("tool.shell truncation", () => {
       Effect.gen(function* () {
         const lineCount = Truncate.MAX_LINES + 100
         const result = yield* run({
-          command: fill("lines", lineCount),
+          command: fillMarkers(lineCount),
           description: "Generate lines for file check",
         })
         mustTruncate(result)
@@ -1291,10 +1355,28 @@ describe("tool.shell truncation", () => {
         expect(filepath).toBeTruthy()
 
         const saved = yield* (yield* AppFileSystem.Service).readFileString(filepath!)
-        const lines = saved.trim().split(/\r?\n/)
-        expect(lines.length).toBe(lineCount)
-        expect(lines[0]).toBe("1")
-        expect(lines[lineCount - 1]).toBe(String(lineCount))
+        expect(saved).toBe(markerOutput(lineCount))
+        expectExactMarkers(saved, lineCount)
+      }),
+    ),
+  )
+
+  it.live("full byte output is saved exactly after truncation", () =>
+    runIn(
+      projectRoot,
+      Effect.gen(function* () {
+        const byteCount = Truncate.MAX_BYTES + 10000
+        const result = yield* run({
+          command: fill("bytes", byteCount),
+          description: "Generate bytes for file check",
+        })
+        mustTruncate(result)
+
+        const filepath = (result.metadata as { outputPath?: string }).outputPath
+        expect(filepath).toBeTruthy()
+
+        const saved = yield* (yield* AppFileSystem.Service).readFileString(filepath!)
+        expect(saved).toBe("a".repeat(byteCount))
       }),
     ),
   )
@@ -1378,23 +1460,21 @@ describe("tool.shell stdio lifecycle regression", () => {
     15_000,
   )
 
-  it.live(
-    "preserves foreground output produced before exit",
-    () =>
-      runIn(
-        projectRoot,
-        Effect.gen(function* () {
-          // The foreground process writes a distinctive string, then exits
-          // normally. The shell result must contain that string even
-          // though there is also a small amount of inherited-stdio data
-          // flowing around the exit.
-          const result = yield* run({
-            command: `echo fg-marker-output`,
-            description: "Preserve foreground output",
-          })
-          expect(result.output).toContain("fg-marker-output")
-        }),
-      ),
+  it.live("preserves foreground output produced before exit", () =>
+    runIn(
+      projectRoot,
+      Effect.gen(function* () {
+        // The foreground process writes a distinctive string, then exits
+        // normally. The shell result must contain that string even
+        // though there is also a small amount of inherited-stdio data
+        // flowing around the exit.
+        const result = yield* run({
+          command: `echo fg-marker-output`,
+          description: "Preserve foreground output",
+        })
+        expect(result.output).toContain("fg-marker-output")
+      }),
+    ),
   )
 
   it.live(
@@ -1409,7 +1489,7 @@ describe("tool.shell stdio lifecycle regression", () => {
           // foreground lines. We use `fill("lines", lines)` to construct
           // a command that is compatible with all configured shells.
           const lines = 500
-          const command = fill("lines", lines)
+          const command = fillMarkers(lines)
           let metadataCalls = 0
           const result = yield* run(
             { command, description: "Fast producer" },
@@ -1427,13 +1507,11 @@ describe("tool.shell stdio lifecycle regression", () => {
                 ),
             },
           )
-          // We require the output to contain at least most of the lines.
           // The capture pipeline is decoupled from metadata so a slow
-          // metadata callback cannot back-pressure persistence.
-          const missing = Array.from({ length: lines }, (_, i) => `${i + 1}`).filter(
-            (line) => !result.output.includes(line),
-          )
-          expect(missing.length).toBeLessThan(5)
+          // metadata callback cannot back-pressure persistence. Every
+          // foreground marker must appear exactly once, in producer order.
+          expectExactMarkers(result.output, lines)
+          expect(metadataCalls).toBeGreaterThan(0)
         }),
       ),
     15_000,
@@ -1513,19 +1591,18 @@ describe("tool.shell Windows PowerShell integration", () => {
     return
   }
 
-  const ps51 = Bun.which("powershell")
-  const ps7 = Bun.which("pwsh")
   const allShells = [
-    ps51 ? { label: "powershell-5.1", shell: ps51 } : undefined,
-    ps7 ? { label: "pwsh", shell: ps7 } : undefined,
-  ].filter((s): s is { label: string; shell: string } => Boolean(s))
+    { label: "powershell-5.1", shell: Bun.which("powershell") },
+    { label: "pwsh", shell: Bun.which("pwsh") },
+  ]
 
-  if (allShells.length === 0) {
-    it.live("skipped: no PowerShell 5.1 or pwsh available", () => Effect.void)
-    return
-  }
+  for (const candidate of allShells) {
+    if (!candidate.shell) {
+      it.live(`${candidate.label}: skipped because executable is unavailable`, () => Effect.void)
+      continue
+    }
+    const item = { label: candidate.label, shell: candidate.shell }
 
-  for (const item of allShells) {
     it.live(
       `${item.label}: detached child holds stdio but shell returns bounded time with marker`,
       () =>
@@ -1558,9 +1635,10 @@ describe("tool.shell Windows PowerShell integration", () => {
               `
               yield* Effect.promise(() => Bun.write(scriptPath, fixture))
               const start = Date.now()
-              const result = yield* run(
-                { command: `& ${bin} ${quote(scriptPath.replaceAll("\\", "/"))}`, description: "PS detach fixture" },
-              )
+              const result = yield* run({
+                command: `& ${bin} ${quote(scriptPath.replaceAll("\\", "/"))}`,
+                description: "PS detach fixture",
+              })
               const elapsed = Date.now() - start
               // The shell tool must return well under 10s. The detached
               // child would otherwise hold stdio for the full 10s.
@@ -1572,6 +1650,49 @@ describe("tool.shell Windows PowerShell integration", () => {
               expect(result.output).not.toContain("shell tool terminated command after exceeding timeout")
               // Exit code must be 0 (the foreground process exited 0).
               expect(result.metadata.exit).toBe(0)
+            }),
+          ),
+        ),
+      10_000,
+    )
+
+    if (!nodeTestBin) {
+      it.live(`${item.label}: skipped node --test pipeline because node executable is unavailable`, () => Effect.void)
+      continue
+    }
+
+    it.live(
+      `${item.label}: runs node --test summary through Select-String pipeline`,
+      () =>
+        withShell(
+          item,
+          runIn(
+            projectRoot,
+            Effect.gen(function* () {
+              const tmp = yield* tmpdirWithPidCleanup()
+              const fixturePath = path.join(tmp, "pipeline-fixture.test.cjs")
+              const fixture = `
+                const test = require("node:test")
+                test("pipeline pass one", () => {})
+                test("pipeline pass two", () => {})
+              `
+              yield* Effect.promise(() => Bun.write(fixturePath, fixture))
+              const result = yield* run({
+                command: `& ${quote(nodeTestBin.replaceAll("\\", "/"))} --test --test-reporter tap ${quote(
+                  fixturePath.replaceAll("\\", "/"),
+                )} 2>&1 | Select-String -Pattern "^# (tests|fail|pass|cancelled|skipped)" | Select-Object -First 10`,
+                description: "PowerShell node test summary pipeline",
+              })
+              const lines = stripAnsi(result.output)
+                .split(/\r?\n/)
+                .map((line) => line.trim())
+              expect(result.metadata.exit).toBe(0)
+              expect(lines).toContain("# tests 2")
+              expect(lines).toContain("# pass 2")
+              expect(lines).toContain("# fail 0")
+              expect(lines).toContain("# cancelled 0")
+              expect(lines).toContain("# skipped 0")
+              expect(result.output).not.toContain("shell tool terminated command after exceeding timeout")
             }),
           ),
         ),

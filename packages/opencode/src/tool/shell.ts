@@ -1,4 +1,4 @@
-import { Effect, Fiber, Queue, Stream } from "effect"
+import { Effect, Exit, Fiber, Queue, Stream } from "effect"
 import os from "os"
 import { createWriteStream } from "node:fs"
 import * as Tool from "./tool"
@@ -474,7 +474,10 @@ export const ShellTool = Tool.define(
         },
       })
 
-      type Completion = { readonly _tag: "Exited" } | { readonly _tag: "Aborted" } | { readonly _tag: "TimedOut" }
+      type Completion =
+        | { readonly _tag: "Exited"; readonly exit: Exit.Exit<number, unknown> }
+        | { readonly _tag: "Aborted" }
+        | { readonly _tag: "TimedOut" }
 
       const { code, completion }: { code: number | null; completion: Completion } = yield* Effect.scoped(
         Effect.gen(function* () {
@@ -508,6 +511,27 @@ export const ShellTool = Tool.define(
           type ChunkEnvelope = { readonly _tag: "chunk"; readonly text: string } | { readonly _tag: "done" }
           const chunks = yield* Queue.bounded<ChunkEnvelope>(CAPACITY)
           const meta = yield* Queue.bounded<{ output: string }>(CAPACITY)
+          let captureOpen = true
+          const closeCapture = Effect.sync(() => {
+            captureOpen = false
+          })
+          const offerCaptured = (text: string) =>
+            Effect.gen(function* () {
+              while (true) {
+                const offered = yield* Effect.sync(() => {
+                  if (!captureOpen) return true
+                  return Queue.offerUnsafe(chunks, { _tag: "chunk", text })
+                })
+                if (offered) return
+                yield* Effect.yieldNow
+              }
+            })
+          const offerDone = Effect.gen(function* () {
+            while (true) {
+              if (yield* Effect.sync(() => Queue.offerUnsafe(chunks, { _tag: "done" }))) return
+              yield* Effect.yieldNow
+            }
+          })
 
           // Persistence fiber: read from chunks queue, write to disk / list.
           const persist = yield* Effect.forkScoped(
@@ -572,11 +596,14 @@ export const ShellTool = Tool.define(
           // timeout fires), so we do not keep reading from a stdio handle
           // held open by a detached descendant.
           const captureFiber = Effect.runFork(
-            Stream.runForEach(Stream.decodeText(handle.all), (chunk) =>
-              Queue.offer(chunks, { _tag: "chunk", text: chunk }),
-            ).pipe(Effect.ignore),
+            Stream.runForEach(Stream.decodeText(handle.all), offerCaptured).pipe(Effect.ignore),
           )
-          yield* Effect.addFinalizer(() => Effect.sync(() => captureFiber.interruptUnsafe()))
+          yield* Effect.addFinalizer(() =>
+            Effect.gen(function* () {
+              yield* closeCapture
+              yield* Effect.sync(() => captureFiber.interruptUnsafe())
+            }),
+          )
 
           const abort = Effect.callback<void>((resume) => {
             if (ctx.abort.aborted) return resume(Effect.void)
@@ -594,7 +621,7 @@ export const ShellTool = Tool.define(
           // failed spawn IS an exit, and we should not wait the full timeout
           // just because the process could not start.
           const completion: Completion = yield* Effect.raceAll([
-            Effect.map(Effect.exit(handle.exitCode), () => ({ _tag: "Exited" as const })),
+            Effect.map(Effect.exit(handle.exitCode), (exit) => ({ _tag: "Exited" as const, exit })),
             Effect.map(abort, () => ({ _tag: "Aborted" as const })),
             Effect.map(timeout, () => ({ _tag: "TimedOut" as const })),
           ])
@@ -620,14 +647,13 @@ export const ShellTool = Tool.define(
             Fiber.join(captureFiber).pipe(Effect.as(true)),
             Effect.as(Effect.sleep(`${CAPTURE_DRAIN_GRACE_MS} millis`), false),
           )
+          yield* closeCapture
           if (!captured) yield* Effect.sync(() => captureFiber.interruptUnsafe())
-          // Offer the done sentinel. We loop in case the queue is full
-          // because the persistence consumer is still draining prior chunks.
-          yield* Effect.gen(function* () {
-            while (!(yield* Queue.offer(chunks, { _tag: "done" }))) {
-              yield* Effect.yieldNow
-            }
-          })
+          // Offer the done sentinel only after the capture gate is closed,
+          // so no producer can enqueue after it. Race the offer with
+          // persistence failure so a dead consumer cannot deadlock finalization
+          // when the bounded queue is full.
+          yield* Effect.race(offerDone, Fiber.join(persist))
 
           // Wait for persistence to finish draining. Bounded by the queue
           // size: persistence ends as soon as it observes the done sentinel.
@@ -635,15 +661,13 @@ export const ShellTool = Tool.define(
 
           // Resolve exit code: the public `handle.exitCode` is now safe to
           // read because foreground process has exited (or we killed it).
-          let resolvedCode: number | null
           if (completion._tag === "Exited") {
-            const c = yield* handle.exitCode.pipe(Effect.orElseSucceed(() => null))
-            resolvedCode = c === null ? null : (c as unknown as number)
-          } else {
-            resolvedCode = null
+            if (Exit.isFailure(completion.exit)) {
+              return yield* Effect.failCause(completion.exit.cause)
+            }
+            return { code: completion.exit.value, completion }
           }
-
-          return { code: resolvedCode, completion }
+          return { code: null, completion }
         }),
       ).pipe(Effect.orDie)
 
