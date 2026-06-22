@@ -186,66 +186,6 @@ describe("ProcessManager integration (real children)", () => {
     }),
   )
 
-  it.instance("write to a real child's stdin is echoed back through poll", () =>
-    Effect.gen(function* () {
-      const manager = yield* ProcessManager.Service
-      // The child reads stdin line-by-line and writes it back to stdout,
-      // then exits after 200ms regardless of activity.
-      const stdinScript = `let buf = ""; process.stdin.on("data", (d) => { buf += d.toString(); }); process.stdin.on("end", () => { process.stdout.write(buf); process.exit(0); }); setTimeout(() => { process.stdout.write(buf); process.exit(0); }, 200);`
-      const child = yield* spawnAndOwn([BUN_BIN, "-e", stdinScript], { stdin: "pipe" })
-
-      const managed = buildManagedChildFromBun(child, true)
-      const info = yield* manager.promote({
-        sessionID: "ses_int_stdin",
-        command: "stdin-echo",
-        cwd: process.cwd(),
-        pid: child.pid,
-        stdinAvailable: true,
-        child: managed,
-      })
-
-      // Write "ping\n" with appendNewline=true. The manager's `write` path
-      // appends a "\n" for us, which means the trailing newline we already
-      // include in the test data would be doubled. Pass `appendNewline: false`
-      // to send exactly "ping\n" (the child expects line-terminated input).
-      const wr = yield* manager.write({
-        sessionID: "ses_int_stdin",
-        handle: info.handle,
-        data: "ping\n",
-        appendNewline: false,
-      })
-      expect(wr).toBeDefined()
-      expect(wr!.bytesWritten).toBe("ping\n".length)
-
-      // Close stdin so the child can flush its buffer and exit deterministically.
-      yield* Effect.sync(() => {
-        const w = child.stdin as unknown as { end?: () => void } | null
-        w?.end?.()
-      })
-
-      // Give the child time to finish + the manager's exit watcher to fire.
-      yield* Effect.promise(() => child.exited)
-      yield* Effect.sleep("20 millis")
-
-      // Drain stdout and feed it into the manager's buffer so `poll` can
-      // surface it.
-      const lines = yield* Effect.promise(() => collectLines(child.stdout))
-      for (const line of lines) {
-        yield* manager.feed({
-          sessionID: "ses_int_stdin",
-          handle: info.handle,
-          kind: "stdout",
-          text: line,
-        })
-      }
-
-      const polled = yield* manager.poll({ sessionID: "ses_int_stdin", handle: info.handle, cursor: 0 })
-      expect(polled).toBeDefined()
-      const combined = polled!.events.map((e) => e.text).join("")
-      expect(combined).toContain("ping")
-    }),
-  )
-
   it.instance("stop kills a long-running real child (Windows + POSIX adapter path)", () =>
     Effect.gen(function* () {
       const manager = yield* ProcessManager.Service

@@ -14,8 +14,6 @@ describe("process-manager schema", () => {
     if (poll.action === "poll") {
       expect(poll.handle as unknown as string).toBe("proc_abc")
     }
-    const write = decode({ action: "write", handle: ProcessHandle.make("proc_xyz"), data: "ls\n", append_newline: false })
-    expect(write.action).toBe("write")
     const stop = decode({ action: "stop", handle: ProcessHandle.make("proc_done") })
     expect(stop.action).toBe("stop")
   })
@@ -30,20 +28,20 @@ describe("process-manager schema", () => {
     expect(threw).toBe(true)
   })
 
-  test("rejects missing required field (poll without handle)", () => {
+  test("rejects the removed write action (stdin is intentionally not a public surface)", () => {
     let threw = false
     try {
-      decode({ action: "poll" })
+      decode({ action: "write", handle: ProcessHandle.make("proc_x"), data: "ignored" })
     } catch {
       threw = true
     }
     expect(threw).toBe(true)
   })
 
-  test("rejects wrong type (write.data must be string)", () => {
+  test("rejects missing required field (poll without handle)", () => {
     let threw = false
     try {
-      decode({ action: "write", handle: ProcessHandle.make("proc_x"), data: 42 })
+      decode({ action: "poll" })
     } catch {
       threw = true
     }

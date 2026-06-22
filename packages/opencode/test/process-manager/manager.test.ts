@@ -203,51 +203,6 @@ describe("ProcessManager service", () => {
     }),
   )
 
-  it.instance("write to a closed-stdin child fails with StdinClosed", () =>
-    Effect.gen(function* () {
-      const manager = yield* ProcessManager.Service
-      const exit = yield* Deferred.make<number, never>()
-      const child = makeFakeChild({ pid: 31, exit }) // stdin=undefined
-      const info = yield* manager.promote({
-        sessionID: "ses_w",
-        command: "x",
-        cwd: "/",
-        pid: 31,
-        stdinAvailable: false,
-        child,
-      })
-
-      const exit2 = yield* Effect.exit(
-        manager.write({ sessionID: "ses_w", handle: info.handle, data: "hi" }),
-      )
-      expect(exit2._tag).toBe("Failure")
-    }),
-  )
-
-  it.instance("write to a running child with available stdin succeeds and reports bytes", () =>
-    Effect.gen(function* () {
-      const manager = yield* ProcessManager.Service
-      const exit = yield* Deferred.make<number, never>()
-      const child = makeFakeChild({ pid: 32, exit, stdin: true })
-      const info = yield* manager.promote({
-        sessionID: "ses_w2",
-        command: "x",
-        cwd: "/",
-        pid: 32,
-        stdinAvailable: true,
-        child,
-      })
-      const r = yield* manager.write({
-        sessionID: "ses_w2",
-        handle: info.handle,
-        data: "hi",
-        appendNewline: true,
-      })
-      expect(r).toBeDefined()
-      expect(r!.bytesWritten).toBe(3) // "hi\n" = 3 bytes
-    }),
-  )
-
   it.instance("poll returns events with monotonic cursor", () =>
     Effect.gen(function* () {
       const manager = yield* ProcessManager.Service

@@ -100,46 +100,6 @@ describe("ProcessManager ownership / session isolation", () => {
     }),
   )
 
-  it.instance("write returns undefined for cross-session handles (no signal, no side effect)", () =>
-    Effect.gen(function* () {
-      const manager = yield* ProcessManager.Service
-      const exit = yield* Deferred.make<number, never>()
-      const info = yield* manager.promote({
-        sessionID: "ses_owner_write",
-        command: "x",
-        cwd: "/",
-        pid: 702,
-        stdinAvailable: true,
-        child: makeFakeChild({ pid: 702, exit, stdin: true }),
-      })
-
-      const stopsBefore = fake.stops.length
-      const r = yield* manager.write({
-        sessionID: "ses_other_write",
-        handle: info.handle,
-        data: "should not deliver\n",
-        appendNewline: false,
-      })
-      expect(r).toBeUndefined()
-      // Cross-session write must not surface as a NotFound/NotRunning error
-      // (it returns undefined instead) AND must not call the adapter.
-      expect(fake.stops.length).toBe(stopsBefore)
-    }),
-  )
-
-  it.instance("write returns undefined for missing handles within the owning session", () =>
-    Effect.gen(function* () {
-      const manager = yield* ProcessManager.Service
-      const r = yield* manager.write({
-        sessionID: "ses_owner_write",
-        handle: ProcessHandle.make("proc_missing_write"),
-        data: "x",
-        appendNewline: false,
-      })
-      expect(r).toBeUndefined()
-    }),
-  )
-
   it.instance("stop fails with NotFound for cross-session handles (no adapter signal)", () =>
     Effect.gen(function* () {
       const manager = yield* ProcessManager.Service
