@@ -277,6 +277,65 @@ describe("ProcessManager drainStream UTF-8 chunk-boundary decoding", () => {
       expect(observed === "あ" || observed === "\uFFFD").toBe(true)
     }),
   )
+
+  it.instance(
+    "Effect Stream: end-of-stream flushes partial multi-byte sequences",
+    () =>
+      Effect.gen(function* () {
+        const manager = yield* ProcessManager.Service
+        // "あ" = E3 81 82 — 3 bytes. Send the first 2 bytes then
+        // close the stream. The Effect Stream path wraps
+        // `Stream.runForEach` in `Effect.ensuring(flushTail())`, so
+        // the decoder's end-of-stream flush must run on this path
+        // too (was previously the v2 regression: the Effect Stream
+        // path skipped the flush entirely). The flush must emit the
+        // partial sequence as U+FFFD rather than silently dropping
+        // it. We accept either the full character (if the decoder
+        // implementation buffers across end-of-stream and
+        // synthesizes the missing byte) OR the replacement char; in
+        // either case the buffer is non-empty after the stream
+        // closes — the bytes are not lost.
+        const partial = new Uint8Array([0xe3, 0x81])
+        const stream = chunkedEffectStream([partial])
+        const info = yield* manager.promote({
+          sessionID: "ses_utf8_partial_es",
+          command: "partial-effect-stream",
+          cwd: "/",
+          pid: 7005,
+          stdinAvailable: false,
+          child: {
+            pid: 7005,
+            exitCode: Effect.succeed(0),
+            kill: () => {},
+          },
+          stdout: stream,
+        })
+        let observed = ""
+        const deadline = Date.now() + 2000
+        while (Date.now() < deadline) {
+          const polled = yield* manager.poll({
+            sessionID: "ses_utf8_partial_es",
+            handle: info.handle as ProcessHandle,
+            cursor: 0,
+          })
+          if (polled) observed = polled.events.map((e) => e.text).join("")
+          if (observed.length > 0) break
+          yield* Effect.sleep("20 millis")
+        }
+        // Same loose assertion as the ReadableStream partial test:
+        //   - "あ" if the decoder implementation completes the
+        //     multi-byte sequence across end-of-stream
+        //   - "\uFFFD" if the standard replacement is emitted
+        // Either way, the buffer MUST have something — the bytes
+        // are not silently dropped. This is the regression guard
+        // for the Effect Stream flush path: without
+        // `Effect.ensuring(flushTail())`, observed would be ""
+        // because the forEach returns immediately and the decoder's
+        // buffered tail never flushes.
+        expect(observed.length).toBeGreaterThan(0)
+        expect(observed === "あ" || observed === "\uFFFD").toBe(true)
+      }),
+  )
 })
 
 // Async helper exported for the harness above. Not part of the

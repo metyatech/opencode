@@ -224,20 +224,32 @@ function drainStream(
           if (done) break
           if (value) appendChunk(value)
         }
-        flushTail()
       } catch {
         // Best-effort: errors during read mean the underlying handle is
         // already gone (child exit, OS reset). Buffer already accepts chunks
         // synchronously so nothing to roll back here.
       }
+      // Always flush at end-of-stream / on interruption so any partial
+      // multi-byte sequences surface as text (or the U+FFFD replacement)
+      // rather than being silently dropped.
+      flushTail()
     }).pipe(Effect.ignore)
   }
 
   // Path 2: Effect Stream. Use the typed runner for Stream<Uint8Array>.
+  // The runner's end-of-stream is signalled by forEach returning; we
+  // wrap it in `Effect.ensuring` so `flushTail()` runs on the happy
+  // path, on error, AND on interruption. The decoder instance is the
+  // same one the chunk callback used, so any buffered tail bytes that
+  // did not yet form a complete code point are emitted as text.
   if (Stream.isStream(stream)) {
-    return Stream.runForEach(stream as Stream.Stream<Uint8Array, never, never>, (chunk) =>
-      Effect.sync(() => appendChunk(chunk)),
-    ).pipe(Effect.ignore)
+    return Stream.runForEach(
+      stream as Stream.Stream<Uint8Array, never, never>,
+      (chunk) => Effect.sync(() => appendChunk(chunk)),
+    ).pipe(
+      Effect.ensuring(Effect.sync(() => flushTail())),
+      Effect.ignore,
+    )
   }
 
   // Unknown shape — skip capture silently. The caller can still drive the
