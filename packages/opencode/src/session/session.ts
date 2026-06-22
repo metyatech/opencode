@@ -2,6 +2,7 @@ import { Slug } from "@opencode-ai/core/util/slug"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
 import path from "path"
 import { BackgroundJob } from "@/background/job"
+import { ProcessManager } from "@/process-manager/service"
 import { BusEvent } from "@/bus/bus-event"
 import { Bus } from "@/bus"
 import { Decimal } from "decimal.js"
@@ -522,7 +523,12 @@ const db = <T>(fn: (d: Parameters<typeof Database.use>[0] extends (trx: infer D)
 export const layer: Layer.Layer<
   Service,
   never,
-  BackgroundJob.Service | Bus.Service | Storage.Service | SyncEvent.Service | RuntimeFlags.Service
+  | BackgroundJob.Service
+  | ProcessManager.Service
+  | Bus.Service
+  | Storage.Service
+  | SyncEvent.Service
+  | RuntimeFlags.Service
 > = Layer.effect(
   Service,
   Effect.gen(function* () {
@@ -531,6 +537,7 @@ export const layer: Layer.Layer<
     const storage = yield* Storage.Service
     const sync = yield* SyncEvent.Service
     const flags = yield* RuntimeFlags.Service
+    const manager = yield* ProcessManager.Service
 
     let taskReconciliationWatcher: InstanceState.InstanceState<boolean> | undefined
     const ensureTaskReconciliationWatcher: Effect.Effect<void> = Effect.gen(function* () {
@@ -621,6 +628,7 @@ export const layer: Layer.Layer<
         )
 
         if (hasInstance) yield* cancelBackgroundJobs(background, sessionID)
+        if (hasInstance) yield* manager.killAllForSession(sessionID).pipe(Effect.ignore)
         const kids = yield* children(sessionID)
         for (const child of kids) {
           yield* remove(child.id)
@@ -924,6 +932,7 @@ export const layer: Layer.Layer<
 
 export const defaultLayer = layer.pipe(
   Layer.provide(BackgroundJob.defaultLayer),
+  Layer.provide(ProcessManager.defaultLayer),
   Layer.provide(Bus.layer),
   Layer.provide(Storage.defaultLayer),
   Layer.provide(SyncEvent.defaultLayer),

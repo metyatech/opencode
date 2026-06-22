@@ -7,6 +7,19 @@ import { ShellID } from "./id"
 const PS = new Set(["powershell", "pwsh"])
 const CMD = new Set(["cmd"])
 
+// Default value for the `background_after_ms` parameter on the shell tool.
+// When a foreground command runs longer than this, the tool promotes it to a
+// background process manager handle and returns control to the model. Set to
+// 0 to disable promotion entirely (foreground-only behavior). 10s is the
+// default — short commands finish first and behave identically to today.
+export const DEFAULT_BACKGROUND_AFTER_MS = 10_000
+
+// Hard upper bound for `background_after_ms`. 60s prevents callers from
+// accidentally parking a stuck command for hours and forgetting about it;
+// the model's \`timeout\` parameter is the proper way to express a longer
+// overall deadline.
+export const MAX_BACKGROUND_AFTER_MS = 60_000
+
 const descriptions = {
   bash: "Clear, concise description of what this command does in 5-10 words. Examples:\nInput: ls\nOutput: Lists files in current directory\n\nInput: git status\nOutput: Shows working tree status\n\nInput: npm install\nOutput: Installs package dependencies\n\nInput: mkdir foo\nOutput: Creates directory 'foo'",
   powershell:
@@ -19,7 +32,7 @@ export type Limits = {
   maxBytes: number
 }
 
-export function parameterSchema(description: string) {
+export function parameterSchema(description: string, defaultBackgroundAfterMs: number) {
   return Schema.Struct({
     command: Schema.String.annotate({ description: "The command to execute" }),
     timeout: Schema.optional(PositiveInt).annotate({ description: "Optional timeout in milliseconds" }),
@@ -27,10 +40,15 @@ export function parameterSchema(description: string) {
       description: `The working directory to run the command in. Defaults to the current directory. Use this instead of 'cd' commands.`,
     }),
     description: Schema.String.annotate({ description }),
+    background_after_ms: Schema.optional(
+      Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)).check(Schema.isLessThanOrEqualTo(MAX_BACKGROUND_AFTER_MS)),
+    ).annotate({
+      description: `If the command is still running after this many milliseconds, return a background process handle instead of waiting for completion. 0 disables background promotion. Defaults to ${defaultBackgroundAfterMs}ms. The hard \`timeout\` still applies as the overall deadline; once backgrounded, the manager enforces it.`,
+    }),
   })
 }
 
-export const Parameters = parameterSchema(descriptions.bash)
+export const Parameters = parameterSchema(descriptions.bash, DEFAULT_BACKGROUND_AFTER_MS)
 export type Parameters = Schema.Schema.Type<typeof Parameters>
 
 function renderPrompt(template: string, values: Record<string, string>) {
@@ -83,7 +101,12 @@ function chainGuidance(name: string) {
   return "If the commands depend on each other and must run sequentially, use a single Bash call with '&&' to chain them together (e.g., `git add . && git commit -m \"message\" && git push`). For instance, if one operation must complete before another starts (like mkdir before cp, Write before Bash for git operations, or git add before git commit), run these operations sequentially instead."
 }
 
-function bashCommandSection(chain: string, limits: Limits, defaultTimeoutMs: number) {
+function bashCommandSection(
+  chain: string,
+  limits: Limits,
+  defaultTimeoutMs: number,
+  defaultBackgroundAfterMs: number,
+) {
   return `Before executing the command, please follow these steps:
 
 1. Directory Verification:
@@ -103,6 +126,7 @@ function bashCommandSection(chain: string, limits: Limits, defaultTimeoutMs: num
 Usage notes:
   - The command argument is required.
   - You can specify an optional timeout in milliseconds. If not specified, commands will time out after ${defaultTimeoutMs}ms.
+  - You can specify an optional \`background_after_ms\` (0..${MAX_BACKGROUND_AFTER_MS}, default ${defaultBackgroundAfterMs}) to promote the command to a background process handle if it has not exited by then. Set to 0 to disable background promotion and wait for completion. The hard \`timeout\` is the overall deadline regardless.
   - It is very helpful if you write a clear, concise description of what this command does in 5-10 words.
   - If the output exceeds ${limits.maxLines} lines or ${limits.maxBytes} bytes, it will be truncated and the full output will be written to a file. You can use Read with offset/limit to read specific sections or Grep to search the full content. Do NOT use \`head\`, \`tail\`, or other truncation commands to limit output; the full output will already be captured to a file for more precise searching.
 
@@ -133,6 +157,7 @@ function powershellCommandSection(
   pathSep: string,
   limits: Limits,
   defaultTimeoutMs: number,
+  defaultBackgroundAfterMs: number,
 ) {
   return `${powershellNotes(name)}
 
@@ -140,7 +165,7 @@ Before executing the command, please follow these steps:
 
 1. Directory Verification:
    - If the command will create new directories or files, first use \`Test-Path -LiteralPath <parent>\` to verify the parent directory exists and is the correct location
-   - For example, before creating \`foo${pathSep}bar\`, first use \`Test-Path -LiteralPath "foo"\` to check that \`foo\` exists and is the intended parent directory
+   - For example, before creating \`foo${pathSep}bar\`, first use \`Test-Path -LiteralPath "foo"\` to check that "foo" exists and is the intended parent directory
 
 2. Command Execution:
    - Always quote file paths that contain spaces with double quotes (e.g., Remove-Item -LiteralPath "path with spaces${pathSep}file.txt")
@@ -155,6 +180,7 @@ Before executing the command, please follow these steps:
 Usage notes:
   - The command argument is required.
   - You can specify an optional timeout in milliseconds. If not specified, commands will time out after ${defaultTimeoutMs}ms.
+  - You can specify an optional \`background_after_ms\` (0..${MAX_BACKGROUND_AFTER_MS}, default ${defaultBackgroundAfterMs}) to promote the command to a background process handle if it has not exited by then. Set to 0 to disable background promotion and wait for completion. The hard \`timeout\` is the overall deadline regardless.
   - It is very helpful if you write a clear, concise description of what this command does in 5-10 words.
   - If the output exceeds ${limits.maxLines} lines or ${limits.maxBytes} bytes, it will be truncated and the full output will be written to a file. You can use Read with offset/limit to read specific sections or Grep to search the full content. Do NOT use \`Select-Object -First\`, \`Select-Object -Last\`, or other truncation commands to limit output; the full output will already be captured to a file for more precise searching.
 
@@ -179,7 +205,12 @@ Usage notes:
     </bad-example>`
 }
 
-function cmdCommandSection(chain: string, limits: Limits, defaultTimeoutMs: number) {
+function cmdCommandSection(
+  chain: string,
+  limits: Limits,
+  defaultTimeoutMs: number,
+  defaultBackgroundAfterMs: number,
+) {
   return `# cmd.exe shell notes
 - Use double quotes for paths with spaces.
 - Use %VAR% for environment variables.
@@ -190,7 +221,7 @@ Before executing the command, please follow these steps:
 
 1. Directory Verification:
    - If the command will create new directories or files, first use \`if exist\` to verify the parent directory exists and is the correct location
-   - For example, before creating \`foo\\bar\`, first use \`if exist "foo\\" dir "foo"\` to check that \`foo\` exists and is the intended parent directory
+   - For example, before creating \`foo\\bar\`, first use \`if exist "foo\\" dir "foo"\` to check that "foo" exists and is the intended parent directory
 
 2. Command Execution:
    - Always quote file paths that contain spaces with double quotes (e.g., del "path with spaces\\file.txt")
@@ -205,6 +236,7 @@ Before executing the command, please follow these steps:
 Usage notes:
   - The command argument is required.
   - You can specify an optional timeout in milliseconds. If not specified, commands will time out after ${defaultTimeoutMs}ms.
+  - You can specify an optional \`background_after_ms\` (0..${MAX_BACKGROUND_AFTER_MS}, default ${defaultBackgroundAfterMs}) to promote the command to a background process handle if it has not exited by then. Set to 0 to disable background promotion and wait for completion. The hard \`timeout\` is the overall deadline regardless.
   - It is very helpful if you write a clear, concise description of what this command does in 5-10 words.
   - If the output exceeds ${limits.maxLines} lines or ${limits.maxBytes} bytes, it will be truncated and the full output will be written to a file. You can use Read with offset/limit to read specific sections or Grep to search the full content. Do NOT use \`more\` or other pagination commands to limit output; the full output will already be captured to a file for more precise searching.
 
@@ -229,7 +261,13 @@ Usage notes:
     </bad-example>`
 }
 
-function profile(name: string, platform: NodeJS.Platform, limits: Limits, defaultTimeoutMs: number) {
+function profile(
+  name: string,
+  platform: NodeJS.Platform,
+  limits: Limits,
+  defaultTimeoutMs: number,
+  defaultBackgroundAfterMs: number,
+) {
   const isPowerShell = PS.has(name)
   const chain = chainGuidance(name)
   if (CMD.has(name)) {
@@ -237,7 +275,7 @@ function profile(name: string, platform: NodeJS.Platform, limits: Limits, defaul
       intro: `Executes a given ${shellDisplayName(name)} command with optional timeout, ensuring proper handling and security measures.`,
       workdirSection:
         "All commands run in the current working directory by default. Use the `workdir` parameter if you need to run a command in a different directory. AVOID changing directories inside the command - use `workdir` instead.",
-      commandSection: cmdCommandSection(chain, limits, defaultTimeoutMs),
+      commandSection: cmdCommandSection(chain, limits, defaultTimeoutMs, defaultBackgroundAfterMs),
       gitCommands: "git commands",
       gitCommandRestriction: "git commands",
       createPrInstruction: "Create PR using a temporary body file so cmd.exe quoting stays simple.",
@@ -256,6 +294,7 @@ function profile(name: string, platform: NodeJS.Platform, limits: Limits, defaul
         platform === "win32" ? "\\" : "/",
         limits,
         defaultTimeoutMs,
+        defaultBackgroundAfterMs,
       ),
       gitCommands: "git commands",
       gitCommandRestriction: "git commands",
@@ -272,7 +311,7 @@ function profile(name: string, platform: NodeJS.Platform, limits: Limits, defaul
       "Executes a given bash command in a persistent shell session with optional timeout, ensuring proper handling and security measures.",
     workdirSection:
       "All commands run in the current working directory by default. Use the `workdir` parameter if you need to run a command in a different directory. AVOID using `cd <directory> && <command>` patterns - use `workdir` instead.",
-    commandSection: bashCommandSection(chain, limits, defaultTimeoutMs),
+    commandSection: bashCommandSection(chain, limits, defaultTimeoutMs, defaultBackgroundAfterMs),
     gitCommands: "bash commands",
     gitCommandRestriction: "git bash commands",
     createPrInstruction:
@@ -284,8 +323,14 @@ function profile(name: string, platform: NodeJS.Platform, limits: Limits, defaul
   }
 }
 
-export function render(name: string, platform: NodeJS.Platform, limits: Limits, defaultTimeoutMs: number) {
-  const selected = profile(name, platform, limits, defaultTimeoutMs)
+export function render(
+  name: string,
+  platform: NodeJS.Platform,
+  limits: Limits,
+  defaultTimeoutMs: number,
+  defaultBackgroundAfterMs: number,
+) {
+  const selected = profile(name, platform, limits, defaultTimeoutMs, defaultBackgroundAfterMs)
   return {
     description: renderPrompt(DESCRIPTION, {
       intro: selected.intro,
@@ -300,7 +345,7 @@ export function render(name: string, platform: NodeJS.Platform, limits: Limits, 
       createPrInstruction: selected.createPrInstruction,
       createPrExample: selected.createPrExample,
     }),
-    parameters: parameterSchema(selected.parameterDescription),
+    parameters: parameterSchema(selected.parameterDescription, defaultBackgroundAfterMs),
   }
 }
 

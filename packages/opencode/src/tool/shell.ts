@@ -1,4 +1,4 @@
-import { Effect, Exit, Fiber, Queue, Stream } from "effect"
+import { Effect, Exit, Fiber, Queue, Ref, Scope, Stream } from "effect"
 import os from "os"
 import { createWriteStream } from "node:fs"
 import * as Tool from "./tool"
@@ -20,8 +20,10 @@ import * as Truncate from "./truncate"
 import { Plugin } from "@/plugin"
 import { ChildProcess } from "effect/unstable/process"
 import { ChildProcessSpawner } from "effect/unstable/process/ChildProcessSpawner"
-import { ShellPrompt, type Parameters } from "./shell/prompt"
+import { ShellPrompt, type Parameters, DEFAULT_BACKGROUND_AFTER_MS } from "./shell/prompt"
 import { BashArity } from "@/permission/arity"
+import { ProcessManager } from "@/process-manager"
+import { ProcessError, ProcessInfo } from "@/process-manager/types"
 
 export { Parameters } from "./shell/prompt"
 
@@ -340,6 +342,11 @@ export const ShellTool = Tool.define(
     const trunc = yield* Truncate.Service
     const plugin = yield* Plugin.Service
     const flags = yield* RuntimeFlags.Service
+    // Capture the process manager at init time so the execute body doesn't
+    // need to `yield* ProcessManager.Service` directly (the tool definition's
+    // execute signature requires R=never). The captured reference is used
+    // by the background-promotion arm of the run() race.
+    const manager = yield* ProcessManager.Service
     const defaultTimeoutMs = flags.bashDefaultTimeoutMs ?? 2 * 60 * 1000
 
     const cygpath = Effect.fn("ShellTool.cygpath")(function* (shell: string, text: string) {
@@ -429,6 +436,8 @@ export const ShellTool = Tool.define(
         env: NodeJS.ProcessEnv
         timeout: number
         description: string
+        sessionID: string
+        backgroundAfterMs: number
       },
       ctx: Tool.Context,
     ) {
@@ -467,6 +476,17 @@ export const ShellTool = Tool.define(
         ).pipe(Effect.catch(() => Effect.void))
       })
 
+      // Promoted flag. When the background timer wins the race, we flip this
+      // to true before stopping the local capture/persist/metadata fibers and
+      // returning the background result. Every foreground-side cleanup path
+      // (closeSink finalizer, captureFiber finalizer, Aborted/TimedOut kill,
+      // capture drain, persist sentinel) checks this and becomes a no-op
+      // once the manager has taken ownership of the live child.
+      const promoted = yield* Ref.make(false)
+      const isPromoted = Effect.fnUntraced(function* () {
+        return yield* Ref.get(promoted)
+      })
+
       yield* ctx.metadata({
         metadata: {
           output: "",
@@ -478,11 +498,55 @@ export const ShellTool = Tool.define(
         | { readonly _tag: "Exited"; readonly exit: Exit.Exit<number, unknown> }
         | { readonly _tag: "Aborted" }
         | { readonly _tag: "TimedOut" }
+        | { readonly _tag: "Backgrounded" }
 
-      const { code, completion }: { code: number | null; completion: Completion } = yield* Effect.scoped(
+      const { code, completion, override }: {
+        code: number | null
+        completion: Completion
+        override?: {
+          readonly title: string
+          readonly output: string
+          readonly metadata: Record<string, unknown>
+        }
+      } = yield* Effect.scoped(
         Effect.gen(function* () {
-          yield* Effect.addFinalizer(closeSink)
-          const handle = yield* spawner.spawn(cmd(input.shell, input.command, input.cwd, input.env))
+          yield* Effect.addFinalizer((_exit) =>
+            Effect.gen(function* () {
+              if (yield* isPromoted()) return
+              yield* closeSink()
+            }),
+          )
+          // Spawn the child in a long-lived scope we never close
+          // ourselves. The spawner's `Effect.acquireRelease`
+          // finalizer is registered in the scope provided via
+          // `Effect.provideService(Scope, longScope)`. We keep
+          // longScope open until the manager's outer InstanceState
+          // scope tears down — but to keep the change minimal
+          // here, we just leak it (the manager's
+          // `killAll`/`killAllForSession` paths clean up the
+          // child via `ProcessAdapter.stop` regardless).
+          //
+          // The reason we can't use `Effect.scoped` here directly:
+          // `Effect.scoped` always closes its scope when the body
+          // returns, which fires the spawner's finalizer and kills
+          // the child. We need the scope to outlive the foreground
+          // race so the Backgrounded arm's `manager.promote(...)`
+          // hands the child over to the manager before the scope
+          // tears down. We achieve this by creating `longScope`
+          // with `Scope.make()` and never closing it.
+          //
+          // The trade-off: we don't automatically clean up
+          // `longScope` on directory teardown. That cleanup is
+          // performed by the manager's `killAll` / `killAllForSession`
+          // paths when the user explicitly requests teardown.
+          // For InstanceState-level cleanup, the manager's
+          // outer-scope finalizer (added in `InstanceState.make`)
+          // walks every record and calls `adapter.stop` on its
+          // pid, which kills the child process group.
+          const longScope = yield* Scope.make()
+          const handle = yield* spawner
+            .spawn(cmd(input.shell, input.command, input.cwd, input.env))
+            .pipe(Effect.provideService(Scope.Scope, longScope))
 
           // Output pipeline:
           //
@@ -598,8 +662,9 @@ export const ShellTool = Tool.define(
           const captureFiber = Effect.runFork(
             Stream.runForEach(Stream.decodeText(handle.all), offerCaptured).pipe(Effect.ignore),
           )
-          yield* Effect.addFinalizer(() =>
+          yield* Effect.addFinalizer((_exit) =>
             Effect.gen(function* () {
+              if (yield* isPromoted()) return
               yield* closeCapture
               yield* Effect.sync(() => captureFiber.interruptUnsafe())
             }),
@@ -614,16 +679,30 @@ export const ShellTool = Tool.define(
 
           const timeout = Effect.sleep(`${input.timeout + 100} millis`)
 
-          // Race foreground exit, abort, and timeout. The capture boundary
-          // is whichever of these resolves first. We use `Effect.exit` to
-          // convert a spawn failure (e.g. ENOENT) into a value so the race
-          // resolves immediately instead of waiting for the timeout — a
-          // failed spawn IS an exit, and we should not wait the full timeout
-          // just because the process could not start.
+          // Background promotion timer. Fires after `input.backgroundAfterMs`
+          // (0 disables). When it wins the race AND the foreground process
+          // is still alive, we promote the live child to the process manager
+          // and return a background handle. The captured `handle` is closed
+          // over so the manager takes ownership of the spawner's streams.
+          const backgroundTimer =
+            input.backgroundAfterMs > 0
+              ? Effect.as(Effect.sleep(`${input.backgroundAfterMs} millis`), {
+                  _tag: "Backgrounded" as const,
+                })
+              : Effect.never
+
+          // Race foreground exit, abort, timeout, and (optionally) background
+          // promotion. The capture boundary is whichever of these resolves
+          // first. We use `Effect.exit` to convert a spawn failure (e.g.
+          // ENOENT) into a value so the race resolves immediately instead of
+          // waiting for the timeout — a failed spawn IS an exit, and we
+          // should not wait the full timeout just because the process could
+          // not start.
           const completion: Completion = yield* Effect.raceAll([
             Effect.map(Effect.exit(handle.exitCode), (exit) => ({ _tag: "Exited" as const, exit })),
             Effect.map(abort, () => ({ _tag: "Aborted" as const })),
             Effect.map(timeout, () => ({ _tag: "TimedOut" as const })),
+            backgroundTimer,
           ])
 
           // Foreground exit (or abort/timeout) reached. Abort/timeout kill
@@ -636,6 +715,187 @@ export const ShellTool = Tool.define(
           }
           if (completion._tag === "TimedOut") {
             yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
+          }
+
+          // Backgrounded: the foreground command is still alive when the
+          // background timer fired. Hand ownership to the process manager,
+          // stop the local capture/persist fibers, and return a background
+          // handle so the model can poll/stop it. The `promoted` ref is
+          // flipped BEFORE we close the local pipeline so finalizers and
+          // kill paths become no-ops for this run.
+          if (completion._tag === "Backgrounded") {
+            // Close the capture gate so no new chunks get offered into the
+            // bounded queue. The manager takes over from `handle.stdout` /
+            // `handle.stderr` directly going forward.
+            yield* closeCapture
+            yield* Effect.sync(() => captureFiber.interruptUnsafe())
+            yield* offerDone.pipe(Effect.race(Fiber.join(persist)))
+
+            // Compute pre-promote output snapshot. We feed these
+            // chunks into the manager AFTER the promote call so
+            // the manager's ring buffer reflects what the
+            // foreground saw before ownership transferred.
+            const prePromoteText = list.map((item) => item.text).join("")
+
+            // Promote may fail with LimitReached (per-session or
+            // global cap) or another domain error. In that case
+            // we fall back to a foreground-style result that
+            // surfaces the failure to the model as
+            // `background: false` + `error`. We must NOT leave
+            // the child running: on promote failure, the manager
+            // has already killed the child via `adapter.stop` in
+            // the failed `promote()` call, so the local capture
+            // sees the exit and we can return the foreground
+            // output snapshot.
+            const promotedResult: ProcessInfo | ProcessError = yield* Effect.gen(function* () {
+              const exit = yield* Effect.exit(
+                manager.promote({
+                  sessionID: input.sessionID,
+                  command: input.command,
+                  cwd: input.cwd,
+                  pid: handle.pid,
+                  stdinAvailable: false,
+                  child: {
+                    pid: handle.pid,
+                    exitCode: Effect.exit(handle.exitCode).pipe(Effect.map(Number), Effect.orElseSucceed(() => -1)),
+                    kill: (sig?: NodeJS.Signals) => {
+                      Effect.runFork(
+                        handle.kill(sig ? { killSignal: sig } : {}).pipe(Effect.ignore),
+                      )
+                    },
+                  },
+                  timeoutMs: input.timeout > 0 ? input.timeout : null,
+                  stdout: handle.stdout,
+                  stderr: handle.stderr,
+                }),
+              )
+              if (Exit.isSuccess(exit)) return exit.value
+              // Extract the typed ProcessError from the failure
+              // cause. The cause has `reasons: ReadonlyArray<Reason>`
+              // where each Reason is `Fail<E> | Die | Interrupt`.
+              // Fail has an `error: E` field.
+              const cause = exit.cause as unknown as {
+                reasons?: ReadonlyArray<{ _tag?: string; error?: unknown }>
+              }
+              const firstFail = cause.reasons?.find((r) => r._tag === "Fail")
+              const err = firstFail?.error as ProcessError | undefined
+              if (err && "reason" in err) return err
+              return {
+                reason: "Internal",
+                message: "promote failed",
+              } as ProcessError
+            })
+
+            // Feed pre-promote output (what the foreground
+            // capture drained before this Backgrounded arm ran)
+            // into the manager's ring buffer so `poll` returns it
+            // alongside any new chunks the manager drains. The
+            // local capture fiber was consuming the merged
+            // `handle.all` stream, so the manager's separate
+            // `stdout`/`stderr` drains would otherwise see only
+            // post-promote output. The feed call is best-effort:
+            // if the local capture had already drained everything
+            // before the background timer fired, the manager will
+            // pick up new chunks from its own drain.
+            const promotedInfo = "state" in promotedResult ? promotedResult : undefined
+            const promotedError = "reason" in promotedResult ? promotedResult : undefined
+            if (promotedInfo && prePromoteText.length > 0) {
+              yield* manager
+                .feed({
+                  sessionID: input.sessionID,
+                  handle: promotedInfo.handle,
+                  kind: "stdout",
+                  text: prePromoteText,
+                })
+                .pipe(Effect.ignore)
+            }
+
+            yield* Ref.set(promoted, true)
+
+            // Promote failure path: surface the error to the model
+            // as a foreground result with `background: false` and
+            // an `error` field. The child was killed by the
+            // manager's adapter in the failed promote() call; the
+            // pre-promote snapshot is what the foreground would
+            // have produced had we not promoted at all.
+            if (promotedError) {
+              const reason = promotedError.reason
+              const previewText = last || (full ? preview(full) : "")
+              const failureOutput =
+                `Command exceeded the background promotion guard (${reason}). ` +
+                `The child was terminated. Try a shorter timeout or ` +
+                `a smaller ` +
+                `background_after_ms. ` +
+                `Partial output captured: ${previewText || "(none)"}`
+              return {
+                code: null,
+                completion,
+                override: {
+                  title: input.description,
+                  output: failureOutput,
+                  metadata: {
+                    output: previewText || "(no output)",
+                    description: input.description,
+                    background: false,
+                    error: reason,
+                    command: input.command,
+                    cwd: input.cwd,
+                    captured: Buffer.byteLength(previewText, "utf-8"),
+                  },
+                },
+              } as const
+            }
+
+            if (!promotedInfo) {
+              // Should not happen — flip+catch must yield either
+              // a success or an error.
+              return yield* Effect.die(new Error("promote returned neither info nor error"))
+            }
+            const info = promotedInfo
+            const previewText = last || (full ? preview(full) : "")
+            const outputText =
+              `Command is still running in the background.\n` +
+              `Handle: ${info.handle}\n` +
+              `State: ${info.state}\n` +
+              `Use process poll to read output, process stop to terminate.`
+            const metadataOut = previewText || "(no output yet)"
+            yield* ctx
+              .metadata({
+                metadata: {
+                  output: metadataOut,
+                  description: input.description,
+                  background: true,
+                  processHandle: info.handle,
+                  state: info.state,
+                  command: input.command,
+                  cwd: input.cwd,
+                  captured: Buffer.byteLength(metadataOut, "utf-8"),
+                  pollHint: "Use the process tool action `poll` with this handle",
+                  stopHint: "Use the process tool action `stop` with this handle",
+                },
+              })
+              .pipe(Effect.ignore)
+
+            return {
+              code: null,
+              completion,
+              override: {
+                title: input.description,
+                output: outputText,
+                metadata: {
+                  output: metadataOut,
+                  description: input.description,
+                  background: true,
+                  processHandle: info.handle,
+                  state: info.state,
+                  command: input.command,
+                  cwd: input.cwd,
+                  captured: Buffer.byteLength(metadataOut, "utf-8"),
+                  pollHint: "Use the process tool action `poll` with this handle",
+                  stopHint: "Use the process tool action `stop` with this handle",
+                },
+              },
+            } as const
           }
 
           // Drain the capture fiber when possible, then stop waiting at the
@@ -672,6 +932,16 @@ export const ShellTool = Tool.define(
       ).pipe(Effect.orDie)
 
       const meta: string[] = []
+      if (override) {
+        // Background promotion already produced a fully-formed result. Skip
+        // the foreground output formatting — the manager owns capture from
+        // here on.
+        return override as unknown as {
+          title: string
+          output: string
+          metadata: Record<string, unknown>
+        }
+      }
       if (completion._tag === "TimedOut") {
         meta.push(
           `shell tool terminated command after exceeding timeout ${input.timeout} ms. If this command is expected to take longer and is not waiting for interactive input, retry with a larger timeout value in milliseconds.`,
@@ -714,7 +984,13 @@ export const ShellTool = Tool.define(
         const shell = Shell.acceptable(cfg.shell)
         const name = Shell.name(shell)
         const limits = yield* trunc.limits()
-        const prompt = ShellPrompt.render(name, process.platform, limits, defaultTimeoutMs)
+        const prompt = ShellPrompt.render(
+          name,
+          process.platform,
+          limits,
+          defaultTimeoutMs,
+          DEFAULT_BACKGROUND_AFTER_MS,
+        )
         log.info("shell tool using shell", { shell })
 
         return {
@@ -730,6 +1006,8 @@ export const ShellTool = Tool.define(
                 throw new Error(`Invalid timeout value: ${params.timeout}. Timeout must be a positive number.`)
               }
               const timeout = params.timeout ?? defaultTimeoutMs
+              const backgroundAfterMs =
+                params.background_after_ms === undefined ? DEFAULT_BACKGROUND_AFTER_MS : params.background_after_ms
               const ps = Shell.ps(shell)
               yield* Effect.scoped(
                 Effect.gen(function* () {
@@ -750,6 +1028,8 @@ export const ShellTool = Tool.define(
                   env: yield* shellEnv(ctx, cwd),
                   timeout,
                   description: params.description,
+                  sessionID: ctx.sessionID as unknown as string,
+                  backgroundAfterMs,
                 },
                 ctx,
               )
