@@ -333,6 +333,28 @@ const parser = lazy(async () => {
   return { bash, ps }
 })
 
+// Unified metadata shape for ShellTool. The run() function has multiple
+// return paths (foreground / background-promoted / promotion-failed); each
+// produces a slightly different literal metadata. We pin the inferred
+// `Result` type parameter of Tool.define to this shape so the TUI's
+// `Tool.InferMetadata<typeof ShellTool>` returns the union rather than `{}`.
+type ShellMetadata = {
+  output: string
+  description: string
+  exit?: number | null
+  truncated?: boolean
+  outputPath?: string
+  background?: boolean
+  error?: string
+  processHandle?: string
+  state?: string
+  command?: string
+  cwd?: string
+  captured?: number
+  pollHint?: string
+  stopHint?: string
+}
+
 export const ShellTool = Tool.define(
   ShellID.ToolID,
   Effect.gen(function* () {
@@ -936,11 +958,7 @@ export const ShellTool = Tool.define(
         // Background promotion already produced a fully-formed result. Skip
         // the foreground output formatting — the manager owns capture from
         // here on.
-        return override as unknown as {
-          title: string
-          output: string
-          metadata: Record<string, unknown>
-        }
+        return override as unknown as Tool.ExecuteResult<ShellMetadata>
       }
       if (completion._tag === "TimedOut") {
         meta.push(
@@ -973,9 +991,9 @@ export const ShellTool = Tool.define(
           description: input.description,
           truncated: cut,
           ...(cut && file ? { outputPath: file } : {}),
-        },
+        } as ShellMetadata,
         output,
-      }
+      } as Tool.ExecuteResult<ShellMetadata>
     })
 
     return () =>
