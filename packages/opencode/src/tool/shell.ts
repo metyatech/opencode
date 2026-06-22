@@ -1,4 +1,4 @@
-import { Cause, Effect, Exit, Ref, Stream } from "effect"
+import { Effect, Exit, Fiber, Queue, Stream } from "effect"
 import os from "os"
 import { createWriteStream } from "node:fs"
 import * as Tool from "./tool"
@@ -22,17 +22,10 @@ import { ChildProcess } from "effect/unstable/process"
 import { ChildProcessSpawner } from "effect/unstable/process/ChildProcessSpawner"
 import { ShellPrompt, type Parameters } from "./shell/prompt"
 import { BashArity } from "@/permission/arity"
-import { ProcessManager } from "@/process-manager"
-import { ProcessError } from "@/process-manager/types"
 
 export { Parameters } from "./shell/prompt"
 
 const MAX_METADATA_LENGTH = 30_000
-// 10 seconds. The default `background_after_ms`; commands still running
-// after this many ms are promoted to ProcessManager rather than waited on.
-// Mirrored in `shell/prompt.ts` so the prompt description and the runtime
-// default stay in lock-step.
-const DEFAULT_BACKGROUND_AFTER_MS = 10_000
 const CWD = new Set(["cd", "chdir", "popd", "pushd", "push-location", "set-location"])
 const FILES = new Set([
   ...CWD,
@@ -338,23 +331,6 @@ const parser = lazy(async () => {
   return { bash, ps }
 })
 
-type ShellMetadata = {
-  output: string
-  description: string
-  background: boolean
-  error?: string
-  processHandle?: string
-  state?: string
-  command?: string
-  cwd?: string
-  captured?: number
-  pollHint?: string
-  stopHint?: string
-  exit?: number | null
-  truncated?: boolean
-  outputPath?: string
-}
-
 export const ShellTool = Tool.define(
   ShellID.ToolID,
   Effect.gen(function* () {
@@ -364,7 +340,6 @@ export const ShellTool = Tool.define(
     const trunc = yield* Truncate.Service
     const plugin = yield* Plugin.Service
     const flags = yield* RuntimeFlags.Service
-    const manager = yield* ProcessManager.Service
     const defaultTimeoutMs = flags.bashDefaultTimeoutMs ?? 2 * 60 * 1000
 
     const cygpath = Effect.fn("ShellTool.cygpath")(function* (shell: string, text: string) {
@@ -454,8 +429,6 @@ export const ShellTool = Tool.define(
         env: NodeJS.ProcessEnv
         timeout: number
         description: string
-        sessionID: string
-        backgroundAfterMs: number
       },
       ctx: Tool.Context,
     ) {
@@ -468,8 +441,6 @@ export const ShellTool = Tool.define(
       let file = ""
       let sink: ReturnType<typeof createWriteStream> | undefined
       let cut = false
-      let expired = false
-      let aborted = false
 
       const closeSink = Effect.fnUntraced(function* () {
         const stream = sink
@@ -503,57 +474,134 @@ export const ShellTool = Tool.define(
         },
       })
 
-      const result = yield* Effect.scoped(
+      type Completion =
+        | { readonly _tag: "Exited"; readonly exit: Exit.Exit<number, unknown> }
+        | { readonly _tag: "Aborted" }
+        | { readonly _tag: "TimedOut" }
+
+      const { code, completion }: { code: number | null; completion: Completion } = yield* Effect.scoped(
         Effect.gen(function* () {
           yield* Effect.addFinalizer(closeSink)
           const handle = yield* spawner.spawn(cmd(input.shell, input.command, input.cwd, input.env))
 
-          yield* Effect.forkScoped(
-            Stream.runForEach(Stream.decodeText(handle.all), (chunk) => {
-              const size = Buffer.byteLength(chunk, "utf-8")
-              list.push({ text: chunk, size })
-              used += size
-              while (used > keep && list.length > 1) {
-                const item = list.shift()
-                if (!item) break
-                used -= item.size
-                cut = true
+          // Output pipeline:
+          //
+          // 1. Capture: a producer fiber reads `handle.all` (decoded as text)
+          //    and offers chunks into a bounded queue. The capture stage
+          //    MUST NOT block on stdio EOF; on Windows or when detached
+          //    descendants inherit the stdio handles, `close` can lag the
+          //    foreground `exit` event indefinitely.
+          //
+          // 2. Persistence: a consumer fiber drains the queue, applies
+          //    truncation/file/output rules. The consumer ends only when it
+          //    receives a sentinel "done" chunk. Metadata is published on a
+          //    separate queue so a slow metadata callback cannot back-pressure
+          //    persistence.
+          //
+          // 3. Metadata: a third fiber drains the metadata queue and calls
+          //    `ctx.metadata`. It is decoupled from capture and persistence.
+          //
+          // 4. Foreground exit (or Aborted / TimedOut) is the capture
+          //    boundary: we interrupt the capture fiber and offer a "done"
+          //    sentinel so the persistence consumer drains already-accepted
+          //    chunks and stops. Output produced by detached descendants
+          //    after the foreground process has exited is NOT pulled into
+          //    this Shell result.
+          const CAPACITY = 256
+          type ChunkEnvelope = { readonly _tag: "chunk"; readonly text: string } | { readonly _tag: "done" }
+          const chunks = yield* Queue.bounded<ChunkEnvelope>(CAPACITY)
+          const meta = yield* Queue.bounded<{ output: string }>(CAPACITY)
+          let captureOpen = true
+          const closeCapture = Effect.sync(() => {
+            captureOpen = false
+          })
+          const offerCaptured = (text: string) =>
+            Effect.gen(function* () {
+              while (true) {
+                const offered = yield* Effect.sync(() => {
+                  if (!captureOpen) return true
+                  return Queue.offerUnsafe(chunks, { _tag: "chunk", text })
+                })
+                if (offered) return
+                yield* Effect.yieldNow
               }
+            })
+          const offerDone = Effect.gen(function* () {
+            while (true) {
+              if (yield* Effect.sync(() => Queue.offerUnsafe(chunks, { _tag: "done" }))) return
+              yield* Effect.yieldNow
+            }
+          })
 
-              last = preview(last + chunk)
-
-              if (file) {
-                sink?.write(chunk)
-              } else {
-                full += chunk
-                if (Buffer.byteLength(full, "utf-8") > limits.maxBytes) {
-                  return trunc.write(full).pipe(
-                    Effect.andThen((next) =>
-                      Effect.sync(() => {
-                        file = next
-                        cut = true
-                        sink = createWriteStream(next, { flags: "a" })
-                        full = ""
-                      }),
-                    ),
-                    Effect.andThen(
-                      ctx.metadata({
-                        metadata: {
-                          output: last,
-                          description: input.description,
-                        },
-                      }),
-                    ),
-                  )
+          // Persistence fiber: read from chunks queue, write to disk / list.
+          const persist = yield* Effect.forkScoped(
+            Effect.gen(function* () {
+              while (true) {
+                const item = yield* Queue.take(chunks)
+                if (item._tag === "done") {
+                  return
                 }
-              }
+                const chunk = item.text
+                const size = Buffer.byteLength(chunk, "utf-8")
+                list.push({ text: chunk, size })
+                used += size
+                while (used > keep && list.length > 1) {
+                  const first = list.shift()
+                  if (!first) break
+                  used -= first.size
+                  cut = true
+                }
 
-              return ctx.metadata({
-                metadata: {
-                  output: last,
-                  description: input.description,
-                },
-              })
+                last = preview(last + chunk)
+
+                if (file) {
+                  sink?.write(chunk)
+                } else {
+                  full += chunk
+                  if (Buffer.byteLength(full, "utf-8") > limits.maxBytes) {
+                    const next = yield* trunc.write(full)
+                    file = next
+                    cut = true
+                    sink = createWriteStream(next, { flags: "a" })
+                    full = ""
+                  }
+                }
+                // Publish a metadata update. We do NOT block on the metadata
+                // queue; if it is saturated, we drop the update. `last`
+                // remains the source of truth for the latest preview.
+                Queue.offerUnsafe(meta, { output: last })
+              }
+            }),
+          )
+
+          // Metadata fiber: take metadata updates and call `ctx.metadata`.
+          // We bound how many metadata updates we will issue to avoid
+          // producing an unbounded stream of events for fast producers.
+          yield* Effect.forkScoped(
+            Effect.gen(function* () {
+              while (true) {
+                const item = yield* Queue.take(meta)
+                yield* ctx.metadata({
+                  metadata: {
+                    output: item.output,
+                    description: input.description,
+                  },
+                })
+              }
+            }),
+          )
+
+          // Capture fiber: read `handle.all`, offer chunks. We fork and then
+          // interrupt this fiber once the foreground process exits (or abort/
+          // timeout fires), so we do not keep reading from a stdio handle
+          // held open by a detached descendant.
+          const captureFiber = Effect.runFork(
+            Stream.runForEach(Stream.decodeText(handle.all), offerCaptured).pipe(Effect.ignore),
+          )
+          yield* Effect.addFinalizer(() =>
+            Effect.gen(function* () {
+              yield* closeCapture
+              yield* Effect.sync(() => captureFiber.interruptUnsafe())
             }),
           )
 
@@ -566,175 +614,98 @@ export const ShellTool = Tool.define(
 
           const timeout = Effect.sleep(`${input.timeout + 100} millis`)
 
-          // The shell tool has a 4-way race for the in-flight child:
-          //   - `exit`     the child exits naturally (handle.exitCode resolves)
-          //   - `abort`    the upstream abort signal fires
-          //   - `timeout`  the caller-configured `timeout` elapses
-          //   - `background`  the `backgroundAfterMs` threshold elapses
-          //                  and we promote the child to ProcessManager
-          //
-          // The `backgrounded` ref is flipped when promotion succeeds. The
-          // `abort` and `timeout` arms must NOT kill the child after
-          // promotion: the manager owns it from that point. Reading the ref
-          // before the kill keeps the existing synchronous behavior intact
-          // when the timer hasn't fired yet.
-          const backgrounded = yield* Ref.make(false)
-          const exitCodeHandle = handle.exitCode
-          type RaceArm =
-            | { kind: "exit"; code: number }
-            | { kind: "abort" }
-            | { kind: "timeout" }
-            | { kind: "background" }
-          const arms: Array<Effect.Effect<RaceArm, unknown, never>> = [
-            exitCodeHandle.pipe(
-              Effect.map((code) => ({ kind: "exit" as const, code: Number(code) })),
-            ),
-            abort.pipe(Effect.map(() => ({ kind: "abort" as const }))),
-            timeout.pipe(Effect.map(() => ({ kind: "timeout" as const }))),
-          ]
-          if (input.backgroundAfterMs > 0) {
-            arms.push(
-              Effect.gen(function* () {
-                yield* Effect.sleep(`${input.backgroundAfterMs} millis`)
-                return { kind: "background" as const }
-              }),
-            )
+          // Race foreground exit, abort, and timeout. The capture boundary
+          // is whichever of these resolves first. We use `Effect.exit` to
+          // convert a spawn failure (e.g. ENOENT) into a value so the race
+          // resolves immediately instead of waiting for the timeout — a
+          // failed spawn IS an exit, and we should not wait the full timeout
+          // just because the process could not start.
+          const completion: Completion = yield* Effect.raceAll([
+            Effect.map(Effect.exit(handle.exitCode), (exit) => ({ _tag: "Exited" as const, exit })),
+            Effect.map(abort, () => ({ _tag: "Aborted" as const })),
+            Effect.map(timeout, () => ({ _tag: "TimedOut" as const })),
+          ])
+
+          // Foreground exit (or abort/timeout) reached. Abort/timeout kill
+          // the process group with a bounded wait. A normal foreground exit
+          // deliberately does not kill descendants, so we race the capture
+          // fiber's natural completion against a short grace window in case
+          // stdio is still held open by a detached descendant.
+          if (completion._tag === "Aborted") {
+            yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
+          }
+          if (completion._tag === "TimedOut") {
+            yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
           }
 
-          const exit = yield* Effect.raceAll(arms)
+          // Drain the capture fiber when possible, then stop waiting at the
+          // foreground boundary. `interruptUnsafe()` is intentionally
+          // fire-and-forget: awaiting interruption can itself wait for stdio
+          // close in Node stream finalizers.
+          const CAPTURE_DRAIN_GRACE_MS = 500
+          const captured = yield* Effect.race(
+            Fiber.join(captureFiber).pipe(Effect.as(true)),
+            Effect.as(Effect.sleep(`${CAPTURE_DRAIN_GRACE_MS} millis`), false),
+          )
+          yield* closeCapture
+          if (!captured) yield* Effect.sync(() => captureFiber.interruptUnsafe())
+          // Offer the done sentinel only after the capture gate is closed,
+          // so no producer can enqueue after it. Race the offer with
+          // persistence failure so a dead consumer cannot deadlock finalization
+          // when the bounded queue is full.
+          yield* Effect.race(offerDone, Fiber.join(persist))
 
-          if (exit.kind === "abort") {
-            const isBackgrounded = yield* Ref.get(backgrounded)
-            if (!isBackgrounded) {
-              aborted = true
-              yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
+          // Wait for persistence to finish draining. Bounded by the queue
+          // size: persistence ends as soon as it observes the done sentinel.
+          yield* Fiber.join(persist)
+
+          // Resolve exit code: the public `handle.exitCode` is now safe to
+          // read because foreground process has exited (or we killed it).
+          if (completion._tag === "Exited") {
+            if (Exit.isFailure(completion.exit)) {
+              return yield* Effect.failCause(completion.exit.cause)
             }
+            return { code: completion.exit.value, completion }
           }
-          if (exit.kind === "timeout") {
-            const isBackgrounded = yield* Ref.get(backgrounded)
-            if (!isBackgrounded) {
-              expired = true
-              yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
-            }
-          }
-          if (exit.kind === "background") {
-            // Flip the flag BEFORE calling promote so a late-firing abort
-            // (between now and the manager commit) is a no-op.
-            yield* Ref.set(backgrounded, true)
-            // The current `cmd()` helper always uses `stdin: "ignore"`, so
-            // the manager cannot write to the child's stdin yet. Future
-            // shells that pipe stdin should pass `true` here.
-            const promoted = yield* manager
-              .promote({
-                sessionID: input.sessionID,
-                command: input.command,
-                cwd: input.cwd,
-                pid: handle.pid ?? null,
-                stdinAvailable: false,
-                child: ProcessManager.fromSpawnerChild(
-                  {
-                    pid: handle.pid,
-                    exitCode: exitCodeHandle,
-                    kill: () => {
-                      Effect.runFork(handle.kill())
-                    },
-                  },
-                  false,
-                ),
-                timeoutMs: input.timeout,
-              })
-              .pipe(Effect.exit)
+          return { code: null, completion }
+        }),
+      ).pipe(Effect.orDie)
 
-            if (Exit.isFailure(promoted)) {
-              // Manager refused the child. The child keeps running; we just
-              // report the failure. The user's next call can use the
-              // `process` tool to list / stop anything that was already
-              // accepted by the manager.
-              const cause = Cause.squash(promoted.cause)
-              const reason =
-                cause instanceof ProcessError ? cause.reason : "internal_error"
-              const detail =
-                cause instanceof Error ? cause.message : String(cause ?? "unknown error")
-              const note =
-                reason === "LimitReached"
-                  ? "Could not background process: per-session limit reached. The command continues to run, but is not tracked by the manager."
-                  : `Could not background process: ${detail}. The command continues to run, but is not tracked by the manager.`
-              log.warn("shell tool background promotion failed", { reason, detail })
-              return {
-                title: input.description,
-                metadata: {
-                  output: last || preview(full),
-                  description: input.description,
-                  background: false,
-                  error: reason === "LimitReached" ? "limit_reached" : "promote_failed",
-                } as ShellMetadata,
-                output: note,
-              } as Tool.ExecuteResult<ShellMetadata>
-            }
+      const meta: string[] = []
+      if (completion._tag === "TimedOut") {
+        meta.push(
+          `shell tool terminated command after exceeding timeout ${input.timeout} ms. If this command is expected to take longer and is not waiting for interactive input, retry with a larger timeout value in milliseconds.`,
+        )
+      }
+      if (completion._tag === "Aborted") meta.push("User aborted the command")
+      const raw = list.map((item) => item.text).join("")
+      const end = tail(raw, limits.maxLines, limits.maxBytes)
+      if (end.cut) cut = true
+      if (!file && end.cut) {
+        file = yield* trunc.write(raw)
+      }
 
-            const info = promoted.value as {
-              readonly handle: string
-              readonly state: string
-            }
-            const output = `Backgrounded: ${info.handle}\nState: ${info.state}\nUse process tool to poll, write, or stop.`
-            return {
-              title: input.description,
-              metadata: {
-                output: last || preview(full),
-                description: input.description,
-                background: true,
-                processHandle: info.handle,
-                state: info.state,
-                command: input.command,
-                cwd: input.cwd,
-                captured: Buffer.byteLength(full, "utf-8"),
-                pollHint: "Use the `process` tool action `poll` with the handle",
-                stopHint: "Use the `process` tool action `stop` with the handle",
-              } as ShellMetadata,
-              output,
-            } as Tool.ExecuteResult<ShellMetadata>
-          }
+      let output = end.text
+      if (!output) output = "(no output)"
 
-          const code = exit.kind === "exit" ? exit.code : null
-          const meta: string[] = []
-          if (expired) {
-            meta.push(
-              `shell tool terminated command after exceeding timeout ${input.timeout} ms. If this command is expected to take longer and is not waiting for interactive input, retry with a larger timeout value in milliseconds.`,
-            )
-          }
-          if (aborted) meta.push("User aborted the command")
-          const raw = list.map((item) => item.text).join("")
-          const end = tail(raw, limits.maxLines, limits.maxBytes)
-          if (end.cut) cut = true
-          if (!file && end.cut) {
-            file = yield* trunc.write(raw)
-          }
+      if (cut && file) {
+        output = `...output truncated...\n\nFull output saved to: ${file}\n\n` + output
+      }
 
-          let output = end.text
-          if (!output) output = "(no output)"
-
-          if (cut && file) {
-            output = `...output truncated...\n\nFull output saved to: ${file}\n\n` + output
-          }
-
-          if (meta.length > 0) {
-            output += "\n\n<shell_metadata>\n" + meta.join("\n") + "\n</shell_metadata>"
-          }
-          return {
-            title: input.description,
-            metadata: {
-              output: last || preview(output),
-              exit: code,
-              description: input.description,
-              truncated: cut,
-              ...(cut && file ? { outputPath: file } : {}),
-            } as ShellMetadata,
-            output,
-          } as Tool.ExecuteResult<ShellMetadata>
-        })
-        ).pipe(Effect.orDie)
-
-      return result
+      if (meta.length > 0) {
+        output += "\n\n<shell_metadata>\n" + meta.join("\n") + "\n</shell_metadata>"
+      }
+      return {
+        title: input.description,
+        metadata: {
+          output: last || preview(output),
+          exit: code,
+          description: input.description,
+          truncated: cut,
+          ...(cut && file ? { outputPath: file } : {}),
+        },
+        output,
+      }
     })
 
     return () =>
@@ -743,7 +714,7 @@ export const ShellTool = Tool.define(
         const shell = Shell.acceptable(cfg.shell)
         const name = Shell.name(shell)
         const limits = yield* trunc.limits()
-        const prompt = ShellPrompt.render(name, process.platform, limits, defaultTimeoutMs, DEFAULT_BACKGROUND_AFTER_MS)
+        const prompt = ShellPrompt.render(name, process.platform, limits, defaultTimeoutMs, 10_000)
         log.info("shell tool using shell", { shell })
 
         return {
@@ -771,7 +742,6 @@ export const ShellTool = Tool.define(
                 }),
               )
 
-              const backgroundAfterMs = params.background_after_ms ?? DEFAULT_BACKGROUND_AFTER_MS
               return yield* run(
                 {
                   shell,
@@ -780,8 +750,6 @@ export const ShellTool = Tool.define(
                   env: yield* shellEnv(ctx, cwd),
                   timeout,
                   description: params.description,
-                  sessionID: ctx.sessionID as unknown as string,
-                  backgroundAfterMs,
                 },
                 ctx,
               )
