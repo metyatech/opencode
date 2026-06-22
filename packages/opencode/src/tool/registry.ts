@@ -53,6 +53,8 @@ import { Skill } from "../skill"
 import { Permission } from "@/permission"
 import { Reference } from "@/reference/reference"
 import { BackgroundJob } from "@/background/job"
+import { ProcessManager } from "@/process-manager"
+import { ProcessTool } from "@/process-manager/tool"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 
 const log = Log.create({ service: "tool.registry" })
@@ -92,6 +94,7 @@ export const layer: Layer.Layer<
   | Session.Service
   | SessionStatus.Service
   | BackgroundJob.Service
+  | ProcessManager.Service
   | Provider.Service
   | Git.Service
   | RepositoryCache.Service
@@ -134,6 +137,7 @@ export const layer: Layer.Layer<
     const greptool = yield* GrepTool
     const patchtool = yield* ApplyPatchTool
     const skilltool = yield* SkillTool
+    const process = yield* ProcessTool
     const agent = yield* Agent.Service
 
     const state = yield* InstanceState.make<State>(
@@ -243,6 +247,7 @@ export const layer: Layer.Layer<
           question: Tool.init(question),
           lsp: Tool.init(lsptool),
           plan: Tool.init(plan),
+          process: Tool.init(process),
         })
 
         return {
@@ -265,6 +270,7 @@ export const layer: Layer.Layer<
             tool.patch,
             ...(flags.experimentalLspTool ? [tool.lsp] : []),
             ...(flags.experimentalPlanMode && flags.client === "cli" ? [tool.plan] : []),
+            tool.process,
           ],
           task: tool.task,
           read: tool.read,
@@ -383,6 +389,7 @@ export const defaultLayer = Layer.suspend(() =>
       Layer.provide(Session.defaultLayer),
       Layer.provide(SessionStatus.defaultLayer),
       Layer.provide(BackgroundJob.defaultLayer),
+      Layer.provide(ProcessManager.defaultLayer),
       Layer.provide(Provider.defaultLayer),
       Layer.provide(Layer.mergeAll(Git.defaultLayer, RepositoryCache.defaultLayer)),
       Layer.provide(Reference.defaultLayer),

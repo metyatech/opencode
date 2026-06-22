@@ -1,4 +1,4 @@
-import { Effect, Stream } from "effect"
+import { Cause, Effect, Exit, Ref, Stream } from "effect"
 import os from "os"
 import { createWriteStream } from "node:fs"
 import * as Tool from "./tool"
@@ -22,10 +22,17 @@ import { ChildProcess } from "effect/unstable/process"
 import { ChildProcessSpawner } from "effect/unstable/process/ChildProcessSpawner"
 import { ShellPrompt, type Parameters } from "./shell/prompt"
 import { BashArity } from "@/permission/arity"
+import { ProcessManager } from "@/process-manager"
+import { ProcessError } from "@/process-manager/types"
 
 export { Parameters } from "./shell/prompt"
 
 const MAX_METADATA_LENGTH = 30_000
+// 10 seconds. The default `background_after_ms`; commands still running
+// after this many ms are promoted to ProcessManager rather than waited on.
+// Mirrored in `shell/prompt.ts` so the prompt description and the runtime
+// default stay in lock-step.
+const DEFAULT_BACKGROUND_AFTER_MS = 10_000
 const CWD = new Set(["cd", "chdir", "popd", "pushd", "push-location", "set-location"])
 const FILES = new Set([
   ...CWD,
@@ -331,6 +338,23 @@ const parser = lazy(async () => {
   return { bash, ps }
 })
 
+type ShellMetadata = {
+  output: string
+  description: string
+  background: boolean
+  error?: string
+  processHandle?: string
+  state?: string
+  command?: string
+  cwd?: string
+  captured?: number
+  pollHint?: string
+  stopHint?: string
+  exit?: number | null
+  truncated?: boolean
+  outputPath?: string
+}
+
 export const ShellTool = Tool.define(
   ShellID.ToolID,
   Effect.gen(function* () {
@@ -340,6 +364,7 @@ export const ShellTool = Tool.define(
     const trunc = yield* Truncate.Service
     const plugin = yield* Plugin.Service
     const flags = yield* RuntimeFlags.Service
+    const manager = yield* ProcessManager.Service
     const defaultTimeoutMs = flags.bashDefaultTimeoutMs ?? 2 * 60 * 1000
 
     const cygpath = Effect.fn("ShellTool.cygpath")(function* (shell: string, text: string) {
@@ -429,6 +454,8 @@ export const ShellTool = Tool.define(
         env: NodeJS.ProcessEnv
         timeout: number
         description: string
+        sessionID: string
+        backgroundAfterMs: number
       },
       ctx: Tool.Context,
     ) {
@@ -476,7 +503,7 @@ export const ShellTool = Tool.define(
         },
       })
 
-      const code: number | null = yield* Effect.scoped(
+      const result = yield* Effect.scoped(
         Effect.gen(function* () {
           yield* Effect.addFinalizer(closeSink)
           const handle = yield* spawner.spawn(cmd(input.shell, input.command, input.cwd, input.env))
@@ -539,60 +566,175 @@ export const ShellTool = Tool.define(
 
           const timeout = Effect.sleep(`${input.timeout + 100} millis`)
 
-          const exit = yield* Effect.raceAll([
-            handle.exitCode.pipe(Effect.map((code) => ({ kind: "exit" as const, code }))),
-            abort.pipe(Effect.map(() => ({ kind: "abort" as const, code: null }))),
-            timeout.pipe(Effect.map(() => ({ kind: "timeout" as const, code: null }))),
-          ])
+          // The shell tool has a 4-way race for the in-flight child:
+          //   - `exit`     the child exits naturally (handle.exitCode resolves)
+          //   - `abort`    the upstream abort signal fires
+          //   - `timeout`  the caller-configured `timeout` elapses
+          //   - `background`  the `backgroundAfterMs` threshold elapses
+          //                  and we promote the child to ProcessManager
+          //
+          // The `backgrounded` ref is flipped when promotion succeeds. The
+          // `abort` and `timeout` arms must NOT kill the child after
+          // promotion: the manager owns it from that point. Reading the ref
+          // before the kill keeps the existing synchronous behavior intact
+          // when the timer hasn't fired yet.
+          const backgrounded = yield* Ref.make(false)
+          const exitCodeHandle = handle.exitCode
+          type RaceArm =
+            | { kind: "exit"; code: number }
+            | { kind: "abort" }
+            | { kind: "timeout" }
+            | { kind: "background" }
+          const arms: Array<Effect.Effect<RaceArm, unknown, never>> = [
+            exitCodeHandle.pipe(
+              Effect.map((code) => ({ kind: "exit" as const, code: Number(code) })),
+            ),
+            abort.pipe(Effect.map(() => ({ kind: "abort" as const }))),
+            timeout.pipe(Effect.map(() => ({ kind: "timeout" as const }))),
+          ]
+          if (input.backgroundAfterMs > 0) {
+            arms.push(
+              Effect.gen(function* () {
+                yield* Effect.sleep(`${input.backgroundAfterMs} millis`)
+                return { kind: "background" as const }
+              }),
+            )
+          }
+
+          const exit = yield* Effect.raceAll(arms)
 
           if (exit.kind === "abort") {
-            aborted = true
-            yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
+            const isBackgrounded = yield* Ref.get(backgrounded)
+            if (!isBackgrounded) {
+              aborted = true
+              yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
+            }
           }
           if (exit.kind === "timeout") {
-            expired = true
-            yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
+            const isBackgrounded = yield* Ref.get(backgrounded)
+            if (!isBackgrounded) {
+              expired = true
+              yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
+            }
+          }
+          if (exit.kind === "background") {
+            // Flip the flag BEFORE calling promote so a late-firing abort
+            // (between now and the manager commit) is a no-op.
+            yield* Ref.set(backgrounded, true)
+            // The current `cmd()` helper always uses `stdin: "ignore"`, so
+            // the manager cannot write to the child's stdin yet. Future
+            // shells that pipe stdin should pass `true` here.
+            const promoted = yield* manager
+              .promote({
+                sessionID: input.sessionID,
+                command: input.command,
+                cwd: input.cwd,
+                pid: handle.pid ?? null,
+                stdinAvailable: false,
+                child: ProcessManager.fromSpawnerChild(
+                  {
+                    pid: handle.pid,
+                    exitCode: exitCodeHandle,
+                    kill: () => {
+                      Effect.runFork(handle.kill())
+                    },
+                  },
+                  false,
+                ),
+                timeoutMs: input.timeout,
+              })
+              .pipe(Effect.exit)
+
+            if (Exit.isFailure(promoted)) {
+              // Manager refused the child. The child keeps running; we just
+              // report the failure. The user's next call can use the
+              // `process` tool to list / stop anything that was already
+              // accepted by the manager.
+              const cause = Cause.squash(promoted.cause)
+              const reason =
+                cause instanceof ProcessError ? cause.reason : "internal_error"
+              const detail =
+                cause instanceof Error ? cause.message : String(cause ?? "unknown error")
+              const note =
+                reason === "LimitReached"
+                  ? "Could not background process: per-session limit reached. The command continues to run, but is not tracked by the manager."
+                  : `Could not background process: ${detail}. The command continues to run, but is not tracked by the manager.`
+              log.warn("shell tool background promotion failed", { reason, detail })
+              return {
+                title: input.description,
+                metadata: {
+                  output: last || preview(full),
+                  description: input.description,
+                  background: false,
+                  error: reason === "LimitReached" ? "limit_reached" : "promote_failed",
+                } as ShellMetadata,
+                output: note,
+              } as Tool.ExecuteResult<ShellMetadata>
+            }
+
+            const info = promoted.value as {
+              readonly handle: string
+              readonly state: string
+            }
+            const output = `Backgrounded: ${info.handle}\nState: ${info.state}\nUse process tool to poll, write, or stop.`
+            return {
+              title: input.description,
+              metadata: {
+                output: last || preview(full),
+                description: input.description,
+                background: true,
+                processHandle: info.handle,
+                state: info.state,
+                command: input.command,
+                cwd: input.cwd,
+                captured: Buffer.byteLength(full, "utf-8"),
+                pollHint: "Use the `process` tool action `poll` with the handle",
+                stopHint: "Use the `process` tool action `stop` with the handle",
+              } as ShellMetadata,
+              output,
+            } as Tool.ExecuteResult<ShellMetadata>
           }
 
-          return exit.kind === "exit" ? exit.code : null
-        }),
-      ).pipe(Effect.orDie)
+          const code = exit.kind === "exit" ? exit.code : null
+          const meta: string[] = []
+          if (expired) {
+            meta.push(
+              `shell tool terminated command after exceeding timeout ${input.timeout} ms. If this command is expected to take longer and is not waiting for interactive input, retry with a larger timeout value in milliseconds.`,
+            )
+          }
+          if (aborted) meta.push("User aborted the command")
+          const raw = list.map((item) => item.text).join("")
+          const end = tail(raw, limits.maxLines, limits.maxBytes)
+          if (end.cut) cut = true
+          if (!file && end.cut) {
+            file = yield* trunc.write(raw)
+          }
 
-      const meta: string[] = []
-      if (expired) {
-        meta.push(
-          `shell tool terminated command after exceeding timeout ${input.timeout} ms. If this command is expected to take longer and is not waiting for interactive input, retry with a larger timeout value in milliseconds.`,
-        )
-      }
-      if (aborted) meta.push("User aborted the command")
-      const raw = list.map((item) => item.text).join("")
-      const end = tail(raw, limits.maxLines, limits.maxBytes)
-      if (end.cut) cut = true
-      if (!file && end.cut) {
-        file = yield* trunc.write(raw)
-      }
+          let output = end.text
+          if (!output) output = "(no output)"
 
-      let output = end.text
-      if (!output) output = "(no output)"
+          if (cut && file) {
+            output = `...output truncated...\n\nFull output saved to: ${file}\n\n` + output
+          }
 
-      if (cut && file) {
-        output = `...output truncated...\n\nFull output saved to: ${file}\n\n` + output
-      }
+          if (meta.length > 0) {
+            output += "\n\n<shell_metadata>\n" + meta.join("\n") + "\n</shell_metadata>"
+          }
+          return {
+            title: input.description,
+            metadata: {
+              output: last || preview(output),
+              exit: code,
+              description: input.description,
+              truncated: cut,
+              ...(cut && file ? { outputPath: file } : {}),
+            } as ShellMetadata,
+            output,
+          } as Tool.ExecuteResult<ShellMetadata>
+        })
+        ).pipe(Effect.orDie)
 
-      if (meta.length > 0) {
-        output += "\n\n<shell_metadata>\n" + meta.join("\n") + "\n</shell_metadata>"
-      }
-      return {
-        title: input.description,
-        metadata: {
-          output: last || preview(output),
-          exit: code,
-          description: input.description,
-          truncated: cut,
-          ...(cut && file ? { outputPath: file } : {}),
-        },
-        output,
-      }
+      return result
     })
 
     return () =>
@@ -601,7 +743,7 @@ export const ShellTool = Tool.define(
         const shell = Shell.acceptable(cfg.shell)
         const name = Shell.name(shell)
         const limits = yield* trunc.limits()
-        const prompt = ShellPrompt.render(name, process.platform, limits, defaultTimeoutMs)
+        const prompt = ShellPrompt.render(name, process.platform, limits, defaultTimeoutMs, DEFAULT_BACKGROUND_AFTER_MS)
         log.info("shell tool using shell", { shell })
 
         return {
@@ -629,6 +771,7 @@ export const ShellTool = Tool.define(
                 }),
               )
 
+              const backgroundAfterMs = params.background_after_ms ?? DEFAULT_BACKGROUND_AFTER_MS
               return yield* run(
                 {
                   shell,
@@ -637,6 +780,8 @@ export const ShellTool = Tool.define(
                   env: yield* shellEnv(ctx, cwd),
                   timeout,
                   description: params.description,
+                  sessionID: ctx.sessionID as unknown as string,
+                  backgroundAfterMs,
                 },
                 ctx,
               )
