@@ -16,6 +16,7 @@ import { Todo } from "@/session/todo"
 import { Skill } from "@/skill"
 import { Agent } from "@/agent/agent"
 import { BackgroundJob } from "@/background/job"
+import { ProcessManager } from "@/process-manager"
 import { Session } from "@/session/session"
 import { SessionStatus } from "@/session/status"
 import { Provider } from "@/provider/provider"
@@ -55,7 +56,13 @@ const registryLayer = (opts: RegistryLayerOptions = {}) =>
       Layer.provide(Skill.defaultLayer),
       Layer.provide(Agent.defaultLayer),
       Layer.provide(Session.defaultLayer),
-      Layer.provide(Layer.mergeAll(SessionStatus.defaultLayer, BackgroundJob.defaultLayer)),
+      Layer.provide(
+        Layer.mergeAll(
+          SessionStatus.defaultLayer,
+          BackgroundJob.defaultLayer,
+          ProcessManager.defaultLayer,
+        ),
+      ),
       Layer.provide(Provider.defaultLayer),
       Layer.provide(Layer.mergeAll(Git.defaultLayer, RepositoryCache.defaultLayer)),
       Layer.provide(Reference.defaultLayer),

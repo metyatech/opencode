@@ -1,11 +1,11 @@
-import { describe, expect } from "bun:test"
-import { Cause, Effect, Exit, Layer } from "effect"
+import { describe, expect, test } from "bun:test"
+import { Cause, Effect, Exit, Layer, Schema } from "effect"
 import type * as Scope from "effect/Scope"
 import os from "os"
 import path from "path"
 import { Config } from "@/config/config"
 import { Shell } from "../../src/shell/shell"
-import { ShellTool } from "../../src/tool/shell"
+import { ShellTool, Parameters as ShellParameters } from "../../src/tool/shell"
 import { Filesystem } from "@/util/filesystem"
 import { provideInstance, tmpdirScoped } from "../fixture/fixture"
 import type { Permission } from "../../src/permission"
@@ -18,6 +18,20 @@ import { Plugin } from "../../src/plugin"
 import { testEffect } from "../lib/effect"
 import { Tool } from "@/tool/tool"
 import { RuntimeFlags } from "@/effect/runtime-flags"
+import { ProcessAdapter, type ProcessAdapterService } from "@/process-manager/adapter"
+import { ProcessManager } from "@/process-manager"
+
+// `null` adapter — the existing shell tests don't exercise the background
+// promotion path, but the shell tool's init now requires a ProcessManager
+// service in scope. The fake is enough to satisfy the layer wiring.
+class NullProcessAdapter implements ProcessAdapterService {
+  pid(child: { pid: number | null }): number | undefined {
+    return child.pid ?? undefined
+  }
+  stop(_input: { pid: number; graceMs?: number }): Effect.Effect<void> {
+    return Effect.void
+  }
+}
 
 const shellLayer = Layer.mergeAll(
   CrossSpawnSpawner.defaultLayer,
@@ -27,6 +41,7 @@ const shellLayer = Layer.mergeAll(
   Config.defaultLayer,
   Agent.defaultLayer,
   RuntimeFlags.defaultLayer,
+  ProcessManager.layer.pipe(Layer.provide(Layer.succeed(ProcessAdapter, ProcessAdapter.of(new NullProcessAdapter())))),
 )
 const it = testEffect(shellLayer)
 type ShellTestServices =
@@ -1100,6 +1115,63 @@ describe("tool.shell abort", () => {
       ).pipe(Effect.provide(RuntimeFlags.layer({ bashDefaultTimeoutMs: 500 }))),
     15_000,
   )
+
+  it.live(
+    "describes the default background_after_ms threshold in the tool description",
+    () =>
+      runIn(
+        projectRoot,
+        Effect.gen(function* () {
+          const tool = yield* initShell()
+          // Mirrors the `uses RuntimeFlags bashDefaultTimeoutMs` test
+          // pattern: confirm the rendered prompt mentions the default
+          // background promotion threshold. The default is 10 seconds.
+          expect(tool.description).toContain("more than 10000ms")
+        }),
+      ),
+    5_000,
+  )
+
+  describe("background_after_ms parameter", () => {
+    const accepts = (input: unknown) => {
+      try {
+        Schema.decodeUnknownSync(ShellParameters)(input)
+        return true
+      } catch {
+        return false
+      }
+    }
+    test("accepts the field as optional", () => {
+      const parsed = Schema.decodeUnknownSync(ShellParameters)({ command: "ls", description: "list" })
+      expect(parsed.background_after_ms).toBeUndefined()
+    })
+    test("accepts background_after_ms: 0 (disable promotion)", () => {
+      const parsed = Schema.decodeUnknownSync(ShellParameters)({
+        command: "ls",
+        description: "list",
+        background_after_ms: 0,
+      })
+      expect(parsed.background_after_ms).toBe(0)
+    })
+    test("accepts background_after_ms in range", () => {
+      const parsed = Schema.decodeUnknownSync(ShellParameters)({
+        command: "ls",
+        description: "list",
+        background_after_ms: 5000,
+      })
+      expect(parsed.background_after_ms).toBe(5000)
+    })
+    test("rejects background_after_ms > 60000", () => {
+      expect(
+        accepts({ command: "ls", description: "list", background_after_ms: 60001 }),
+      ).toBe(false)
+    })
+    test("rejects negative background_after_ms", () => {
+      expect(
+        accepts({ command: "ls", description: "list", background_after_ms: -1 }),
+      ).toBe(false)
+    })
+  })
 
   if (process.platform !== "win32") {
     it.live("captures stderr in output", () =>
