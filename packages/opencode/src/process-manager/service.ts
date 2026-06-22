@@ -10,11 +10,21 @@ import {
   POLL_MAX_WAIT_MS,
   type PollInput,
   type PromoteInput,
-  type WriteInput,
 } from "./schema"
 import { ProcessError, ProcessInfo } from "./types"
 import type { ManagedChild, ProcessErrorReason, ProcessState } from "./types"
 import { InstanceState } from "@/effect/instance-state"
+
+// An effect that closes the caller-supplied scope. The shell tool
+// produces this from `Scope.close(longScope, Exit.void)` and hands it
+// to the manager on successful promote. The manager runs it exactly
+// once per record on the first terminal transition so the spawner's
+// acquireRelease finalizers fire and the stdin/stdout/stderr file
+// descriptors are released. We type it as `Effect<void, never, never>`
+// for documentation; the actual value carries whatever R channel the
+// shell tool produced (typically Scope) and the manager just calls it
+// inside the layer's environment so the dependency is satisfied.
+export type OwnedScopeRelease = Effect.Effect<void, never, never>
 
 // Hard caps. Per-session is the limit a single shell session can hold; the
 // global cap is the worst-case total the manager is willing to track across
@@ -58,6 +68,17 @@ type Record = {
   // record's lifetime interrupts these so the bounded ring buffer stops
   // accepting new chunks once the record is purged.
   captureFibers: ReadonlyArray<Fiber.Fiber<void, unknown>>
+  // Caller-supplied scope release. The shell tool creates a long-lived
+  // `Scope.make()` to host the spawner's acquireRelease finalizers and
+  // hands ownership to the manager on successful promote. Every
+  // terminal path closes the scope at most once (idempotent) so we
+  // never leak the spawner's finalizers. Absent for internal-only
+  // records (e.g. tests that don't transfer scope ownership).
+  ownedRelease: OwnedScopeRelease | null
+  // Guard so we close the caller-owned scope at most once. Set on the
+  // first terminal transition; further transitions see it as already
+  // closed and skip the release call.
+  ownedScopeClosed: boolean
 }
 
 // Per-directory state. The `scope` is captured at InstanceState-make time
@@ -104,9 +125,6 @@ export interface ProcessManagerService {
   // because ownership is the caller's responsibility, and the worst case is a
   // dropped chunk for a process the manager doesn't track.
   readonly feed: (input: FeedInput) => Effect.Effect<boolean>
-  readonly write: (
-    input: WriteInput,
-  ) => Effect.Effect<{ bytesWritten: number } | undefined, ProcessError>
   readonly stop: (input: { sessionID: string; handle: ProcessHandle }) => Effect.Effect<ProcessInfo, ProcessError>
   readonly killAllForSession: (sessionID: string) => Effect.Effect<void>
   readonly killAll: () => Effect.Effect<void>
@@ -146,6 +164,22 @@ function byteLength(text: string): number {
   return Buffer.byteLength(text, "utf-8")
 }
 
+// Run the caller's owned-scope release effect at most once. The release
+// is whatever the shell tool produced from `Scope.close(longScope, Exit.void)`
+// at promote time — running it closes the long-lived scope the spawner
+// lives in, which fires the spawner's acquireRelease finalizers
+// (closing stdin/stdout/stderr fds). Subsequent calls are no-ops so a
+// natural exit, timeout, and explicit stop that race on the same record
+// do not double-release. Failures are best-effort: we ignore the error
+// channel because the manager's record state is already terminal and a
+// half-closed scope does not corrupt it.
+const closeOwnedScope = (rec: Record): Effect.Effect<void, never, never> => {
+  if (rec.ownedScopeClosed) return Effect.void
+  if (!rec.ownedRelease) return Effect.void
+  rec.ownedScopeClosed = true
+  return rec.ownedRelease.pipe(Effect.ignore, Effect.asVoid)
+}
+
 // Drain a stream-like value into the record's ring buffer. Accepts either
 // an Effect `Stream.Stream<Uint8Array, ...>` (the shape the ChildProcessSpawner
 // hands back) or a `ReadableStream<Uint8Array>` (Bun.spawn, manual tests).
@@ -158,12 +192,18 @@ function drainStream(
   buffer: RingBuffer,
   kind: "stdout" | "stderr",
 ): Effect.Effect<void, never, Scope.Scope> {
+  // One decoder for the entire stream lifetime. Reused on every chunk so
+  // split UTF-8 sequences are reassembled before we append text to the
+  // ring buffer. Creating a fresh decoder per chunk (the v2 regression)
+  // breaks characters whose bytes are split across `stdout.write` calls
+  // — `こんにちは` becomes `ããããã` or drops bytes.
+  const decoder = new TextDecoder()
   const appendChunk = (chunk: Uint8Array) => {
-    const text = new TextDecoder().decode(chunk, { stream: true })
+    const text = decoder.decode(chunk, { stream: true })
     if (text.length > 0) buffer.append(kind, text, Date.now())
   }
   const flushTail = () => {
-    const tail = new TextDecoder().decode()
+    const tail = decoder.decode()
     if (tail.length > 0) buffer.append(kind, tail, Date.now())
   }
 
@@ -250,7 +290,10 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
 
         // When the directory is torn down, kill anything still alive. Best-
         // effort: the adapter call is wrapped in `Effect.ignore` so a single
-        // ESRCH or taskkill hiccup doesn't block teardown.
+        // ESRCH or taskkill hiccup doesn't block teardown. Close the
+        // caller-owned scope for every live record so the spawner's
+        // acquireRelease finalizers fire and no scope leaks across
+        // directory teardown.
         yield* Effect.addFinalizer(
           Effect.fn("ProcessManager.finalize")(function* () {
             const map = yield* SynchronizedRef.get(records)
@@ -261,6 +304,7 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
               if (rec.watcher) yield* Fiber.interrupt(rec.watcher).pipe(Effect.ignore)
               if (rec.timeoutWatcher) yield* Fiber.interrupt(rec.timeoutWatcher).pipe(Effect.ignore)
               for (const f of rec.captureFibers) yield* Fiber.interrupt(f).pipe(Effect.ignore)
+              yield* closeOwnedScope(rec)
             }
           }),
         )
@@ -364,12 +408,23 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
         watcher: null,
         timeoutWatcher: null,
         captureFibers: [],
+        // Take ownership of the caller-supplied scope release (cast at
+        // the manager boundary; the schema accepts `unknown` so the LLM
+        // surface stays narrow). On the first terminal transition the
+        // watcher / stop / killAll paths close this exactly once via
+        // `closeOwnedScope`. On promote failure the caller closes its
+        // own scope.
+        ownedRelease: (input.release ?? null) as OwnedScopeRelease | null,
+        ownedScopeClosed: false,
       }
 
       const { scope } = yield* InstanceState.get(state)
 
       // 5. Fork the long-lived exit watcher. It owns the state transition
       // from `running` to `exited` / `failed` and resolves `onExit` once.
+      // On every transition we close the caller-owned scope (idempotent)
+      // so the spawner's acquireRelease finalizers fire and the OS file
+      // descriptors are released.
       const watcher: Fiber.Fiber<void, unknown> = yield* Effect.forkIn(
         Effect.gen(function* () {
           const exitCode = yield* child.exitCode
@@ -388,6 +443,7 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
             }
           })
           if (next) {
+            yield* closeOwnedScope(next)
             void Deferred.succeed(onExit, { exitCode, signal: null })
           }
         }).pipe(
@@ -427,6 +483,7 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
                   yield* adapter.stop({ pid: next.pid, graceMs: 200 }).pipe(Effect.ignore)
                 }
                 if (next) {
+                  yield* closeOwnedScope(next)
                   void Deferred.succeed(next.onExit, { exitCode: null, signal: "TIMEOUT" })
                 }
               }).pipe(
@@ -539,36 +596,6 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
       return true
     })
 
-    const write: ProcessManagerService["write"] = Effect.fn("ProcessManager.write")(function* (input) {
-      const rec = yield* lookup(input.handle, input.sessionID)
-      if (!rec) return undefined
-      if (rec.state !== "running" && rec.state !== "starting") {
-        return yield* failWith(
-          "NotRunning",
-          `process ${input.handle} is not running (state=${rec.state})`,
-          input.handle,
-        )
-      }
-      if (!rec.stdinAvailable) {
-        return yield* failWith(
-          "StdinClosed",
-          `process ${input.handle} stdin is closed`,
-          input.handle,
-        )
-      }
-      const stdin = rec.child.stdin
-      if (!stdin) {
-        return yield* failWith(
-          "StdinClosed",
-          `process ${input.handle} has no stdin handle`,
-          input.handle,
-        )
-      }
-      const data = input.appendNewline ? input.data + "\n" : input.data
-      yield* stdin.write(data)
-      return { bytesWritten: byteLength(data) }
-    })
-
     const stop: ProcessManagerService["stop"] = Effect.fn("ProcessManager.stop")(function* (input) {
       const rec = yield* lookup(input.handle, input.sessionID)
       if (!rec) return yield* failWith("NotFound", `process ${input.handle} not found`, input.handle)
@@ -601,7 +628,10 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
           terminationReason: "stopped",
           stopping: true,
         }))
-        if (next) void Deferred.succeed(updated.onExit, { exitCode: null, signal: null })
+        if (next) {
+          yield* closeOwnedScope(next)
+          void Deferred.succeed(updated.onExit, { exitCode: null, signal: null })
+        }
         return snapshot(next ?? { ...updated, state: "stopped", endedAt, exitCode: null, signal: null, terminationReason: "stopped" })
       }
 
@@ -617,6 +647,7 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
         stopping: true,
       }))
       if (final) {
+        yield* closeOwnedScope(final)
         void Deferred.succeed(updated.onExit, { exitCode: final.exitCode, signal: final.signal })
       }
       return snapshot(final ?? { ...updated, state: "stopped", endedAt, exitCode: updated.exitCode, signal: updated.signal, terminationReason: "stopped", stopping: true })
@@ -655,7 +686,10 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
           signal: cur.signal,
           terminationReason: "stopped",
         }))
-        if (next) void Deferred.succeed(next.onExit, { exitCode: next.exitCode, signal: next.signal })
+        if (next) {
+          yield* closeOwnedScope(next)
+          void Deferred.succeed(next.onExit, { exitCode: next.exitCode, signal: next.signal })
+        }
       }
     })
 
@@ -680,7 +714,10 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
           signal: cur.signal,
           terminationReason: "stopped",
         }))
-        if (next) void Deferred.succeed(next.onExit, { exitCode: next.exitCode, signal: next.signal })
+        if (next) {
+          yield* closeOwnedScope(next)
+          void Deferred.succeed(next.onExit, { exitCode: next.exitCode, signal: next.signal })
+        }
       }
     })
 
@@ -691,7 +728,14 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
           let changed = false
           const next = new Map(m)
           for (const [key, rec] of m) {
-            if (rec.endedAt !== null && now - rec.endedAt >= TTL_MS) {
+            // Only purge records that are terminal AND whose caller-owned
+            // scope (if any) has been released. This is currently the same
+            // condition as `endedAt !== null` because every terminal
+            // transition closes the scope, but the explicit check guards
+            // against future code that decouples the two states.
+            const isTerminal = rec.endedAt !== null
+            const scopeIsClosed = !rec.ownedRelease || rec.ownedScopeClosed
+            if (isTerminal && scopeIsClosed && now - rec.endedAt! >= TTL_MS) {
               next.delete(key)
               changed = true
             }
@@ -713,7 +757,7 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
       yield* Scope.Scope,
     )
 
-    return Service.of({ promote, list, info, poll, feed, write, stop, killAllForSession, killAll, purgeExpired })
+    return Service.of({ promote, list, info, poll, feed, stop, killAllForSession, killAll, purgeExpired })
   }),
 )
 

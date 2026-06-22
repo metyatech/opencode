@@ -538,34 +538,40 @@ export const ShellTool = Tool.define(
               yield* closeSink()
             }),
           )
-          // Spawn the child in a long-lived scope we never close
-          // ourselves. The spawner's `Effect.acquireRelease`
+          // Spawn the child in a long-lived scope we own until promote
+          // (success or failure). The spawner's `Effect.acquireRelease`
           // finalizer is registered in the scope provided via
-          // `Effect.provideService(Scope, longScope)`. We keep
-          // longScope open until the manager's outer InstanceState
-          // scope tears down — but to keep the change minimal
-          // here, we just leak it (the manager's
-          // `killAll`/`killAllForSession` paths clean up the
-          // child via `ProcessAdapter.stop` regardless).
+          // `Effect.provideService(Scope, longScope)`. We must NOT use
+          // `Effect.scoped` here: it would close the scope when the
+          // body returns, firing the spawner's finalizer and killing the
+          // child. Instead we keep the scope alive across the foreground
+          // race so the Backgrounded arm's `manager.promote(...)` can
+          // hand the child over to the manager before the scope tears
+          // down.
           //
-          // The reason we can't use `Effect.scoped` here directly:
-          // `Effect.scoped` always closes its scope when the body
-          // returns, which fires the spawner's finalizer and kills
-          // the child. We need the scope to outlive the foreground
-          // race so the Backgrounded arm's `manager.promote(...)`
-          // hands the child over to the manager before the scope
-          // tears down. We achieve this by creating `longScope`
-          // with `Scope.make()` and never closing it.
+          // Ownership transfer (was: leak the scope; is: hand the scope
+          // to the manager):
           //
-          // The trade-off: we don't automatically clean up
-          // `longScope` on directory teardown. That cleanup is
-          // performed by the manager's `killAll` / `killAllForSession`
-          // paths when the user explicitly requests teardown.
-          // For InstanceState-level cleanup, the manager's
-          // outer-scope finalizer (added in `InstanceState.make`)
-          // walks every record and calls `adapter.stop` on its
-          // pid, which kills the child process group.
+          // - On successful promote, we pass `release` derived from
+          //   `Scope.close(longScope, Exit.void)` to the manager. The
+          //   manager calls it exactly once on the first terminal
+          //   transition via `finalizeRecord` (natural exit, hard
+          //   timeout, stop, killAll*, InstanceState teardown).
+          // - On promote failure (LimitReached, etc.), we close the
+          //   scope HERE before returning, so the spawner's finalizer
+          //   runs and the child is killed cleanly. The `promoted` ref
+          //   is left false so the run's normal foreground finalizers
+          //   still fire (closeSink).
+          // - On the non-backgrounded (foreground / Aborted / TimedOut)
+          //   arms, the scope stays in scope-local ownership and is
+          //   closed by the Effect.scoped that wraps this whole block
+          //   when the body returns. That's fine: the foreground path
+          //   is fully done and killing the child is correct.
           const longScope = yield* Scope.make()
+          // Scope.close returns an Effect that runs all acquireRelease
+          // finalizers attached to `longScope`. The manager invokes the
+          // same Effect once via the `release` field on PromoteInput.
+          const longScopeRelease = Scope.close(longScope, Exit.void)
           const handle = yield* spawner
             .spawn(cmd(input.shell, input.command, input.cwd, input.env))
             .pipe(Effect.provideService(Scope.Scope, longScope))
@@ -746,29 +752,43 @@ export const ShellTool = Tool.define(
           // flipped BEFORE we close the local pipeline so finalizers and
           // kill paths become no-ops for this run.
           if (completion._tag === "Backgrounded") {
-            // Close the capture gate so no new chunks get offered into the
-            // bounded queue. The manager takes over from `handle.stdout` /
-            // `handle.stderr` directly going forward.
+            // Stop the local capture pipeline deterministically BEFORE
+            // we compute the pre-promote snapshot:
+            //
+            // 1. Close the capture gate so no new chunks get offered into
+            //    the bounded queue.
+            // 2. Interrupt the capture fiber so it stops pulling more
+            //    chunks from the spawner's merged stream. Any chunks it
+            //    has already pushed into the queue are safe.
+            // 3. Send the "done" sentinel and join persistence so the
+            //    queue drains through to `list` BEFORE we snapshot.
+            //
+            // We deliberately do NOT race `offerDone` vs `Fiber.join(persist)`;
+            // we always wait for persistence to finish so the pre-promote
+            // snapshot is the complete foreground view.
             yield* closeCapture
             yield* Effect.sync(() => captureFiber.interruptUnsafe())
-            yield* offerDone.pipe(Effect.race(Fiber.join(persist)))
+            yield* offerDone
+            yield* Fiber.join(persist)
 
-            // Compute pre-promote output snapshot. We feed these
-            // chunks into the manager AFTER the promote call so
-            // the manager's ring buffer reflects what the
-            // foreground saw before ownership transferred.
-            const prePromoteText = list.map((item) => item.text).join("")
+            // Pre-promote output snapshot. With persistence fully drained,
+            // `list` is the canonical pre-promote text in arrival order.
+            // We pass it to the manager via `prePromoteOutput` so the
+            // ring buffer reflects what the foreground saw BEFORE the
+            // manager takes over stdout/stderr drains. The first `process
+            // poll` after promote returns this snapshot as events with
+            // seq starting at 1; subsequent post-promote chunks append at
+            // higher seqs.
+            const prePromoteStdout = list.map((item) => item.text).join("")
+            const prePromoteSnapshot = last || (full ? preview(full) : "")
 
             // Promote may fail with LimitReached (per-session or
-            // global cap) or another domain error. In that case
-            // we fall back to a foreground-style result that
-            // surfaces the failure to the model as
-            // `background: false` + `error`. We must NOT leave
-            // the child running: on promote failure, the manager
-            // has already killed the child via `adapter.stop` in
-            // the failed `promote()` call, so the local capture
-            // sees the exit and we can return the foreground
-            // output snapshot.
+            // global cap) or another domain error. On failure we close
+            // `longScope` ourselves (the manager has already killed the
+            // child via `adapter.stop` in the failed promote() call) so
+            // the spawner's acquireRelease finalizers run and the child
+            // is fully cleaned up. The `promoted` ref is left false so
+            // the run's normal foreground finalizers still fire.
             const promotedResult: ProcessInfo | ProcessError = yield* Effect.gen(function* () {
               const exit = yield* Effect.exit(
                 manager.promote({
@@ -789,13 +809,14 @@ export const ShellTool = Tool.define(
                   timeoutMs: input.timeout > 0 ? input.timeout : null,
                   stdout: handle.stdout,
                   stderr: handle.stderr,
+                  release: longScopeRelease,
+                  prePromoteOutput:
+                    prePromoteStdout.length > 0
+                      ? { stdout: prePromoteStdout, stderr: "" }
+                      : null,
                 }),
               )
               if (Exit.isSuccess(exit)) return exit.value
-              // Extract the typed ProcessError from the failure
-              // cause. The cause has `reasons: ReadonlyArray<Reason>`
-              // where each Reason is `Fail<E> | Die | Interrupt`.
-              // Fail has an `error: E` field.
               const cause = exit.cause as unknown as {
                 reasons?: ReadonlyArray<{ _tag?: string; error?: unknown }>
               }
@@ -808,47 +829,20 @@ export const ShellTool = Tool.define(
               } as ProcessError
             })
 
-            // Feed pre-promote output (what the foreground
-            // capture drained before this Backgrounded arm ran)
-            // into the manager's ring buffer so `poll` returns it
-            // alongside any new chunks the manager drains. The
-            // local capture fiber was consuming the merged
-            // `handle.all` stream, so the manager's separate
-            // `stdout`/`stderr` drains would otherwise see only
-            // post-promote output. The feed call is best-effort:
-            // if the local capture had already drained everything
-            // before the background timer fired, the manager will
-            // pick up new chunks from its own drain.
             const promotedInfo = "state" in promotedResult ? promotedResult : undefined
             const promotedError = "reason" in promotedResult ? promotedResult : undefined
-            if (promotedInfo && prePromoteText.length > 0) {
-              yield* manager
-                .feed({
-                  sessionID: input.sessionID,
-                  handle: promotedInfo.handle,
-                  kind: "stdout",
-                  text: prePromoteText,
-                })
-                .pipe(Effect.ignore)
-            }
 
-            yield* Ref.set(promoted, true)
-
-            // Promote failure path: surface the error to the model
-            // as a foreground result with `background: false` and
-            // an `error` field. The child was killed by the
-            // manager's adapter in the failed promote() call; the
-            // pre-promote snapshot is what the foreground would
-            // have produced had we not promoted at all.
+            // Promote failure path: close `longScope` ourselves so the
+            // spawner's acquireRelease finalizers run.
             if (promotedError) {
+              yield* longScopeRelease.pipe(Effect.ignore)
               const reason = promotedError.reason
-              const previewText = last || (full ? preview(full) : "")
               const failureOutput =
                 `Command exceeded the background promotion guard (${reason}). ` +
                 `The child was terminated. Try a shorter timeout or ` +
                 `a smaller ` +
                 `background_after_ms. ` +
-                `Partial output captured: ${previewText || "(none)"}`
+                `Partial output captured: ${prePromoteSnapshot || "(none)"}`
               return {
                 code: null,
                 completion,
@@ -856,31 +850,32 @@ export const ShellTool = Tool.define(
                   title: input.description,
                   output: failureOutput,
                   metadata: {
-                    output: previewText || "(no output)",
+                    output: prePromoteSnapshot || "(no output)",
                     description: input.description,
                     background: false,
                     error: reason,
                     command: input.command,
                     cwd: input.cwd,
-                    captured: Buffer.byteLength(previewText, "utf-8"),
+                    captured: Buffer.byteLength(prePromoteSnapshot, "utf-8"),
                   },
                 },
               } as const
             }
 
             if (!promotedInfo) {
-              // Should not happen — flip+catch must yield either
-              // a success or an error.
+              yield* longScopeRelease.pipe(Effect.ignore)
               return yield* Effect.die(new Error("promote returned neither info nor error"))
             }
+
+            yield* Ref.set(promoted, true)
+
             const info = promotedInfo
-            const previewText = last || (full ? preview(full) : "")
             const outputText =
               `Command is still running in the background.\n` +
               `Handle: ${info.handle}\n` +
               `State: ${info.state}\n` +
               `Use process poll to read output, process stop to terminate.`
-            const metadataOut = previewText || "(no output yet)"
+            const metadataOut = prePromoteSnapshot || "(no output yet)"
             yield* ctx
               .metadata({
                 metadata: {

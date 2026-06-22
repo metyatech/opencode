@@ -20,16 +20,16 @@ function errorToResult(action: Metadata["action"], err: unknown, handle?: string
 }
 
 function asAction(value: string): Metadata["action"] {
-  if (value === "list" || value === "poll" || value === "stop" || value === "write") return value
+  if (value === "list" || value === "poll" || value === "stop") return value
   return "poll"
 }
 
-const DESCRIPTION = `Manage long-running background shell processes started by the bash tool when its background_after_ms threshold is reached. Actions: list, poll, write, stop. Tool calls are session-scoped: a session can only interact with processes it owns. Handles are opaque tokens, not OS PIDs. Use \`list\` to enumerate the session's processes. Use \`poll\` to fetch new output since a monotonic cursor. Use \`write\` to send a string to a running process's stdin (pass \`append_newline: true\` for line-terminated input). Use \`stop\` to terminate a process; idempotent on already-stopped processes.
+const DESCRIPTION = `Manage long-running background shell processes started by the bash tool when its background_after_ms threshold is reached. Actions: list, poll, stop. Tool calls are session-scoped: a session can only interact with processes it owns. Handles are opaque tokens, not OS PIDs. Use \`list\` to enumerate the session's processes. Use \`poll\` to fetch new output since a monotonic cursor. Use \`stop\` to terminate a process; idempotent on already-stopped processes.
 
-NOTE on \`write\`: the bash tool currently spawns every command with stdin set to "ignore", so no stdin pipe is exposed to the process. The \`write\` action is reserved for a future spawner that opens a real stdin pipe; today \`write\` calls return a "process stdin is closed" error. Use \`stop\` (or wait for the natural exit / hard timeout) to terminate backgrounded processes.`
+There is intentionally no \`write\` action: the bash tool spawns every command with stdin set to "ignore", so no stdin pipe is exposed to backgrounded processes today. Use \`stop\` (or wait for the natural exit / hard timeout) to terminate a backgrounded process.`
 
 type Metadata = {
-  action: "list" | "poll" | "write" | "stop"
+  action: "list" | "poll" | "stop"
   state?: string
   handle?: string
   count?: number
@@ -78,24 +78,6 @@ export const ProcessTool = Tool.define<typeof Action, Metadata, ProcessManager.S
                   next_cursor: result.nextCursor,
                   truncated_before_cursor: result.truncatedBeforeCursor,
                 }),
-              }
-            }
-            case "write": {
-              const r = yield* manager.write({
-                sessionID,
-                handle: params.handle,
-                data: params.data,
-                appendNewline: params.append_newline ?? false,
-              })
-              if (r === undefined) {
-                return errorToResult("write", {
-                  message: "process not found or not owned by this session",
-                }, params.handle)
-              }
-              return {
-                title: "write" as const,
-                metadata: { action: "write" as const, state: "running" as const, handle: params.handle },
-                output: JSON.stringify({ handle: params.handle, bytes_written: r.bytesWritten }),
               }
             }
             case "stop": {
