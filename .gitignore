@@ -31,3 +31,6 @@ UPCOMING_CHANGELOG.md
 logs/
 *.bun-build
 tsconfig.tsbuildinfo
+
+# Local OpenCode/agent runtime artifacts
+.omo/
