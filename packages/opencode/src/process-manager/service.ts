@@ -527,6 +527,33 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
         captureFibers.push(f)
       }
 
+      // 8. Seed pre-promote output into the ring buffer. The shell tool
+      // stops its local capture/persist fibers BEFORE calling `promote`,
+      // drains them into a single `prePromoteStdout` (and future
+      // `prePromoteStderr`) string, and hands those strings to the
+      // manager here. Appending them to the buffer BEFORE the record is
+      // inserted guarantees two invariants:
+      //
+      //   a) The first `process poll` after promote returns the
+      //      pre-promote snapshot rather than only post-promote chunks
+      //      from the manager's drainStream fibers. This is the contract
+      //      documented on `PromoteInput.prePromoteOutput` (see
+      //      schema.ts).
+      //   b) The pre-promote events get strictly LOWER seq numbers than
+      //      any post-promote chunk the manager drains, because the
+      //      ring buffer is single-writer and capture fibers append
+      //      only after this point. Cursors issued before any
+      //      post-promote output remains cursor=0 plus however many
+      //      seed events we wrote.
+      //
+      // We append stdout first, then stderr, to match the foreground
+      // ordering the shell tool already produced (list joined in
+      // arrival order; both streams are independently UTF-8-decoded
+      // before this point so there is no byte-boundary concern).
+      const pre = input.prePromoteOutput ?? null
+      if (pre?.stdout) record.buffer.append("stdout", pre.stdout, startedAt)
+      if (pre?.stderr) record.buffer.append("stderr", pre.stderr, startedAt)
+
       const promoted: Record = {
         ...record,
         state: "running",
