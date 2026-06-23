@@ -7,6 +7,12 @@ on:
 
 jobs:
   generate:
+    # Skip on forks: the setup-git-committer step requires
+    # vars.OPENCODE_APP_ID / secrets.OPENCODE_APP_SECRET, which are only
+    # configured for the canonical upstream repository. Without this
+    # guard the workflow runs to completion only to fail at the secrets
+    # step, which marks the fork's dev pushes red for no useful reason.
+    if: github.repository == 'anomalyco/opencode'
     runs-on: ubuntu-latest
     permissions:
       contents: write
