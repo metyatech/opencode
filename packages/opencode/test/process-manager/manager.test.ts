@@ -237,4 +237,104 @@ describe("ProcessManager service", () => {
       expect(r).toBeUndefined()
     }),
   )
+
+  it.instance("prePromoteOutput stdout is pollable immediately after promote", () =>
+    Effect.gen(function* () {
+      const manager = yield* ProcessManager.Service
+      const exit = yield* Deferred.make<number, never>()
+      const child = makeFakeChild({ pid: 51, exit, stdin: true })
+      const info = yield* manager.promote({
+        sessionID: "ses_pre_stdout",
+        command: "x",
+        cwd: "/",
+        pid: 51,
+        stdinAvailable: true,
+        child,
+        prePromoteOutput: { stdout: "hello\n", stderr: "" },
+      })
+
+      const r = yield* manager.poll({ sessionID: "ses_pre_stdout", handle: info.handle, cursor: 0 })
+      expect(r).toBeDefined()
+      expect(r!.events.length).toBe(1)
+      expect(r!.events[0]!.text).toBe("hello\n")
+      expect(r!.events[0]!.kind).toBe("stdout")
+      expect(r!.nextCursor).toBeGreaterThan(0)
+    }),
+  )
+
+  it.instance("prePromoteOutput stderr is pollable and tagged kind=stderr", () =>
+    Effect.gen(function* () {
+      const manager = yield* ProcessManager.Service
+      const exit = yield* Deferred.make<number, never>()
+      const child = makeFakeChild({ pid: 52, exit, stdin: true })
+      const info = yield* manager.promote({
+        sessionID: "ses_pre_stderr",
+        command: "x",
+        cwd: "/",
+        pid: 52,
+        stdinAvailable: true,
+        child,
+        prePromoteOutput: { stdout: "", stderr: "boom\n" },
+      })
+
+      const r = yield* manager.poll({ sessionID: "ses_pre_stderr", handle: info.handle, cursor: 0 })
+      expect(r).toBeDefined()
+      expect(r!.events.length).toBe(1)
+      expect(r!.events[0]!.text).toBe("boom\n")
+      expect(r!.events[0]!.kind).toBe("stderr")
+    }),
+  )
+
+  it.instance("pre + post chunks don't duplicate and seq is monotonic", () =>
+    Effect.gen(function* () {
+      const manager = yield* ProcessManager.Service
+      const exit = yield* Deferred.make<number, never>()
+      const child = makeFakeChild({ pid: 53, exit, stdin: true })
+      const info = yield* manager.promote({
+        sessionID: "ses_pre_post",
+        command: "x",
+        cwd: "/",
+        pid: 53,
+        stdinAvailable: true,
+        child,
+        prePromoteOutput: { stdout: "pre", stderr: "" },
+      })
+
+      const accepted = yield* manager.feed({
+        sessionID: "ses_pre_post",
+        handle: info.handle,
+        kind: "stdout",
+        text: "post",
+      })
+      expect(accepted).toBe(true)
+
+      const r = yield* manager.poll({ sessionID: "ses_pre_post", handle: info.handle, cursor: 0 })
+      expect(r).toBeDefined()
+      expect(r!.events.length).toBe(2)
+      expect(r!.events.map((e) => e.text)).toEqual(["pre", "post"])
+      expect(r!.events[0]!.seq).toBeLessThan(r!.events[1]!.seq)
+      expect(r!.events[0]!.seq).toBe(1)
+      expect(r!.events[1]!.seq).toBe(2)
+    }),
+  )
+
+  it.instance("prePromoteOutput null/omitted is a no-op for poll", () =>
+    Effect.gen(function* () {
+      const manager = yield* ProcessManager.Service
+      const exit = yield* Deferred.make<number, never>()
+      const child = makeFakeChild({ pid: 54, exit, stdin: true })
+      const info = yield* manager.promote({
+        sessionID: "ses_pre_none",
+        command: "x",
+        cwd: "/",
+        pid: 54,
+        stdinAvailable: true,
+        child,
+      })
+
+      const r = yield* manager.poll({ sessionID: "ses_pre_none", handle: info.handle, cursor: 0 })
+      expect(r).toBeDefined()
+      expect(r!.events.length).toBe(0)
+    }),
+  )
 })
