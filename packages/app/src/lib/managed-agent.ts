@@ -17,9 +17,17 @@ export const MANAGED_AGENT_NOTICE =
  * (no longer `undefined`) at runtime. Accepting this minimal structural
  * shape lets every call site pass the typed object directly without a
  * `Record<string, unknown>` cast.
+ *
+ * `modelSelection` is typed as optional to match the SDK `Agent.modelSelection`
+ * (which is itself optional). At runtime `undefined` is treated identically to
+ * `"user"` by `isManagedAgent` -- the discriminator is `=== "managed"`, so an
+ * absent value is naturally "not managed". Marking this field optional lets
+ * `Agent | undefined` flow into helpers like `isManagedAgent` and
+ * `migrateAgentSwitchState` without a per-call-site cast, without weakening
+ * the runtime contract (see `isManagedAgent` below).
  */
 export type ManagedAgentShape = {
-  modelSelection: "user" | "managed"
+  modelSelection?: "user" | "managed"
 }
 
 /**
