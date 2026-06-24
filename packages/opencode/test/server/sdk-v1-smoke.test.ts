@@ -53,8 +53,38 @@ describe("v1 SDK runtime smoke", () => {
     await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
     const sdk = client(tmp.path)
     const result = await sdk.session.get({ path: { id: "ses_no_such" } as never })
+    expect(result.response.status).toBe(404)
     expect(result.error).toBeDefined()
     // wire body for 404 is NamedError-shaped
     expect(result.error).toMatchObject({ name: "NotFoundError" })
+    expect((result.error as { name?: string }).name).not.toBe("UnknownError")
+  })
+
+  test("session 404: legacy id path throws NotFoundError with throwOnError", async () => {
+    await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+    const sdk = client(tmp.path)
+
+    let thrown: unknown
+    try {
+      await sdk.session.get({
+        path: { id: "ses_no_such" } as never,
+        throwOnError: true,
+      })
+    } catch (error) {
+      thrown = error
+    }
+
+    expect(thrown).toBeInstanceOf(Error)
+
+    const cause = (thrown as Error & {
+      cause?: {
+        status?: number
+        body?: { name?: string }
+      }
+    }).cause
+
+    expect(cause?.status).toBe(404)
+    expect(cause?.body?.name).toBe("NotFoundError")
+    expect(cause?.body?.name).not.toBe("UnknownError")
   })
 })

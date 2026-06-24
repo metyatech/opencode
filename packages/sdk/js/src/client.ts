@@ -30,6 +30,36 @@ function rewrite(request: Request, directory?: string) {
   return next
 }
 
+// Preserve the legacy v1 SDK plugin-contract call shape. Stale plugins
+// (or any caller built against the pre-rename schema) pass `path.id` for
+// session endpoints, but the current generated SDK substitutes the URL
+// template using `path.sessionID`, so the wire path becomes `/session/`
+// instead of `/session/{id}` and the server falls through to an unrelated
+// route that surfaces as a 500 UnknownError. Normalize here, inside
+// requestValidator (the only hook that runs BEFORE buildUrl), so the
+// generated URL substitution sees both fields. Existing callers that
+// already pass `path.sessionID` are left untouched, and `id` is kept on
+// the object so downstream consumers that read it still work.
+function normalizeLegacySessionPath(data: unknown) {
+  if (!data || typeof data !== "object") return
+
+  const options = data as {
+    url?: unknown
+    path?: Record<string, unknown>
+  }
+
+  if (typeof options.url !== "string") return
+  if (!options.url.includes("{sessionID}")) return
+  if (!options.path || typeof options.path !== "object") return
+  if (options.path.sessionID !== undefined) return
+  if (options.path.id === undefined || options.path.id === null) return
+
+  options.path = {
+    ...options.path,
+    sessionID: options.path.id,
+  }
+}
+
 export function createOpencodeClient(config?: Config & { directory?: string }) {
   if (!config?.fetch) {
     const customFetch: any = (req: any) => {
@@ -41,6 +71,16 @@ export function createOpencodeClient(config?: Config & { directory?: string }) {
       ...config,
       fetch: customFetch,
     }
+  }
+
+  const userRequestValidator = config?.requestValidator
+  const wrappedValidator: NonNullable<Config["requestValidator"]> = async (data) => {
+    normalizeLegacySessionPath(data)
+    return await userRequestValidator?.(data)
+  }
+  config = {
+    ...config,
+    requestValidator: wrappedValidator,
   }
 
   if (config?.directory) {
