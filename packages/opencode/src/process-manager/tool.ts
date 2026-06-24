@@ -24,9 +24,42 @@ function asAction(value: string): Metadata["action"] {
   return "poll"
 }
 
-const DESCRIPTION = `Manage long-running background shell processes started by the bash tool when its background_after_ms threshold is reached. Actions: list, poll, stop. Tool calls are session-scoped: a session can only interact with processes it owns. Handles are opaque tokens, not OS PIDs. Use \`list\` to enumerate the session's processes. Use \`poll\` to fetch new output since a monotonic cursor. Use \`stop\` to terminate a process; idempotent on already-stopped processes.
+const DESCRIPTION = `Manage long-running background shell processes started by the bash tool when its background_after_ms threshold is reached. Tool calls are session-scoped: a session can only interact with processes it owns. Handles are opaque tokens, not OS PIDs. Use \`list\` to enumerate the session's processes. Use \`poll\` to fetch new output since a monotonic cursor. Use \`stop\` to terminate a process; idempotent on already-stopped processes.
+
+Never call this tool with empty arguments.
+Use exactly one of these argument shapes:
+
+List processes in this session:
+{"action":"list"}
+
+Poll output from a background process:
+{"action":"poll","handle":"proc_...","cursor":0}
+
+Stop a background process:
+{"action":"stop","handle":"proc_..."}
+
+If you need a handle but do not know it, call {"action":"list"} first.
 
 There is intentionally no \`write\` action: the bash tool spawns every command with stdin set to "ignore", so no stdin pipe is exposed to backgrounded processes today. Use \`stop\` (or wait for the natural exit / hard timeout) to terminate a backgrounded process.`
+
+function shortError(error: unknown) {
+  const text = String(error)
+  return text.length <= 1000 ? text : `${text.slice(0, 1000)}...`
+}
+
+function formatProcessValidationError(error: unknown): string {
+  return [
+    "The process tool requires an action and must never be called with empty arguments.",
+    "Use exactly one of:",
+    '{"action":"list"}',
+    '{"action":"poll","handle":"proc_...","cursor":0}',
+    '{"action":"stop","handle":"proc_..."}',
+    "",
+    'If the handle is unknown, call {"action":"list"} first.',
+    "",
+    `Original schema error: ${shortError(error)}`,
+  ].join("\n")
+}
 
 type Metadata = {
   action: "list" | "poll" | "stop"
@@ -43,6 +76,7 @@ export const ProcessTool = Tool.define<typeof Action, Metadata, ProcessManager.S
     return {
       description: DESCRIPTION,
       parameters: Action,
+      formatValidationError: formatProcessValidationError,
       execute: (params, ctx: Tool.Context<Metadata>) =>
         Effect.gen(function* () {
           const sessionID = ctx.sessionID as unknown as string

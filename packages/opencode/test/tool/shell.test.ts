@@ -20,6 +20,7 @@ import { testEffect } from "../lib/effect"
 import { Tool } from "@/tool/tool"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProcessManager } from "@/process-manager"
+import { ProcessHandle } from "@/process-manager/id"
 
 const shellLayer = Layer.mergeAll(
   CrossSpawnSpawner.defaultLayer,
@@ -1121,6 +1122,55 @@ describe("tool.shell permissions", () => {
         }),
       )
     }),
+  )
+})
+
+describe("tool.shell background promotion guidance", () => {
+  it.live(
+    "background-promoted result advertises process tool JSON args",
+    () =>
+      runIn(
+        projectRoot,
+        Effect.gen(function* () {
+          const manager = yield* ProcessManager.Service
+          const command = nodeEval(`setTimeout(() => process.exit(0), 30_000)`)
+          const result = yield* run(
+            {
+              command,
+              description: "background guidance",
+              timeout: 30_000,
+              background_after_ms: 1,
+            },
+            ctx,
+          )
+          const metadata = result.metadata as {
+            background?: boolean
+            processHandle?: string
+            pollHint?: string
+            stopHint?: string
+            listHint?: string
+          }
+          const handle = result.metadata.processHandle as ProcessHandle
+          yield* Effect.sync(() => {
+            expect(metadata.background).toBe(true)
+            expect(typeof metadata.processHandle).toBe("string")
+            expect((metadata.processHandle ?? "").length).toBeGreaterThan(0)
+            expect(metadata.pollHint?.startsWith("Use the process tool with ")).toBe(true)
+            expect(metadata.stopHint?.startsWith("Use the process tool with ")).toBe(true)
+            expect(metadata.listHint?.startsWith("Use the process tool with ")).toBe(true)
+            expect(result.output).toContain("Command is still running in the background.")
+            expect(result.output).toContain(
+              `Use the process tool with {"action":"poll","handle":"${handle}","cursor":0} to read output.`,
+            )
+            expect(result.output).toContain(
+              `Use the process tool with {"action":"stop","handle":"${handle}"} to terminate it.`,
+            )
+            expect(result.output).toContain(`If unsure, call the process tool with {"action":"list"} first.`)
+            expect(result.output).not.toContain("Use process poll to read output, process stop to terminate.")
+          }).pipe(Effect.ensuring(manager.stop({ sessionID: ctx.sessionID, handle }).pipe(Effect.ignore)))
+        }),
+      ),
+    45_000,
   )
 })
 

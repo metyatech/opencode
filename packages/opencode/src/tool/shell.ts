@@ -353,6 +353,7 @@ type ShellMetadata = {
   captured?: number
   pollHint?: string
   stopHint?: string
+  listHint?: string
 }
 
 export const ShellTool = Tool.define(
@@ -870,11 +871,16 @@ export const ShellTool = Tool.define(
             yield* Ref.set(promoted, true)
 
             const info = promotedInfo
+            const processPollArgs = JSON.stringify({ action: "poll", handle: info.handle, cursor: 0 })
+            const processStopArgs = JSON.stringify({ action: "stop", handle: info.handle })
+            const processListArgs = JSON.stringify({ action: "list" })
             const outputText =
               `Command is still running in the background.\n` +
               `Handle: ${info.handle}\n` +
               `State: ${info.state}\n` +
-              `Use process poll to read output, process stop to terminate.`
+              `Use the process tool with ${processPollArgs} to read output.\n` +
+              `Use the process tool with ${processStopArgs} to terminate it.\n` +
+              `If unsure, call the process tool with ${processListArgs} first.`
             const metadataOut = prePromoteSnapshot || "(no output yet)"
             yield* ctx
               .metadata({
@@ -887,8 +893,9 @@ export const ShellTool = Tool.define(
                   command: input.command,
                   cwd: input.cwd,
                   captured: Buffer.byteLength(metadataOut, "utf-8"),
-                  pollHint: "Use the process tool action `poll` with this handle",
-                  stopHint: "Use the process tool action `stop` with this handle",
+                  pollHint: `Use the process tool with ${processPollArgs}`,
+                  stopHint: `Use the process tool with ${processStopArgs}`,
+                  listHint: `Use the process tool with ${processListArgs}`,
                 },
               })
               .pipe(Effect.ignore)
@@ -908,8 +915,9 @@ export const ShellTool = Tool.define(
                   command: input.command,
                   cwd: input.cwd,
                   captured: Buffer.byteLength(metadataOut, "utf-8"),
-                  pollHint: "Use the process tool action `poll` with this handle",
-                  stopHint: "Use the process tool action `stop` with this handle",
+                  pollHint: `Use the process tool with ${processPollArgs}`,
+                  stopHint: `Use the process tool with ${processStopArgs}`,
+                  listHint: `Use the process tool with ${processListArgs}`,
                 },
               },
             } as const
