@@ -142,6 +142,9 @@ jobs:
         run: bunx playwright install-deps chromium
 
       - name: Install Playwright browsers
+        # Bound the chromium download so a network stall cannot occupy the
+        # runner for the full 6h job-timeout ceiling (see triage).
+        timeout-minutes: 10
         if: steps.playwright-cache.outputs.cache-hit != 'true'
         working-directory: packages/app
         run: bunx playwright install chromium
