@@ -1,8 +1,9 @@
 import { describe, expect } from "bun:test"
-import { Effect, Layer } from "effect"
+import { Deferred, Effect, Layer } from "effect"
 import { ProcessAdapter, type ProcessAdapterService } from "../../src/process-manager/adapter"
+import { MAX_GLOBAL, RECENT_PROCESS_PROTECT_COUNT } from "../../src/process-manager/service"
 import { ProcessManager } from "../../src/process-manager/service"
-import { MAX_GLOBAL, MAX_PER_SESSION } from "../../src/process-manager/service"
+import type { ProcessInfo } from "../../src/process-manager/types"
 import { testEffect } from "../lib/effect"
 
 class FakeProcessAdapter implements ProcessAdapterService {
@@ -16,7 +17,16 @@ class FakeProcessAdapter implements ProcessAdapterService {
   }
 }
 
-function makeFakeChild(pid: number) {
+function makeLiveChild(pid: number, exit: Deferred.Deferred<number, never>) {
+  return {
+    pid,
+    exitCode: Effect.flatMap(Deferred.await(exit), (code) => Effect.succeed(code)),
+    kill: () => {},
+    stdin: undefined,
+  }
+}
+
+function makeExitedChild(pid: number) {
   return {
     pid,
     exitCode: Effect.succeed(0),
@@ -27,120 +37,191 @@ function makeFakeChild(pid: number) {
 
 const fake = new FakeProcessAdapter()
 const adapterLayer = Layer.succeed(ProcessAdapter, ProcessAdapter.of(fake))
-
 const it = testEffect(ProcessManager.layer.pipe(Layer.provide(adapterLayer)))
 
 describe("ProcessManager limits", () => {
-  it.instance("rejects the (MAX_PER_SESSION + 1)-th promote from the same session", () =>
+  it.instance("allows 64 live processes in one session", () =>
     Effect.gen(function* () {
       const manager = yield* ProcessManager.Service
-      const sessionID = "ses_capped"
+      const sessionID = "ses_sixty_four"
 
-      for (let i = 0; i < MAX_PER_SESSION; i++) {
+      for (let i = 0; i < MAX_GLOBAL; i++) {
         yield* manager.promote({
           sessionID,
           command: `cmd${i}`,
           cwd: "/",
           pid: 1000 + i,
           stdinAvailable: false,
-          child: makeFakeChild(1000 + i),
+          child: makeLiveChild(1000 + i, yield* Deferred.make<number, never>()),
         })
       }
 
-      const exits: number[] = []
-      // Capture which PIDs got killed by the cap-reject path.
-      const beforeKills = fake.stops.length
-      for (let i = 0; i < 3; i++) {
-        const candidatePid = 9000 + i
-        const result = yield* Effect.exit(
-          manager.promote({
+      const list = yield* manager.list({ sessionID })
+      expect(list.length).toBe(MAX_GLOBAL)
+    }),
+  )
+
+  it.instance("prunes the least-recently-used live process instead of rejecting the 65th promote", () =>
+    Effect.gen(function* () {
+      const manager = yield* ProcessManager.Service
+      const sessionID = "ses_prune_live"
+      const handles: ProcessInfo[] = []
+
+      for (let i = 0; i < MAX_GLOBAL; i++) {
+        handles.push(
+          yield* manager.promote({
             sessionID,
-            command: "extra",
+            command: `cmd${i}`,
             cwd: "/",
-            pid: candidatePid,
+            pid: 2000 + i,
             stdinAvailable: false,
-            child: makeFakeChild(candidatePid),
+            child: makeLiveChild(2000 + i, yield* Deferred.make<number, never>()),
           }),
         )
-        if (result._tag === "Failure") exits.push(candidatePid)
       }
-      // All over-cap promotes were rejected
-      expect(exits.length).toBe(3)
-      // All those candidate PIDs were killed by the adapter
-      for (const pid of exits) {
-        expect(fake.stops).toContain(pid)
-      }
-      // No new records were added to the session
-      const list = yield* manager.list({ sessionID })
-      expect(list.length).toBe(MAX_PER_SESSION)
+
+      const promoted = yield* manager.promote({
+        sessionID,
+        command: "extra",
+        cwd: "/",
+        pid: 2999,
+        stdinAvailable: false,
+        child: makeLiveChild(2999, yield* Deferred.make<number, never>()),
+      })
+
+      expect(promoted.state).toBe("running")
+      expect(fake.stops).toContain(2000)
+      expect(yield* manager.info({ sessionID, handle: handles[0]!.handle })).toBeUndefined()
+      expect((yield* manager.list({ sessionID })).length).toBe(MAX_GLOBAL)
     }),
   )
 
-  it.instance("rejects the (MAX_GLOBAL + 1)-th promote across all sessions", () =>
+  it.instance("prefers pruning an old terminal process over a live process", () =>
     Effect.gen(function* () {
       const manager = yield* ProcessManager.Service
-      // Fill up to the global cap by spreading across many sessions.
-      // We only need the 33rd promote to be rejected, regardless of session.
-      let placed = 0
-      let s = 0
-      while (placed < MAX_GLOBAL) {
-        const sessionID = `ses_g_${s++}`
+      const sessionID = "ses_prune_terminal"
+      const terminal = yield* manager.promote({
+        sessionID,
+        command: "done",
+        cwd: "/",
+        pid: 3000,
+        stdinAvailable: false,
+        child: makeExitedChild(3000),
+      })
+
+      for (let i = 1; i < MAX_GLOBAL; i++) {
         yield* manager.promote({
           sessionID,
-          command: "x",
+          command: `cmd${i}`,
           cwd: "/",
-          pid: 7000 + placed,
+          pid: 3000 + i,
           stdinAvailable: false,
-          child: makeFakeChild(7000 + placed),
+          child: makeLiveChild(3000 + i, yield* Deferred.make<number, never>()),
         })
-        placed++
       }
-      // Now a 33rd promote from any session is rejected.
+      yield* Effect.sleep("20 millis")
+
+      const beforeStops = fake.stops.length
+      yield* manager.promote({
+        sessionID,
+        command: "extra",
+        cwd: "/",
+        pid: 3999,
+        stdinAvailable: false,
+        child: makeLiveChild(3999, yield* Deferred.make<number, never>()),
+      })
+
+      expect(fake.stops.length).toBe(beforeStops)
+      expect(yield* manager.info({ sessionID, handle: terminal.handle })).toBeUndefined()
+      expect((yield* manager.list({ sessionID })).length).toBe(MAX_GLOBAL)
+    }),
+  )
+
+  it.instance("protects the 8 most recently used processes during prune", () =>
+    Effect.gen(function* () {
+      const manager = yield* ProcessManager.Service
+      const sessionID = "ses_prune_protected"
+      const handles: ProcessInfo[] = []
+
+      for (let i = 0; i < MAX_GLOBAL; i++) {
+        handles.push(
+          yield* manager.promote({
+            sessionID,
+            command: `cmd${i}`,
+            cwd: "/",
+            pid: 4000 + i,
+            stdinAvailable: false,
+            child: makeLiveChild(4000 + i, yield* Deferred.make<number, never>()),
+          }),
+        )
+      }
+      for (let i = 0; i < RECENT_PROCESS_PROTECT_COUNT; i++) {
+        yield* manager.poll({ sessionID, handle: handles[i]!.handle, cursor: 0 })
+      }
+
+      yield* manager.promote({
+        sessionID,
+        command: "extra",
+        cwd: "/",
+        pid: 4999,
+        stdinAvailable: false,
+        child: makeLiveChild(4999, yield* Deferred.make<number, never>()),
+      })
+
+      for (let i = 0; i < RECENT_PROCESS_PROTECT_COUNT; i++) {
+        expect(yield* manager.info({ sessionID, handle: handles[i]!.handle })).toBeDefined()
+        expect(fake.stops).not.toContain(4000 + i)
+      }
+      expect(fake.stops).toContain(4000 + RECENT_PROCESS_PROTECT_COUNT)
+    }),
+  )
+
+  it.instance("never stops another session's live process to make room for a promote", () =>
+    Effect.gen(function* () {
+      const manager = yield* ProcessManager.Service
+      const victimSession = "ses_victim"
+      const attackerSession = "ses_attacker"
+      const victimHandles: ProcessInfo[] = []
+
+      // Session A fills the entire global store with live processes.
+      for (let i = 0; i < MAX_GLOBAL; i++) {
+        victimHandles.push(
+          yield* manager.promote({
+            sessionID: victimSession,
+            command: `victim${i}`,
+            cwd: "/",
+            pid: 6000 + i,
+            stdinAvailable: false,
+            child: makeLiveChild(6000 + i, yield* Deferred.make<number, never>()),
+          }),
+        )
+      }
+
+      // Session B promotes into a full store. There is no terminal record to
+      // prune and session B owns no live record, so the promote MUST be
+      // rejected — session A's running jobs must never be stopped to make
+      // room for session B.
+      const beforeStops = fake.stops.length
       const result = yield* Effect.exit(
         manager.promote({
-          sessionID: "ses_g_99",
-          command: "x",
+          sessionID: attackerSession,
+          command: "intruder",
           cwd: "/",
-          pid: 9999,
+          pid: 6999,
           stdinAvailable: false,
-          child: makeFakeChild(9999),
+          child: makeLiveChild(6999, yield* Deferred.make<number, never>()),
         }),
       )
-      expect(result._tag).toBe("Failure")
-      // And that PID was killed
-      expect(fake.stops).toContain(9999)
-    }),
-  )
 
-  it.instance("the over-cap child is killed by the adapter even though the record is dropped", () =>
-    Effect.gen(function* () {
-      const manager = yield* ProcessManager.Service
-      const sessionID = "ses_kill"
-      for (let i = 0; i < MAX_PER_SESSION; i++) {
-        yield* manager.promote({
-          sessionID,
-          command: "x",
-          cwd: "/",
-          pid: 5000 + i,
-          stdinAvailable: false,
-          child: makeFakeChild(5000 + i),
-        })
+      expect(result._tag).toBe("Failure")
+      // Only the rejected candidate's own pid may be stopped; no victim pid.
+      expect(fake.stops).toContain(6999)
+      for (let i = 0; i < MAX_GLOBAL; i++) {
+        expect(fake.stops).not.toContain(6000 + i)
+        expect(yield* manager.info({ sessionID: victimSession, handle: victimHandles[i]!.handle })).toBeDefined()
       }
-      const overPid = 5555
-      const before = fake.stops.length
-      yield* Effect.exit(
-        manager.promote({
-          sessionID,
-          command: "x",
-          cwd: "/",
-          pid: overPid,
-          stdinAvailable: false,
-          child: makeFakeChild(overPid),
-        }),
-      )
-      // adapter.stop was called for the over-cap PID
-      expect(fake.stops.length).toBe(before + 1)
-      expect(fake.stops).toContain(overPid)
+      expect((yield* manager.list({ sessionID: victimSession })).length).toBe(MAX_GLOBAL)
+      void beforeStops
     }),
   )
 })

@@ -262,6 +262,36 @@ describe("ProcessManager service", () => {
     }),
   )
 
+  it.instance("list hides terminal records but they stay readable by handle until TTL", () =>
+    Effect.gen(function* () {
+      const manager = yield* ProcessManager.Service
+      const info = yield* manager.promote({
+        sessionID: "ses_terminal_poll",
+        command: "x",
+        cwd: "/",
+        pid: 55,
+        stdinAvailable: true,
+        child: makeFakeChild({ pid: 55 }),
+        prePromoteOutput: { stdout: "done\n", stderr: "" },
+      })
+      yield* Effect.sleep("20 millis")
+
+      // `list` is live-only, so a terminal record is hidden from it...
+      expect(yield* manager.list({ sessionID: "ses_terminal_poll" })).toEqual([])
+      // ...but `poll` still returns its final output and the record is NOT
+      // removed on poll (it persists until the TTL purge), so capture fibers
+      // can never be interrupted mid-drain and final output is never lost.
+      const r = yield* manager.poll({ sessionID: "ses_terminal_poll", handle: info.handle, cursor: 0 })
+      expect(r).toBeDefined()
+      expect(r!.info.state).toBe("exited")
+      expect(r!.events.map((e) => e.text)).toEqual(["done\n"])
+      expect(yield* manager.info({ sessionID: "ses_terminal_poll", handle: info.handle })).toBeDefined()
+      // A second poll still works because the record was retained.
+      const again = yield* manager.poll({ sessionID: "ses_terminal_poll", handle: info.handle, cursor: 0 })
+      expect(again!.events.map((e) => e.text)).toEqual(["done\n"])
+    }),
+  )
+
   it.instance("prePromoteOutput stderr is pollable and tagged kind=stderr", () =>
     Effect.gen(function* () {
       const manager = yield* ProcessManager.Service
