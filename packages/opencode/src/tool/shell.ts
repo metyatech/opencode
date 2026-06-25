@@ -783,8 +783,8 @@ export const ShellTool = Tool.define(
             const prePromoteStdout = list.map((item) => item.text).join("")
             const prePromoteSnapshot = last || (full ? preview(full) : "")
 
-            // Promote may fail with LimitReached (per-session or
-            // global cap) or another domain error. On failure we close
+            // Promote may fail with LimitReached (global cap) or another
+            // domain error. On failure we close
             // `longScope` ourselves (the manager has already killed the
             // child via `adapter.stop` in the failed promote() call) so
             // the spawner's acquireRelease finalizers run and the child
@@ -807,7 +807,11 @@ export const ShellTool = Tool.define(
                       )
                     },
                   },
-                  timeoutMs: input.timeout > 0 ? input.timeout : null,
+                  // `background_after_ms` is opencode's compatibility name
+                  // for a Codex-style yield threshold. Once the command has
+                  // yielded into the process manager, elapsed time alone must
+                  // not become a hard kill deadline.
+                  timeoutMs: null,
                   stdout: handle.stdout,
                   stderr: handle.stderr,
                   release: longScopeRelease,

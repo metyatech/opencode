@@ -8,17 +8,18 @@ const PS = new Set(["powershell", "pwsh"])
 const CMD = new Set(["cmd"])
 
 // Default value for the `background_after_ms` parameter on the shell tool.
-// When a foreground command runs longer than this, the tool promotes it to a
-// background process manager handle and returns control to the model. Set to
-// 0 to disable promotion entirely (foreground-only behavior). 10s is the
-// default — short commands finish first and behave identically to today.
+// This is opencode's compatibility name for a Codex-style `yield_time_ms`:
+// if the command is still alive after this initial wait, the tool yields a
+// process manager handle and returns control to the model. Set to 0 to disable
+// yielding entirely (foreground-only behavior). 10s is the default — short
+// commands finish first and behave identically to today.
 export const DEFAULT_BACKGROUND_AFTER_MS = 10_000
 
-// Hard upper bound for `background_after_ms`. 60s prevents callers from
-// accidentally parking a stuck command for hours and forgetting about it;
-// the model's \`timeout\` parameter is the proper way to express a longer
-// overall deadline.
-export const MAX_BACKGROUND_AFTER_MS = 60_000
+// Codex-like effective range for `background_after_ms`. `0` is retained as an
+// opencode extension that disables yielding and keeps legacy foreground-only
+// timeout behavior.
+export const MIN_BACKGROUND_AFTER_MS = 250
+export const MAX_BACKGROUND_AFTER_MS = 30_000
 
 const descriptions = {
   bash: "Clear, concise description of what this command does in 5-10 words. Examples:\nInput: ls\nOutput: Lists files in current directory\n\nInput: git status\nOutput: Shows working tree status\n\nInput: npm install\nOutput: Installs package dependencies\n\nInput: mkdir foo\nOutput: Creates directory 'foo'",
@@ -41,9 +42,14 @@ export function parameterSchema(description: string, defaultBackgroundAfterMs: n
     }),
     description: Schema.String.annotate({ description }),
     background_after_ms: Schema.optional(
-      Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)).check(Schema.isLessThanOrEqualTo(MAX_BACKGROUND_AFTER_MS)),
+      Schema.Union([
+        Schema.Literal(0),
+        Schema.Int.check(Schema.isGreaterThanOrEqualTo(MIN_BACKGROUND_AFTER_MS)).check(
+          Schema.isLessThanOrEqualTo(MAX_BACKGROUND_AFTER_MS),
+        ),
+      ]),
     ).annotate({
-      description: `If the command is still running after this many milliseconds, return a background process handle instead of waiting for completion. 0 disables background promotion. Defaults to ${defaultBackgroundAfterMs}ms. The hard \`timeout\` still applies as the overall deadline; once backgrounded, the manager enforces it.`,
+      description: `Initial yield time in milliseconds, equivalent to Codex \`yield_time_ms\`. If the command completes before this time, the tool returns a foreground result. If it is still running, the tool returns a managed process handle; elapsed time alone does not kill it after yielding. Use process poll to read output and process stop to terminate. Set 0 to disable yielding and keep legacy foreground execution. Defaults to ${defaultBackgroundAfterMs}ms. Valid values are 0 or ${MIN_BACKGROUND_AFTER_MS}..${MAX_BACKGROUND_AFTER_MS}.`,
     }),
   })
 }
@@ -126,7 +132,7 @@ function bashCommandSection(
 Usage notes:
   - The command argument is required.
   - You can specify an optional timeout in milliseconds. If not specified, commands will time out after ${defaultTimeoutMs}ms.
-  - You can specify an optional \`background_after_ms\` (0..${MAX_BACKGROUND_AFTER_MS}, default ${defaultBackgroundAfterMs}) to promote the command to a background process handle if it has not exited by then. Set to 0 to disable background promotion and wait for completion. The hard \`timeout\` is the overall deadline regardless.
+  - You can specify an optional \`background_after_ms\` (0 or ${MIN_BACKGROUND_AFTER_MS}..${MAX_BACKGROUND_AFTER_MS}, default ${defaultBackgroundAfterMs}) as the initial yield time. If the command finishes before then, it returns as a foreground result. If it is still running, it returns a process handle and is not killed merely because elapsed time passes after yielding. Set to 0 to disable yielding and wait in legacy foreground mode.
   - It is very helpful if you write a clear, concise description of what this command does in 5-10 words.
   - If the output exceeds ${limits.maxLines} lines or ${limits.maxBytes} bytes, it will be truncated and the full output will be written to a file. You can use Read with offset/limit to read specific sections or Grep to search the full content. Do NOT use \`head\`, \`tail\`, or other truncation commands to limit output; the full output will already be captured to a file for more precise searching.
 
@@ -180,7 +186,7 @@ Before executing the command, please follow these steps:
 Usage notes:
   - The command argument is required.
   - You can specify an optional timeout in milliseconds. If not specified, commands will time out after ${defaultTimeoutMs}ms.
-  - You can specify an optional \`background_after_ms\` (0..${MAX_BACKGROUND_AFTER_MS}, default ${defaultBackgroundAfterMs}) to promote the command to a background process handle if it has not exited by then. Set to 0 to disable background promotion and wait for completion. The hard \`timeout\` is the overall deadline regardless.
+  - You can specify an optional \`background_after_ms\` (0 or ${MIN_BACKGROUND_AFTER_MS}..${MAX_BACKGROUND_AFTER_MS}, default ${defaultBackgroundAfterMs}) as the initial yield time. If the command finishes before then, it returns as a foreground result. If it is still running, it returns a process handle and is not killed merely because elapsed time passes after yielding. Set to 0 to disable yielding and wait in legacy foreground mode.
   - It is very helpful if you write a clear, concise description of what this command does in 5-10 words.
   - If the output exceeds ${limits.maxLines} lines or ${limits.maxBytes} bytes, it will be truncated and the full output will be written to a file. You can use Read with offset/limit to read specific sections or Grep to search the full content. Do NOT use \`Select-Object -First\`, \`Select-Object -Last\`, or other truncation commands to limit output; the full output will already be captured to a file for more precise searching.
 
@@ -236,7 +242,7 @@ Before executing the command, please follow these steps:
 Usage notes:
   - The command argument is required.
   - You can specify an optional timeout in milliseconds. If not specified, commands will time out after ${defaultTimeoutMs}ms.
-  - You can specify an optional \`background_after_ms\` (0..${MAX_BACKGROUND_AFTER_MS}, default ${defaultBackgroundAfterMs}) to promote the command to a background process handle if it has not exited by then. Set to 0 to disable background promotion and wait for completion. The hard \`timeout\` is the overall deadline regardless.
+  - You can specify an optional \`background_after_ms\` (0 or ${MIN_BACKGROUND_AFTER_MS}..${MAX_BACKGROUND_AFTER_MS}, default ${defaultBackgroundAfterMs}) as the initial yield time. If the command finishes before then, it returns as a foreground result. If it is still running, it returns a process handle and is not killed merely because elapsed time passes after yielding. Set to 0 to disable yielding and wait in legacy foreground mode.
   - It is very helpful if you write a clear, concise description of what this command does in 5-10 words.
   - If the output exceeds ${limits.maxLines} lines or ${limits.maxBytes} bytes, it will be truncated and the full output will be written to a file. You can use Read with offset/limit to read specific sections or Grep to search the full content. Do NOT use \`more\` or other pagination commands to limit output; the full output will already be captured to a file for more precise searching.
 

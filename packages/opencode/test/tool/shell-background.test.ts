@@ -150,8 +150,37 @@ describe("ShellTool background_after_ms promotion", () => {
         const list = yield* manager.list({ sessionID: ctx.sessionID })
         expect(list.length).toBe(1)
         expect(list[0]!.handle).toBe(metadata.processHandle! as ProcessHandle)
+        expect(list[0]!.timeoutMs).toBeNull()
         // Cleanup: stop the backgrounded process so the suite exits cleanly.
         yield* manager.stop({ sessionID: ctx.sessionID, handle: list[0]!.handle }).pipe(Effect.ignore)
+      }).pipe(provideInstance(__dirname)),
+  )
+
+  it.live(
+    "default 10s yield returns a handle without carrying a manager timeout",
+    () =>
+      Effect.gen(function* () {
+        const started = Date.now()
+        const result = yield* run(
+          {
+            command: fixture(sleepsThenExits(30_000)),
+            description: "default yield background",
+          },
+          ctx,
+        )
+        expect(Date.now() - started).toBeLessThan(15_000)
+        const metadata = result.metadata as { background?: boolean; processHandle?: string }
+        expect(metadata.background).toBe(true)
+        const manager = yield* ProcessManager.Service
+        const polled = yield* manager.poll({
+          sessionID: ctx.sessionID,
+          handle: metadata.processHandle! as ProcessHandle,
+          cursor: 0,
+        })
+        expect(polled).toBeDefined()
+        expect(polled!.info.timeoutMs).toBeNull()
+        expect(polled!.info.state).toBe("running")
+        yield* manager.stop({ sessionID: ctx.sessionID, handle: metadata.processHandle! as ProcessHandle }).pipe(Effect.ignore)
       }).pipe(provideInstance(__dirname)),
   )
 
@@ -176,7 +205,30 @@ describe("ShellTool background_after_ms promotion", () => {
   )
 
   it.live(
-    "background_after_ms=200 with 5s fixture: first poll returns pre-promote preview",
+    "background_after_ms=0 uses legacy default foreground timeout when timeout is omitted",
+    () =>
+      Effect.gen(function* () {
+        const result = yield* run(
+          {
+            command: fixture(sleepsThenExits(30_000)),
+            description: "no-promotion default timeout",
+            background_after_ms: 0,
+          },
+          ctx,
+        )
+        expect((result.metadata as { background?: boolean }).background).toBeUndefined()
+        expect(result.output).toContain("exceeding timeout 500 ms")
+        const manager = yield* ProcessManager.Service
+        expect(yield* manager.list({ sessionID: ctx.sessionID })).toEqual([])
+      }).pipe(
+        Effect.provide(RuntimeFlags.layer({ bashDefaultTimeoutMs: 500 })),
+        provideInstance(__dirname),
+      ),
+    15_000,
+  )
+
+  it.live(
+    "background_after_ms=250 with 5s fixture: first poll returns pre-promote preview",
     () =>
       Effect.gen(function* () {
         const result = yield* run(
@@ -184,7 +236,7 @@ describe("ShellTool background_after_ms promotion", () => {
             command: fixture(sleepsThenExits(5000)),
             description: "background poll pre",
             timeout: 30_000,
-            background_after_ms: 200,
+            background_after_ms: 250,
           },
           ctx,
         )
@@ -208,7 +260,7 @@ describe("ShellTool background_after_ms promotion", () => {
   )
 
   it.live(
-    "background_after_ms=200 with writes-then-sleeps: pre-promote output surfaces in the first poll",
+    "background_after_ms=250 with writes-then-sleeps: pre-promote output surfaces in the first poll",
     () =>
       Effect.gen(function* () {
         const result = yield* run(
@@ -216,7 +268,7 @@ describe("ShellTool background_after_ms promotion", () => {
             command: fixture(writesThenSleeps(5000)),
             description: "background writes hello",
             timeout: 30_000,
-            background_after_ms: 200,
+            background_after_ms: 250,
           },
           ctx,
         )
@@ -278,7 +330,7 @@ describe("ShellTool background_after_ms promotion", () => {
             command: fixture(sleepsThenExits(5000)),
             description: "background then abort",
             timeout: 30_000,
-            background_after_ms: 200,
+            background_after_ms: 250,
           },
           liveCtx,
         )
@@ -343,39 +395,51 @@ describe("ShellTool background_after_ms promotion", () => {
   )
 
   it.live(
-    "hard timeoutMs kills backgrounded process and marks terminationReason=timeout",
+    "explicit timeout before yield kills foreground and does not create a process handle",
     () =>
       Effect.gen(function* () {
         const result = yield* run(
           {
             command: fixture(sleepsThenExits(30_000)),
-            description: "bg with short timeout",
-            timeout: 500,
-            background_after_ms: 100,
+            description: "timeout before yield",
+            timeout: 200,
+            background_after_ms: 1000,
           },
           ctx,
         )
-        const metadata = result.metadata as {
-          background?: boolean
-          processHandle?: string
-        }
+        expect((result.metadata as { background?: boolean }).background).toBeUndefined()
+        expect(result.output).toContain("exceeding timeout 200 ms")
+        const manager = yield* ProcessManager.Service
+        expect(yield* manager.list({ sessionID: ctx.sessionID })).toEqual([])
+      }).pipe(provideInstance(__dirname)),
+  )
+
+  it.live(
+    "explicit timeout after yield is not carried into the process manager",
+    () =>
+      Effect.gen(function* () {
+        const result = yield* run(
+          {
+            command: fixture(sleepsThenExits(30_000)),
+            description: "timeout after yield",
+            timeout: 5000,
+            background_after_ms: 250,
+          },
+          ctx,
+        )
+        const metadata = result.metadata as { background?: boolean; processHandle?: string }
         expect(metadata.background).toBe(true)
         const manager = yield* ProcessManager.Service
-        // Wait past the hard timeout.
-        let info = yield* manager.info({
+        const first = yield* manager.info({ sessionID: ctx.sessionID, handle: metadata.processHandle! as ProcessHandle })
+        expect(first?.timeoutMs).toBeNull()
+        yield* Effect.sleep("5500 millis")
+        const afterTimeout = yield* manager.info({
           sessionID: ctx.sessionID,
           handle: metadata.processHandle! as ProcessHandle,
         })
-        const deadline = Date.now() + 3000
-        while (Date.now() < deadline && info!.state === "running") {
-          yield* Effect.sleep("50 millis")
-          info = yield* manager.info({
-            sessionID: ctx.sessionID,
-            handle: metadata.processHandle! as ProcessHandle,
-          })
-        }
-        expect(info!.state).toBe("failed")
-        expect(info!.terminationReason).toBe("timeout")
+        expect(afterTimeout?.state).toBe("running")
+        expect(afterTimeout?.terminationReason).toBeNull()
+        yield* manager.stop({ sessionID: ctx.sessionID, handle: metadata.processHandle! as ProcessHandle }).pipe(Effect.ignore)
       }).pipe(provideInstance(__dirname)),
   )
 
@@ -389,7 +453,7 @@ describe("ShellTool background_after_ms promotion", () => {
             command: fixture(sleepsThenExits(5000)),
             description: "cross-session check",
             timeout: 30_000,
-            background_after_ms: 200,
+            background_after_ms: 250,
           },
           ctx,
         )
@@ -415,48 +479,39 @@ describe("ShellTool background_after_ms promotion", () => {
   )
 
   it.live(
-    "promote failure (limit reached) returns background:false with error metadata",
+    "full process store prunes an old terminal record and still returns a handle",
     () =>
       Effect.gen(function* () {
-        // Pre-promote 8 fake records to saturate the per-session limit. We
-        // bypass the manager API by directly feeding 8 promote calls on the
-        // same session with fake children that never exit.
         const manager = yield* ProcessManager.Service
-        const exits: Deferred.Deferred<number, never>[] = []
-        for (let i = 0; i < 8; i++) {
-          exits.push(yield* Deferred.make<number, never>())
+        for (let i = 0; i < 64; i++) {
           yield* manager.promote({
             sessionID: ctx.sessionID,
             command: "filler",
             cwd: "/",
-            pid: 9000 + i,
+            pid: null,
             stdinAvailable: false,
             child: {
-              pid: 9000 + i,
-              exitCode: Effect.flatMap(Deferred.await(exits[i]!), (n) => Effect.succeed(n)),
+              pid: null,
+              exitCode: Effect.succeed(0),
               kill: () => {},
             },
           })
         }
+        yield* Effect.sleep("20 millis")
 
         const result = yield* run(
           {
             command: fixture(sleepsThenExits(5000)),
-            description: "limit reached",
+            description: "prune and promote",
             timeout: 30_000,
-            background_after_ms: 100,
+            background_after_ms: 250,
           },
           ctx,
         )
-        const metadata = result.metadata as {
-          background?: boolean
-          error?: string
-        }
-        expect(metadata.background).toBe(false)
-        expect(metadata.error).toBe("LimitReached")
-
-        // Cleanup: release the 8 filler exits so the manager tears down cleanly.
-        for (const e of exits) yield* Deferred.succeed(e, 0)
+        const metadata = result.metadata as { background?: boolean; processHandle?: string }
+        expect(metadata.background).toBe(true)
+        expect(metadata.processHandle).toBeDefined()
+        yield* manager.stop({ sessionID: ctx.sessionID, handle: metadata.processHandle! as ProcessHandle }).pipe(Effect.ignore)
       }).pipe(provideInstance(__dirname)),
   )
 
@@ -469,7 +524,7 @@ describe("ShellTool background_after_ms promotion", () => {
             command: fixture(sleepsThenExits(30_000)),
             description: "stop from manager",
             timeout: 60_000,
-            background_after_ms: 200,
+            background_after_ms: 250,
           },
           ctx,
         )
@@ -511,7 +566,7 @@ describe("ShellTool background_after_ms promotion", () => {
             command: fixture(sleepsThenExits(30_000)),
             description: "no write on backgrounded",
             timeout: 60_000,
-            background_after_ms: 200,
+            background_after_ms: 250,
           },
           ctx,
         )
