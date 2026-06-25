@@ -1139,7 +1139,7 @@ describe("tool.shell background promotion guidance", () => {
               command,
               description: "background guidance",
               timeout: 30_000,
-              background_after_ms: 1,
+              background_after_ms: 250,
             },
             ctx,
           )
@@ -1235,7 +1235,7 @@ describe("tool.shell abort", () => {
         projectRoot,
         Effect.gen(function* () {
           const tool = yield* initShell()
-          expect(tool.description).toContain("commands will time out after 500ms")
+          expect(tool.description).toContain("falls back to 500ms")
           const result = yield* tool.execute(
             {
               command: `echo started && sleep 60`,

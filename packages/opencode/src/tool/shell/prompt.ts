@@ -131,7 +131,7 @@ function bashCommandSection(
 
 Usage notes:
   - The command argument is required.
-  - You can specify an optional timeout in milliseconds. If not specified, commands will time out after ${defaultTimeoutMs}ms.
+  - You can specify an optional \`timeout\` in milliseconds. It applies while the command is still running in the foreground. With the default \`background_after_ms\`, long-running commands yield a process handle before the legacy default timeout is reached; after yielding, elapsed time alone does not kill the process. Set \`background_after_ms\` to 0 to disable yielding and use legacy foreground-only timeout behavior, where an unspecified \`timeout\` falls back to ${defaultTimeoutMs}ms.
   - You can specify an optional \`background_after_ms\` (0 or ${MIN_BACKGROUND_AFTER_MS}..${MAX_BACKGROUND_AFTER_MS}, default ${defaultBackgroundAfterMs}) as the initial yield time. If the command finishes before then, it returns as a foreground result. If it is still running, it returns a process handle and is not killed merely because elapsed time passes after yielding. Set to 0 to disable yielding and wait in legacy foreground mode.
   - It is very helpful if you write a clear, concise description of what this command does in 5-10 words.
   - If the output exceeds ${limits.maxLines} lines or ${limits.maxBytes} bytes, it will be truncated and the full output will be written to a file. You can use Read with offset/limit to read specific sections or Grep to search the full content. Do NOT use \`head\`, \`tail\`, or other truncation commands to limit output; the full output will already be captured to a file for more precise searching.
@@ -185,7 +185,7 @@ Before executing the command, please follow these steps:
 
 Usage notes:
   - The command argument is required.
-  - You can specify an optional timeout in milliseconds. If not specified, commands will time out after ${defaultTimeoutMs}ms.
+  - You can specify an optional \`timeout\` in milliseconds. It applies while the command is still running in the foreground. With the default \`background_after_ms\`, long-running commands yield a process handle before the legacy default timeout is reached; after yielding, elapsed time alone does not kill the process. Set \`background_after_ms\` to 0 to disable yielding and use legacy foreground-only timeout behavior, where an unspecified \`timeout\` falls back to ${defaultTimeoutMs}ms.
   - You can specify an optional \`background_after_ms\` (0 or ${MIN_BACKGROUND_AFTER_MS}..${MAX_BACKGROUND_AFTER_MS}, default ${defaultBackgroundAfterMs}) as the initial yield time. If the command finishes before then, it returns as a foreground result. If it is still running, it returns a process handle and is not killed merely because elapsed time passes after yielding. Set to 0 to disable yielding and wait in legacy foreground mode.
   - It is very helpful if you write a clear, concise description of what this command does in 5-10 words.
   - If the output exceeds ${limits.maxLines} lines or ${limits.maxBytes} bytes, it will be truncated and the full output will be written to a file. You can use Read with offset/limit to read specific sections or Grep to search the full content. Do NOT use \`Select-Object -First\`, \`Select-Object -Last\`, or other truncation commands to limit output; the full output will already be captured to a file for more precise searching.
@@ -241,7 +241,7 @@ Before executing the command, please follow these steps:
 
 Usage notes:
   - The command argument is required.
-  - You can specify an optional timeout in milliseconds. If not specified, commands will time out after ${defaultTimeoutMs}ms.
+  - You can specify an optional \`timeout\` in milliseconds. It applies while the command is still running in the foreground. With the default \`background_after_ms\`, long-running commands yield a process handle before the legacy default timeout is reached; after yielding, elapsed time alone does not kill the process. Set \`background_after_ms\` to 0 to disable yielding and use legacy foreground-only timeout behavior, where an unspecified \`timeout\` falls back to ${defaultTimeoutMs}ms.
   - You can specify an optional \`background_after_ms\` (0 or ${MIN_BACKGROUND_AFTER_MS}..${MAX_BACKGROUND_AFTER_MS}, default ${defaultBackgroundAfterMs}) as the initial yield time. If the command finishes before then, it returns as a foreground result. If it is still running, it returns a process handle and is not killed merely because elapsed time passes after yielding. Set to 0 to disable yielding and wait in legacy foreground mode.
   - It is very helpful if you write a clear, concise description of what this command does in 5-10 words.
   - If the output exceeds ${limits.maxLines} lines or ${limits.maxBytes} bytes, it will be truncated and the full output will be written to a file. You can use Read with offset/limit to read specific sections or Grep to search the full content. Do NOT use \`more\` or other pagination commands to limit output; the full output will already be captured to a file for more precise searching.
