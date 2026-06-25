@@ -24,7 +24,7 @@ function asAction(value: string): Metadata["action"] {
   return "poll"
 }
 
-const DESCRIPTION = `Manage long-running background shell processes started by the bash tool when its background_after_ms threshold is reached. Tool calls are session-scoped: a session can only interact with processes it owns. Handles are opaque tokens, not OS PIDs. Use \`list\` to enumerate the session's processes. Use \`poll\` to fetch new output since a monotonic cursor. Use \`stop\` to terminate a process; idempotent on already-stopped processes.
+const DESCRIPTION = `Manage long-running background shell processes started by the bash tool when its background_after_ms yield threshold is reached. They are not killed merely because elapsed time passes after yielding. Tool calls are session-scoped: a session can only interact with processes it owns. Handles are opaque tokens, not OS PIDs. The manager keeps up to 64 global processes and prunes older records when full. Use \`list\` to enumerate the session's live processes. Use \`poll\` to fetch new output since a monotonic cursor. Use \`stop\` to terminate a process; idempotent on already-stopped processes.
 
 Never call this tool with empty arguments.
 Use exactly one of these argument shapes:
@@ -40,7 +40,7 @@ Stop a background process:
 
 If you need a handle but do not know it, call {"action":"list"} first.
 
-There is intentionally no \`write\` action: the bash tool spawns every command with stdin set to "ignore", so no stdin pipe is exposed to backgrounded processes today. Use \`stop\` (or wait for the natural exit / hard timeout) to terminate a backgrounded process.`
+There is intentionally no \`write\` action: the bash tool spawns every command with stdin set to "ignore", so no stdin pipe is exposed to backgrounded processes today. Use \`poll\` to observe natural exit and \`stop\` to terminate a live backgrounded process.`
 
 function shortError(error: unknown) {
   const text = String(error)

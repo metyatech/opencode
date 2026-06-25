@@ -26,12 +26,12 @@ import { InstanceState } from "@/effect/instance-state"
 // inside the layer's environment so the dependency is satisfied.
 export type OwnedScopeRelease = Effect.Effect<void, never, never>
 
-// Hard caps. Per-session is the limit a single shell session can hold; the
-// global cap is the worst-case total the manager is willing to track across
-// all sessions in one directory instance. Both kill the offending child at
-// the boundary so we never leak a process outside the manager's accounting.
-export const MAX_PER_SESSION = 8
-export const MAX_GLOBAL = 32
+// Codex-like process store cap. A full store prunes old records instead of
+// hard-rejecting immediately; the 8 most recently used records are protected,
+// terminal records are preferred for removal, and only then can the least
+// recently used live record be stopped and removed.
+export const MAX_GLOBAL = 64
+export const RECENT_PROCESS_PROTECT_COUNT = 8
 
 // 30 minutes. The manager purges a record this long after `endedAt`; live
 // records are kept indefinitely (until InstanceState teardown).
@@ -45,6 +45,7 @@ type Record = {
   readonly command: string
   readonly cwd: string
   readonly startedAt: number
+  lastUsedAt: number
   endedAt: number | null
   state: ProcessState
   exitCode: number | null
@@ -284,7 +285,8 @@ export function fromSpawnerChild(
 }
 
 // Core manager layer: covers `promote`, `list`, `info`, `poll`, `feed`,
-// `write`, `stop`, `killAll*`, `purgeExpired`. The shell tool passes
+// `stop`, `killAll*`, `purgeExpired`. There is intentionally no public
+// `write` action (stdin is spawned as "ignore"). The shell tool passes
 // the live `ChildProcessHandle` it already owns to `promote`; the
 // manager tracks the child but does not own the spawner scope.
 export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
@@ -360,11 +362,71 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
       },
     )
 
+    const isLive = (rec: Record) => rec.state === "starting" || rec.state === "running"
+
+    const removeRecord = Effect.fn("ProcessManager.removeRecord")(function* (
+      rec: Record,
+      options?: { readonly stopLive?: boolean },
+    ) {
+      if (options?.stopLive && isLive(rec) && rec.pid !== null) {
+        yield* adapter.stop({ pid: rec.pid, graceMs: 200 }).pipe(Effect.ignore)
+        void Deferred.succeed(rec.onExit, { exitCode: rec.exitCode, signal: rec.signal })
+      }
+      if (rec.watcher) yield* Fiber.interrupt(rec.watcher).pipe(Effect.ignore)
+      if (rec.timeoutWatcher) yield* Fiber.interrupt(rec.timeoutWatcher).pipe(Effect.ignore)
+      for (const f of rec.captureFibers) yield* Fiber.interrupt(f).pipe(Effect.ignore)
+      yield* closeOwnedScope(rec)
+      const ref = yield* recordsRef()
+      const key = rec.handle as unknown as string
+      yield* SynchronizedRef.modify(ref, (m) => {
+        const next = new Map(m)
+        next.delete(key)
+        return [undefined, next] as const
+      })
+    })
+
+    const pruneForGlobalCap = Effect.fn("ProcessManager.pruneForGlobalCap")(function* (sessionID: string) {
+      const map = yield* SynchronizedRef.get(yield* recordsRef())
+      if (map.size < MAX_GLOBAL) return true
+
+      const entries = Array.from(map.entries())
+      const protectedKeys = new Set(
+        entries
+          .toSorted((a, b) => b[1].lastUsedAt - a[1].lastUsedAt)
+          .slice(0, RECENT_PROCESS_PROTECT_COUNT)
+          .map(([key]) => key),
+      )
+      const unprotected = entries.filter(([key]) => !protectedKeys.has(key)).map(([, rec]) => rec)
+
+      // Prefer pruning a terminal record. Terminal records are dead, so
+      // removing one across any session only frees a slot — it never stops a
+      // running job.
+      const terminalVictim = unprotected
+        .filter((rec) => !isLive(rec))
+        .toSorted((a, b) => a.lastUsedAt - b.lastUsedAt)[0]
+      if (terminalVictim) {
+        yield* removeRecord(terminalVictim)
+        return true
+      }
+
+      // No terminal record is available. Only then do we terminate a live
+      // process — and only one owned by the promoting session, so a session
+      // can never stop another session's running job to make room for its
+      // own. This preserves the manager's session-ownership boundary even
+      // under the global cap. If the caller has no unprotected live record to
+      // give up, reject the promote rather than crossing the boundary.
+      const liveVictim = unprotected
+        .filter((rec) => isLive(rec) && rec.ownerSessionID === sessionID)
+        .toSorted((a, b) => a.lastUsedAt - b.lastUsedAt)[0]
+      if (!liveVictim) return false
+      yield* removeRecord(liveVictim, { stopLive: true })
+      return true
+    })
+
     // ---- public methods ----
 
     const promote: ProcessManagerService["promote"] = Effect.fn("ProcessManager.promote")(function* (input) {
       const ref = yield* recordsRef()
-      const map = yield* SynchronizedRef.get(ref)
       const child = input.child as ManagedChild
 
       // 1. Generate a fresh handle. The shell tool that owns the live child
@@ -372,30 +434,21 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
       const handle = ProcessHandle.ascending()
       const key = handle as unknown as string
 
-      // 2. Per-session cap.
-      const perSession = Array.from(map.values()).filter(
-        (rec) => rec.ownerSessionID === input.sessionID,
-      ).length
-      if (perSession >= MAX_PER_SESSION) {
+      // 2. Global cap. A full store prunes old records first. Recent records
+      // are protected; terminal records are removed before live records. Only
+      // if no prune candidate exists do we reject and kill the candidate child.
+      const pruned = yield* pruneForGlobalCap(input.sessionID)
+      const map = yield* SynchronizedRef.get(ref)
+      if (!pruned || map.size >= MAX_GLOBAL) {
         if (input.pid !== null) yield* adapter.stop({ pid: input.pid, graceMs: 200 }).pipe(Effect.ignore)
         return yield* failWith(
           "LimitReached",
-          `per-session limit (${MAX_PER_SESSION}) reached for session ${input.sessionID}`,
+          `global limit (${MAX_GLOBAL}) reached; no unprotected process could be pruned`,
           handle,
         )
       }
 
-      // 3. Global cap.
-      if (map.size >= MAX_GLOBAL) {
-        if (input.pid !== null) yield* adapter.stop({ pid: input.pid, graceMs: 200 }).pipe(Effect.ignore)
-        return yield* failWith(
-          "LimitReached",
-          `global limit (${MAX_GLOBAL}) reached; refusing to track additional processes`,
-          handle,
-        )
-      }
-
-      // 4. Insert record. The exit watcher below flips the state to
+      // 3. Insert record. The exit watcher below flips the state to
       // `exited`/`failed` once the child terminates.
       const startedAt = yield* Clock.currentTimeMillis
       const onExit = yield* Deferred.make<{ exitCode: number | null; signal: string | null }, never>()
@@ -405,6 +458,7 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
         command: input.command,
         cwd: input.cwd,
         startedAt,
+        lastUsedAt: startedAt,
         endedAt: null,
         state: "starting",
         exitCode: null,
@@ -432,7 +486,7 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
 
       const { scope } = yield* InstanceState.get(state)
 
-      // 5. Fork the long-lived exit watcher. It owns the state transition
+      // 4. Fork the long-lived exit watcher. It owns the state transition
       // from `running` to `exited` / `failed` and resolves `onExit` once.
       // On every transition we close the caller-owned scope (idempotent)
       // so the spawner's acquireRelease finalizers fire and the OS file
@@ -465,7 +519,7 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
         scope,
       )
 
-      // 6. Fork the long-lived hard-timeout watcher. Fires once after the
+      // 5. Fork the long-lived hard-timeout watcher. Fires once after the
       // caller's `timeoutMs`; marks the record `failed` with `signal: "TIMEOUT"`
       // and a `terminationReason: "timeout"`. The watcher is a no-op once the
       // record has already ended (via natural exit or explicit stop). It is
@@ -506,7 +560,7 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
             )
           : null
 
-      // 7. Manager-owned output capture. If the caller passed live stdio
+      // 6. Manager-owned output capture. If the caller passed live stdio
       // streams, fork a long-lived drain fiber per stream into the same
       // scope so it dies with the record. The fiber is interrupted by the
       // record's purge finalizer (see InstanceState teardown) and by the
@@ -527,7 +581,7 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
         captureFibers.push(f)
       }
 
-      // 8. Seed pre-promote output into the ring buffer. The shell tool
+      // 7. Seed pre-promote output into the ring buffer. The shell tool
       // stops its local capture/persist fibers BEFORE calling `promote`,
       // drains them into a single `prePromoteStdout` (and future
       // `prePromoteStderr`) string, and hands those strings to the
@@ -571,7 +625,7 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
     const list: ProcessManagerService["list"] = Effect.fn("ProcessManager.list")(function* (input) {
       const map = yield* SynchronizedRef.get(yield* recordsRef())
       return Array.from(map.values())
-        .filter((rec) => rec.ownerSessionID === input.sessionID)
+        .filter((rec) => rec.ownerSessionID === input.sessionID && isLive(rec))
         .map(snapshot)
         .toSorted((a, b) => a.startedAt - b.startedAt)
     })
@@ -585,6 +639,8 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
     const poll: ProcessManagerService["poll"] = Effect.fn("ProcessManager.poll")(function* (input) {
       const rec = yield* lookup(input.handle, input.sessionID)
       if (!rec) return undefined
+      const now = yield* Clock.currentTimeMillis
+      yield* mutate(input.handle, (cur) => ({ ...cur, lastUsedAt: now }))
 
       const maxBytes = Math.min(input.maxBytes ?? POLL_DEFAULT_MAX_BYTES, POLL_MAX_BYTES_HARD_CAP)
       const waitMs = Math.min(input.waitMs ?? POLL_DEFAULT_WAIT_MS, POLL_MAX_WAIT_MS)
@@ -599,7 +655,8 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
       }
 
       const cursor = input.cursor ?? 0
-      const { events, nextCursor, truncatedBeforeCursor } = rec.buffer.since(cursor)
+      const latest = (yield* lookup(input.handle, input.sessionID)) ?? rec
+      const { events, nextCursor, truncatedBeforeCursor } = latest.buffer.since(cursor)
 
       // Apply per-call maxBytes on the response (cumulative cap on the wire,
       // separate from the buffer's internal cap). Walk from the newest event
@@ -620,8 +677,18 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
       }
       const trimmed = events.slice(start)
 
+      // Terminal records are NOT removed here. The exit watcher and the
+      // stdout/stderr capture fibers complete independently, so the child's
+      // `exitCode` resolving does not guarantee the capture fibers have
+      // finished draining the OS pipe. Deleting the record on the first poll
+      // that observes a terminal state could interrupt an in-flight capture
+      // fiber and drop the command's final output. Instead, terminal records
+      // stay readable by handle (and hidden from `list`, which is live-only)
+      // until the 30-minute TTL purge removes them. This is the documented
+      // difference from Codex, which prunes a yielded process from its store
+      // as soon as the final output is read.
       return {
-        info: snapshot(rec),
+        info: snapshot(latest),
         events: trimmed,
         nextCursor: trimmed.length === 0 ? nextCursor : trimmed[trimmed.length - 1]!.seq,
         truncatedBeforeCursor: truncatedBeforeCursor || start > 0,
@@ -638,8 +705,10 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
     const stop: ProcessManagerService["stop"] = Effect.fn("ProcessManager.stop")(function* (input) {
       const rec = yield* lookup(input.handle, input.sessionID)
       if (!rec) return yield* failWith("NotFound", `process ${input.handle} not found`, input.handle)
+      const now = yield* Clock.currentTimeMillis
+      yield* mutate(input.handle, (cur) => ({ ...cur, lastUsedAt: now }))
       if (rec.state === "exited" || rec.state === "failed" || rec.state === "stopped") {
-        return snapshot(rec)
+        return snapshot((yield* lookup(input.handle, input.sessionID)) ?? rec)
       }
 
       // Mark `stopping` first so the exit watcher doesn't race us into
