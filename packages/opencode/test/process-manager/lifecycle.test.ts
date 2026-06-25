@@ -77,11 +77,12 @@ describe("ProcessManager lifecycle", () => {
 
       yield* manager.killAllForSession("ses_lc_a")
 
-      // sessionA's record is still in the map (killAllForSession only kills
-      // the OS process; the manager keeps the record until TTL).
+      // sessionA's record is still in the map until TTL, but `list` is now
+      // live-only so stopped records are only visible by handle.
       const aListAfter = yield* manager.list({ sessionID: "ses_lc_a" })
-      expect(aListAfter.length).toBe(1)
-      expect(aListAfter[0]!.handle).toBe(aInfo.handle)
+      expect(aListAfter).toEqual([])
+      const aInfoAfter = yield* manager.info({ sessionID: "ses_lc_a", handle: aInfo.handle })
+      expect(aInfoAfter?.state).toBe("stopped")
       // sessionB is untouched: its record is still listed and the OS
       // process was never signalled.
       const bListAfter = yield* manager.list({ sessionID: "ses_lc_b" })

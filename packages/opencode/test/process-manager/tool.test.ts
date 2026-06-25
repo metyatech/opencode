@@ -41,10 +41,14 @@ describe("process tool action guidance", () => {
     Effect.gen(function* () {
       const def = yield* Tool.init(yield* ProcessTool)
       expect(def.description).toContain("Never call this tool with empty arguments.")
+      expect(def.description).toContain("not killed merely because elapsed time passes after yielding")
+      expect(def.description).toContain("keeps up to 64 global processes")
+      expect(def.description).toContain("live processes")
       expect(def.description).toContain('{"action":"list"}')
       expect(def.description).toContain('{"action":"poll","handle":"proc_...","cursor":0}')
       expect(def.description).toContain('{"action":"stop","handle":"proc_..."}')
       expect(def.description).toContain('If you need a handle but do not know it, call {"action":"list"} first.')
+      expect(def.description).not.toContain("hard timeout")
     }),
   )
 
