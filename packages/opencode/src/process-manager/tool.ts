@@ -52,18 +52,26 @@ function shortError(error: unknown) {
   return text.length <= 1000 ? text : `${text.slice(0, 1000)}...`
 }
 
-function formatProcessValidationError(error: unknown): string {
-  return [
-    "The process tool requires an action and must never be called with empty arguments.",
-    "Use exactly one of:",
-    '{"action":"list"}',
-    '{"action":"poll","handle":"proc_...","cursor":0}',
-    '{"action":"stop","handle":"proc_..."}',
-    "",
-    'If the handle is unknown, call {"action":"list"} first.',
-    "",
-    `Original schema error: ${shortError(error)}`,
-  ].join("\n")
+function isEmptyObjectArgs(args: unknown): boolean {
+  if (args === null || typeof args !== "object" || Array.isArray(args)) return false
+  return Object.keys(args as Record<string, unknown>).length === 0
+}
+
+function formatProcessValidationError(error: unknown, args?: unknown): string {
+  const guidance = isEmptyObjectArgs(args)
+    ? [
+        "The process tool requires an action and must never be called with empty arguments.",
+        "Use exactly one of:",
+        '{"action":"list"}',
+        '{"action":"poll","handle":"proc_...","cursor":0}',
+        '{"action":"stop","handle":"proc_..."}',
+        "",
+        'If the handle is unknown, call {"action":"list"} first.',
+      ]
+    : [
+        "Invalid process tool arguments. The process tool requires one of list/poll/stop with correctly typed fields. For poll, cursor/wait_ms/max_bytes must be numbers when provided.",
+      ]
+  return [...guidance, "", `Original schema error: ${shortError(error)}`].join("\n")
 }
 
 type Metadata = {

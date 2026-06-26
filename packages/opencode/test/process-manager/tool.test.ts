@@ -72,13 +72,30 @@ describe("process tool action guidance", () => {
   it.instance("formatValidationError produces the expected message shape", () =>
     Effect.gen(function* () {
       const def = yield* Tool.init(yield* ProcessTool)
-      const formatted = def.formatValidationError!(new Error("boom"))
+      const formatted = def.formatValidationError!(new Error("boom"), {})
       expect(formatted).toContain("The process tool requires an action and must never be called with empty arguments.")
       expect(formatted).toContain('{"action":"list"}')
       expect(formatted).toContain('{"action":"poll","handle":"proc_...","cursor":0}')
       expect(formatted).toContain('{"action":"stop","handle":"proc_..."}')
       expect(formatted).toContain('If the handle is unknown, call {"action":"list"} first.')
       expect(formatted).toContain("Original schema error: Error: boom")
+    }),
+  )
+
+  it.instance("process poll with string cursor reports typed-field guidance", () =>
+    Effect.gen(function* () {
+      const def = yield* Tool.init(yield* ProcessTool)
+      const exit = yield* Effect.exit(def.execute({ action: "poll", handle: "proc_cursor", cursor: "0" } as never, ctx))
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (!Exit.isFailure(exit)) return
+      const err = Cause.squash(exit.cause) as Error
+      const message = err.message
+      expect(message).toContain("Invalid process tool arguments.")
+      expect(message).toContain("cursor/wait_ms/max_bytes must be numbers when provided")
+      expect(message).not.toContain("must never be called with empty arguments")
+      expect(message).toContain("Original schema error:")
+      expect(message).toContain('"0"')
+      expect(message).toContain('["cursor"]')
     }),
   )
 })

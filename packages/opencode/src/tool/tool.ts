@@ -60,7 +60,7 @@ export interface Def<
   parameters: Parameters
   jsonSchema?: JSONSchema7
   execute(args: Schema.Schema.Type<Parameters>, ctx: Context): Effect.Effect<ExecuteResult<M>>
-  formatValidationError?(error: unknown): string
+  formatValidationError?(error: unknown, args?: unknown): string
 }
 export type DefWithoutID<
   Parameters extends Schema.Decoder<unknown> = Schema.Decoder<unknown>,
@@ -164,7 +164,7 @@ function wrap<Parameters extends Schema.Decoder<unknown>, Result extends Metadat
                     argsKeys: summary.keys,
                     argsPreview: summary.preview,
                     errorDetail: toolInfo.formatValidationError
-                      ? toolInfo.formatValidationError(error)
+                      ? toolInfo.formatValidationError(error, args)
                       : String(error),
                   }
                 })
@@ -183,13 +183,13 @@ function wrap<Parameters extends Schema.Decoder<unknown>, Result extends Metadat
                     argsKeys: summary.keys,
                     argsPreview: summary.preview,
                     errorDetail: toolInfo.formatValidationError
-                      ? toolInfo.formatValidationError(error)
+                      ? toolInfo.formatValidationError(error, args)
                       : String(error),
                   }
                 })
                 return new InvalidArgumentsError({
                   tool: id,
-                  detail: toolInfo.formatValidationError ? toolInfo.formatValidationError(error) : String(error),
+                  detail: toolInfo.formatValidationError ? toolInfo.formatValidationError(error, args) : String(error),
                 })
               },
             ),
