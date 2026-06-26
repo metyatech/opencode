@@ -1,5 +1,11 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test"
-import { debugToolArgsEnabled, inputSummary, logToolArgsLazy } from "../../src/tool/debug-args"
+import {
+  debugToolArgsEnabled,
+  inputSummary,
+  isEmptyObjectInput,
+  logEmptyProcessArgsWarnLazy,
+  logToolArgsLazy,
+} from "../../src/tool/debug-args"
 
 // Snapshot/restore OPENCODE_DEBUG_TOOL_ARGS around each test so a stray
 // process.env mutation cannot leak across cases. Without this the lazy test
@@ -147,5 +153,76 @@ describe("inputSummary shape coverage", () => {
     expect(s.keys?.includes("a")).toBe(true)
     expect(s.keys?.includes("self")).toBe(true)
     expect(typeof s.preview).toBe("string")
+  })
+})
+
+describe("isEmptyObjectInput", () => {
+  test("true only for a plain empty object", () => {
+    expect(isEmptyObjectInput({})).toBe(true)
+  })
+
+  test("false for an object with keys", () => {
+    expect(isEmptyObjectInput({ action: "list" })).toBe(false)
+  })
+
+  test.each([
+    ["array", [] as unknown],
+    ["null", null],
+    ["undefined", undefined],
+    ["string", ""],
+    ["number", 0],
+  ])("false for %s", (_label, value) => {
+    expect(isEmptyObjectInput(value)).toBe(false)
+  })
+})
+
+describe("logEmptyProcessArgsWarnLazy", () => {
+  test("does not invoke the builder when disabled", () => {
+    let called = false
+    logEmptyProcessArgsWarnLazy("test", () => {
+      called = true
+      return { ok: true }
+    })
+    expect(called).toBe(false)
+  })
+
+  test("does not invoke the builder even when it would throw, when disabled", () => {
+    let called = false
+    logEmptyProcessArgsWarnLazy("test", () => {
+      called = true
+      throw new Error("must not run")
+    })
+    expect(called).toBe(false)
+  })
+
+  test("invokes the builder when enabled and emits nothing when it returns undefined", () => {
+    process.env[ENV_KEY] = "1"
+    let called = false
+    // builder returning undefined is the predicate-skip path: it must run
+    // (we are enabled) but must not throw and must suppress the WARN.
+    logEmptyProcessArgsWarnLazy("test", () => {
+      called = true
+      return undefined
+    })
+    expect(called).toBe(true)
+  })
+
+  test("invokes the builder and accepts a payload without throwing", () => {
+    process.env[ENV_KEY] = "1"
+    let called = false
+    logEmptyProcessArgsWarnLazy("test", () => {
+      called = true
+      return { tool: "process", argsKind: "object", argsKeys: [], argsPreview: "{}" }
+    })
+    expect(called).toBe(true)
+  })
+
+  test("catches builder exceptions so a buggy field cannot break tool flow", () => {
+    process.env[ENV_KEY] = "1"
+    // Must not throw out of the helper.
+    logEmptyProcessArgsWarnLazy("test", () => {
+      throw new Error("builder boom")
+    })
+    // Reaching here without an exception is the assertion.
   })
 })

@@ -100,3 +100,39 @@ export function logToolArgsLazy(stage: string, fields: () => Record<string, unkn
   }
   log.debug("tool args diagnostic", { stage, ...payload })
 }
+
+// Cheap, allocation-light predicate. Call sites may use this inside the
+// field builder passed to `logEmptyProcessArgsWarnLazy` to decide whether
+// the args really are an empty object before doing the full summary work.
+// The hot-path guarantee is that this is only called from inside an env-gated
+// builder, so it does not run when `OPENCODE_DEBUG_TOOL_ARGS` is unset.
+export function isEmptyObjectInput(value: unknown): boolean {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false
+  return Object.keys(value as Record<string, unknown>).length === 0
+}
+
+// WARN-level variant for the narrow case the operator is hunting: the
+// `process` tool being invoked with an empty-object payload. `log.debug`
+// is filtered out by INFO-only TUI log configs, so the regular
+// `logToolArgsLazy` diagnostic never reaches the operator's log file in
+// that mode. This variant emits at WARN so the empty-object call is
+// observable without changing the production log level. Like the debug
+// variant, env-off traffic pays nothing: the builder is only invoked
+// after the env gate has accepted the call. The builder must return
+// `undefined` when the call site decides NOT to emit (e.g. tool name is
+// not `process`, or args are not an empty object) so the WARN is gated
+// on the call site's predicate and stays narrow.
+export function logEmptyProcessArgsWarnLazy(
+  stage: string,
+  fields: () => Record<string, unknown> | undefined,
+): void {
+  if (!debugToolArgsEnabled()) return
+  let payload: Record<string, unknown> | undefined
+  try {
+    payload = fields()
+  } catch (error) {
+    payload = { builderError: error instanceof Error ? error.message : String(error) }
+  }
+  if (!payload) return
+  log.warn("empty process tool args diagnostic", { stage, ...payload })
+}

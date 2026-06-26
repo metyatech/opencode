@@ -5,7 +5,7 @@ import type { Permission } from "../permission"
 import type { SessionID, MessageID } from "../session/schema"
 import * as Truncate from "./truncate"
 import { Agent } from "@/agent/agent"
-import { inputSummary, logToolArgsLazy } from "./debug-args"
+import { inputSummary, isEmptyObjectInput, logEmptyProcessArgsWarnLazy, logToolArgsLazy } from "./debug-args"
 
 interface Metadata {
   [key: string]: any
@@ -131,6 +131,21 @@ function wrap<Parameters extends Schema.Decoder<unknown>, Result extends Metadat
             argsPreview: summary.preview,
           }
         })
+        // Narrow WARN: the `process` tool reaching the wrapper with an
+        // empty-object payload. Surfaces at WARN so it is visible even when
+        // DEBUG diagnostics are filtered out by the TUI log level.
+        logEmptyProcessArgsWarnLazy("tool-wrapper.before-decode", () => {
+          if (id !== "process") return undefined
+          if (!isEmptyObjectInput(args)) return undefined
+          const summary = inputSummary(args)
+          return {
+            tool: id,
+            callID: ctx.callID,
+            argsKind: summary.kind,
+            argsKeys: summary.keys,
+            argsPreview: summary.preview,
+          }
+        })
         return Effect.gen(function* () {
           const decoded = yield* decode(args).pipe(
             Effect.mapError(
@@ -141,6 +156,25 @@ function wrap<Parameters extends Schema.Decoder<unknown>, Result extends Metadat
                 // through InvalidArgumentsError.message; we only add a log
                 // entry under the env gate.
                 logToolArgsLazy("tool-wrapper.decode-error", () => {
+                  const summary = inputSummary(args)
+                  return {
+                    tool: id,
+                    callID: ctx.callID,
+                    argsKind: summary.kind,
+                    argsKeys: summary.keys,
+                    argsPreview: summary.preview,
+                    errorDetail: toolInfo.formatValidationError
+                      ? toolInfo.formatValidationError(error)
+                      : String(error),
+                  }
+                })
+                // Narrow WARN: the `process` tool's schema decode failing on
+                // an empty-object payload. This is the terminal stage of the
+                // `process {}` path; emitting at WARN keeps it visible under
+                // INFO-only TUI log configs.
+                logEmptyProcessArgsWarnLazy("tool-wrapper.decode-error", () => {
+                  if (id !== "process") return undefined
+                  if (!isEmptyObjectInput(args)) return undefined
                   const summary = inputSummary(args)
                   return {
                     tool: id,

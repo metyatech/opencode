@@ -22,7 +22,7 @@ import { Question } from "@/question"
 import { errorMessage } from "@/util/error"
 import * as Log from "@opencode-ai/core/util/log"
 import { isRecord } from "@/util/record"
-import { inputSummary, logToolArgsLazy } from "@/tool/debug-args"
+import { inputSummary, isEmptyObjectInput, logEmptyProcessArgsWarnLazy, logToolArgsLazy } from "@/tool/debug-args"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { SessionEvent } from "@opencode-ai/core/session-event"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -505,6 +505,29 @@ export const layer = Layer.effect(
             // are `{}`. If raw is non-record, `toolInput` wraps it as
             // `{ value }` — useful signal when narrowing the `{}` source.
             logToolArgsLazy("processor.tool-call", () => {
+              const raw = inputSummary(value.input)
+              const normalized = inputSummary(input)
+              return {
+                id: value.id,
+                toolName: value.name,
+                providerExecuted: value.providerExecuted,
+                hasProviderMetadata: value.providerMetadata != null,
+                inputEnded: toolCall.call.inputEnded,
+                rawInputKind: raw.kind,
+                rawInputKeys: raw.keys,
+                rawInputPreview: raw.preview,
+                normalizedInputKind: normalized.kind,
+                normalizedInputKeys: normalized.keys,
+                normalizedInputPreview: normalized.preview,
+              }
+            })
+            // Narrow WARN: only when the `process` tool reaches the processor
+            // with an empty-object payload (raw or normalized). Visible even
+            // when the TUI log level filters out DEBUG. Env-gated and
+            // predicate-gated so normal runs stay silent.
+            logEmptyProcessArgsWarnLazy("processor.tool-call", () => {
+              if (value.name !== "process") return undefined
+              if (!isEmptyObjectInput(value.input) && !isEmptyObjectInput(input)) return undefined
               const raw = inputSummary(value.input)
               const normalized = inputSummary(input)
               return {

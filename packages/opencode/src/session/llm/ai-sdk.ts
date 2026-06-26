@@ -2,7 +2,7 @@ import { FinishReason, LLMEvent, ProviderMetadata, ToolResultValue } from "@open
 import { Effect, Schema } from "effect"
 import { type streamText } from "ai"
 import { errorMessage } from "@/util/error"
-import { inputSummary, logToolArgsLazy } from "@/tool/debug-args"
+import { inputSummary, isEmptyObjectInput, logEmptyProcessArgsWarnLazy, logToolArgsLazy } from "@/tool/debug-args"
 
 type Result = Awaited<ReturnType<typeof streamText>>
 type AISDKEvent = Result["fullStream"] extends AsyncIterable<infer T> ? T : never
@@ -208,6 +208,26 @@ export function toLLMEvents(
         // or downstream (opencode processor / tool wrapper). Disabled in
         // normal runs by OPENCODE_DEBUG_TOOL_ARGS env gate.
         logToolArgsLazy("ai-sdk.tool-call", () => {
+          const raw = inputSummary(event.input)
+          return {
+            id: event.toolCallId,
+            toolName: event.toolName,
+            providerExecuted: "providerExecuted" in event ? event.providerExecuted : undefined,
+            hasProviderMetadata: event.providerMetadata != null,
+            inputKind: raw.kind,
+            inputKeys: raw.keys,
+            inputPreview: raw.preview,
+          }
+        })
+        // Narrow WARN: only emit when the AI SDK event itself already
+        // arrived with an empty object payload for the `process` tool.
+        // This is the upstream-signal for the production `process {}`
+        // observation; if it fires here, the empty object originated
+        // before opencode processor / tool wrapper saw it. Env-gated
+        // so normal runs are silent; builder is the gate for the WARN.
+        logEmptyProcessArgsWarnLazy("ai-sdk.tool-call", () => {
+          if (event.toolName !== "process") return undefined
+          if (!isEmptyObjectInput(event.input)) return undefined
           const raw = inputSummary(event.input)
           return {
             id: event.toolCallId,

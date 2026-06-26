@@ -18,7 +18,7 @@ import { SessionProcessor } from "./processor"
 import { PartID } from "./schema"
 import * as Log from "@opencode-ai/core/util/log"
 import { EffectBridge } from "@/effect/bridge"
-import { inputSummary, logToolArgsLazy } from "@/tool/debug-args"
+import { inputSummary, isEmptyObjectInput, logEmptyProcessArgsWarnLazy, logToolArgsLazy } from "@/tool/debug-args"
 
 const log = Log.create({ service: "session.tools" })
 
@@ -103,6 +103,24 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
                 argsPreview: summary.preview,
               }
             })
+            // Narrow WARN: the `process` tool reaching the AI SDK execute
+            // bridge with an empty-object payload. WARN keeps it visible
+            // under INFO-only TUI log configs.
+            logEmptyProcessArgsWarnLazy("session-tools.execute", () => {
+              if (item.id !== "process") return undefined
+              if (!isEmptyObjectInput(args)) return undefined
+              const summary = inputSummary(args)
+              return {
+                id: item.id,
+                toolCallId: options.toolCallId,
+                agent: input.agent.name,
+                providerID: input.model.providerID,
+                modelID: input.model.api.id,
+                argsKind: summary.kind,
+                argsKeys: summary.keys,
+                argsPreview: summary.preview,
+              }
+            })
             yield* input.processor.startToolCall({
               id: options.toolCallId,
               name: item.id,
@@ -151,6 +169,24 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
           // MCP tools have a separate execute wrapper; log here too so we
           // can tell whether `{}` arrives via the MCP path specifically.
           logToolArgsLazy("session-tools.execute", () => {
+            const summary = inputSummary(args)
+            return {
+              id: key,
+              toolCallId: opts.toolCallId,
+              agent: input.agent.name,
+              providerID: input.model.providerID,
+              modelID: input.model.api.id,
+              argsKind: summary.kind,
+              argsKeys: summary.keys,
+              argsPreview: summary.preview,
+            }
+          })
+          // Narrow WARN: the `process` tool reaching the MCP execute bridge
+          // with an empty-object payload (process is normally a registry tool,
+          // but cover this path too for completeness).
+          logEmptyProcessArgsWarnLazy("session-tools.execute", () => {
+            if (key !== "process") return undefined
+            if (!isEmptyObjectInput(args)) return undefined
             const summary = inputSummary(args)
             return {
               id: key,
