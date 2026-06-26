@@ -417,8 +417,28 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
       options?: { readonly stopLive?: boolean },
     ) {
       if (options?.stopLive && isLive(rec) && rec.pid !== null) {
+        // Mutate `rec` itself to a terminal snapshot BEFORE deleting it from
+        // the map. Parked long polls in `poll(...)` fall back to `rec` when
+        // the map lookup misses (the record was just removed), and they
+        // classify wake reasons from the returned `latest` state. If we
+        // mutated a copy or a fresh record, the stale `rec` reference the
+        // poller captured on entry would still report `running` and the
+        // poller would either (a) sleep through the deadline, or (b) wake
+        // and report a stale "running" snapshot. Mutating in place is
+        // intentional and scoped to this prune path.
+        const endedAt = yield* Clock.currentTimeMillis
+        rec.stopping = true
+        rec.state = "stopped"
+        rec.endedAt = endedAt
+        rec.terminationReason = "stopped"
         yield* adapter.stop({ pid: rec.pid, graceMs: 200 }).pipe(Effect.ignore)
         void Deferred.succeed(rec.onExit, { exitCode: rec.exitCode, signal: rec.signal })
+        // Wake any poller parked on this record's notifier. The pruner is
+        // the only terminal path that does not already wake pollers (the
+        // other terminal paths route through `mutate` + their own wake).
+        // Without this, a long poll would sleep out the full wait window
+        // and return a "timeout" against a record that no longer exists.
+        yield* wakeNotifier(rec.pollNotifier, "terminal")
       }
       if (rec.watcher) yield* Fiber.interrupt(rec.watcher).pipe(Effect.ignore)
       if (rec.timeoutWatcher) yield* Fiber.interrupt(rec.timeoutWatcher).pipe(Effect.ignore)

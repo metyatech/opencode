@@ -455,3 +455,73 @@ describe("normalizePollWaitMs", () => {
     expect(ProcessManager.normalizePollWaitMs(300001)).toBe(300000)
   })
 })
+
+describe("ProcessManager global cap pruning wakes long polls", () => {
+  it.instance("removeRecord({ stopLive: true }) wakes a parked long poll as terminal", () =>
+    Effect.gen(function* () {
+      const manager = yield* ProcessManager.Service
+      const sessionID = "ses_cap_prune_long_poll"
+      // Step 1: promote a live victim that the test will park a long poll on.
+      const victimExit = yield* Deferred.make<number, never>()
+      const victimInfo = yield* manager.promote({
+        sessionID,
+        command: "victim",
+        cwd: "/",
+        pid: 7000,
+        stdinAvailable: true,
+        child: makeFakeChild({ pid: 7000, exit: victimExit }),
+      })
+      // Step 2: park a long poll on the victim handle. Use a 300_000ms
+      // wait so the only way this returns quickly is via wake.
+      const parked = yield* manager
+        .poll({ sessionID, handle: victimInfo.handle, cursor: 0, waitMs: 300_000 })
+        .pipe(Effect.forkChild)
+      // Give the poller a moment to enter the parked state.
+      yield* Effect.sleep("20 millis")
+      // Step 3: fill the global cap (64) with live records in the same
+      // session. The cap pruner prefers a terminal victim; only when no
+      // terminal record is available does it fall back to a live victim
+      // owned by the promoting session. Promoting 63 more live records
+      // here means the 64th live promote (the next step) will prune the
+      // victim — the oldest unprotected live record in this session.
+      for (let i = 0; i < 63; i++) {
+        const exit = yield* Deferred.make<number, never>()
+        yield* manager.promote({
+          sessionID,
+          command: `filler-${i}`,
+          cwd: "/",
+          pid: 8000 + i,
+          stdinAvailable: false,
+          child: makeFakeChild({ pid: 8000 + i, exit }),
+        })
+      }
+      // Step 4: the 65th live promote trips the cap. The cap pruner walks
+      // unprotected records (oldest 56 by `lastUsedAt`); the victim is
+      // the oldest live record in this session because all `lastUsedAt`
+      // values equal their `startedAt` and the victim was promoted first.
+      const triggerExit = yield* Deferred.make<number, never>()
+      yield* manager.promote({
+        sessionID,
+        command: "trigger",
+        cwd: "/",
+        pid: 9000,
+        stdinAvailable: false,
+        child: makeFakeChild({ pid: 9000, exit: triggerExit }),
+      })
+      // Step 5: the parked long poll must return without waiting the
+      // 300_000ms deadline. Wait for the fiber with a 5s safety budget so
+      // a regression surfaces as a deterministic test failure rather than
+      // a hung suite.
+      const result = yield* Fiber.join(parked).pipe(Effect.timeout("5 seconds"))
+      // Step 6: assert the wake result. The `?? rec` fallback in
+      // `poll.observe()` must observe the mutated-in-place terminal
+      // snapshot — i.e. `info.state === "stopped"`, NOT stale `running`.
+      expect(result).toBeDefined()
+      expect(result!.waitStatus).toBe("terminal")
+      expect(result!.waitStatus).not.toBe("timeout")
+      expect(result!.info.state).toBe("stopped")
+      expect(result!.info.state).not.toBe("running")
+      expect(result!.info.terminationReason).toBe("stopped")
+    }),
+  )
+})
