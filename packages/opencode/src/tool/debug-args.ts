@@ -6,10 +6,11 @@ import * as Log from "@opencode-ai/core/util/log"
 // called with `{}` — the AI SDK adapter, the session processor, the AI SDK
 // `execute` bridge, or the tool wrapper's schema decode.
 //
-// Hot-path discipline: when the env is OFF, NO allocation, NO preview
-// generation, and NO field-builder invocation occurs. The lazy variant
-// `logToolArgsLazy` guarantees this by deferring the field builder until
-// after the env gate has accepted the call.
+// Hot-path discipline: when the env is OFF, the field builder is not invoked,
+// so no `inputSummary()`, no `JSON.stringify()`, no preview generation, and no
+// diagnostic log emission occurs. Call sites may still allocate the closure
+// passed to `logToolArgsLazy`; the guarantee is that the expensive diagnostic
+// work is skipped, not that the surrounding call site is allocation-free.
 
 const MAX_PREVIEW_CHARS = 8_000
 
@@ -78,9 +79,12 @@ function safePreview(value: unknown): string {
 }
 
 // Lazy variant. The field builder runs ONLY after the env gate has accepted
-// the call, so env-off traffic pays nothing — no `inputSummary`, no
-// `JSON.stringify`, no object allocation. This is the variant every hot-path
-// tool call site should use.
+// the call, so env-off traffic skips the expensive diagnostic work: the
+// builder is not invoked, so there is no `inputSummary()`, no
+// `JSON.stringify()`, no preview generation, and no log emission. This is
+// the variant every hot-path tool call site should use. Note: the closure
+// passed to this function is still allocated at the call site; the
+// guarantee is about the work inside the closure, not its allocation.
 export function logToolArgsLazy(stage: string, fields: () => Record<string, unknown>): void {
   if (!debugToolArgsEnabled()) return
   // Wrap in try/catch so a buggy field builder cannot break the tool call.
