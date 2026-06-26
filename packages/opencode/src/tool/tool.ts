@@ -5,6 +5,7 @@ import type { Permission } from "../permission"
 import type { SessionID, MessageID } from "../session/schema"
 import * as Truncate from "./truncate"
 import { Agent } from "@/agent/agent"
+import { inputSummary, logToolArgs } from "./debug-args"
 
 interface Metadata {
   [key: string]: any
@@ -115,14 +116,48 @@ function wrap<Parameters extends Schema.Decoder<unknown>, Result extends Metadat
           "message.id": ctx.messageID,
           ...(ctx.callID ? { "tool.call_id": ctx.callID } : {}),
         }
+        // Diagnostic: capture the args shape reaching the tool wrapper. If
+        // they are already `{}` here, the source is upstream of the schema
+        // decoder; if they are non-empty here, the failure is in the schema
+        // itself or in the schema's expected input. Disabled unless
+        // OPENCODE_DEBUG_TOOL_ARGS is set.
+        {
+          const summary = inputSummary(args)
+          logToolArgs("tool-wrapper.before-decode", {
+            tool: id,
+            callID: ctx.callID,
+            argsKind: summary.kind,
+            argsKeys: summary.keys,
+            argsPreview: summary.preview,
+          })
+        }
         return Effect.gen(function* () {
           const decoded = yield* decode(args).pipe(
             Effect.mapError(
-              (error) =>
-                new InvalidArgumentsError({
+              (error) => {
+                // Diagnostic: schema rejection — useful to see exactly
+                // which tool rejected `{}` vs. a malformed-but-non-empty
+                // payload. The original error is still surfaced verbatim
+                // through InvalidArgumentsError.message; we only add a log
+                // entry under the env gate.
+                {
+                  const summary = inputSummary(args)
+                  logToolArgs("tool-wrapper.decode-error", {
+                    tool: id,
+                    callID: ctx.callID,
+                    argsKind: summary.kind,
+                    argsKeys: summary.keys,
+                    argsPreview: summary.preview,
+                    errorDetail: toolInfo.formatValidationError
+                      ? toolInfo.formatValidationError(error)
+                      : String(error),
+                  })
+                }
+                return new InvalidArgumentsError({
                   tool: id,
                   detail: toolInfo.formatValidationError ? toolInfo.formatValidationError(error) : String(error),
-                }),
+                })
+              },
             ),
           )
           const result = yield* execute(decoded as Schema.Schema.Type<Parameters>, ctx)

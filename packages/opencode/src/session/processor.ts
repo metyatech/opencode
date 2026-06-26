@@ -22,6 +22,7 @@ import { Question } from "@/question"
 import { errorMessage } from "@/util/error"
 import * as Log from "@opencode-ai/core/util/log"
 import { isRecord } from "@/util/record"
+import { inputSummary, logToolArgs } from "@/tool/debug-args"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { SessionEvent } from "@opencode-ai/core/session-event"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -494,6 +495,27 @@ export const layer = Layer.effect(
               throw new Error(`Tool call not allowed while generating summary: ${value.name}`)
             }
             const toolCall = yield* ensureToolCall(value)
+            // Diagnostic: compare raw `value.input` against the normalized
+            // `input` produced by `toolInput`. If raw is `{}` upstream, both
+            // are `{}`. If raw is non-record, `toolInput` wraps it as
+            // `{ value }` — useful signal when narrowing the `{}` source.
+            {
+              const raw = inputSummary(value.input)
+              const normalized = inputSummary(toolInput(value.input))
+              logToolArgs("processor.tool-call", {
+                id: value.id,
+                toolName: value.name,
+                providerExecuted: value.providerExecuted,
+                hasProviderMetadata: value.providerMetadata != null,
+                inputEnded: toolCall.call.inputEnded,
+                rawInputKind: raw.kind,
+                rawInputKeys: raw.keys,
+                rawInputPreview: raw.preview,
+                normalizedInputKind: normalized.kind,
+                normalizedInputKeys: normalized.keys,
+                normalizedInputPreview: normalized.preview,
+              })
+            }
             const input = toolInput(value.input)
             if (!toolCall.call.inputEnded) {
               // TODO(v2): Temporary dual-write while migrating session messages to v2 events.

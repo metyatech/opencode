@@ -18,6 +18,7 @@ import { SessionProcessor } from "./processor"
 import { PartID } from "./schema"
 import * as Log from "@opencode-ai/core/util/log"
 import { EffectBridge } from "@/effect/bridge"
+import { inputSummary, logToolArgs } from "@/tool/debug-args"
 
 const log = Log.create({ service: "session.tools" })
 
@@ -85,6 +86,23 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
         return run.promise(
           Effect.gen(function* () {
             const ctx = context(args, options)
+            // Diagnostic: AI SDK's tool execute bridge. Capture the args
+            // shape coming straight from the SDK so we can distinguish
+            // "AI SDK passed `{}`" from "args were correct here and
+            // something later mutated them".
+            {
+              const summary = inputSummary(args)
+              logToolArgs("session-tools.execute", {
+                id: item.id,
+                toolCallId: options.toolCallId,
+                agent: input.agent.name,
+                providerID: input.model.providerID,
+                modelID: input.model.api.id,
+                argsKind: summary.kind,
+                argsKeys: summary.keys,
+                argsPreview: summary.preview,
+              })
+            }
             yield* input.processor.startToolCall({
               id: options.toolCallId,
               name: item.id,
@@ -129,6 +147,22 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
       run.promise(
         Effect.gen(function* () {
           const ctx = context(args, opts)
+          // Diagnostic: same as the registry-backed tools.execute above.
+          // MCP tools have a separate execute wrapper; log here too so we
+          // can tell whether `{}` arrives via the MCP path specifically.
+          {
+            const summary = inputSummary(args)
+            logToolArgs("session-tools.execute", {
+              id: key,
+              toolCallId: opts.toolCallId,
+              agent: input.agent.name,
+              providerID: input.model.providerID,
+              modelID: input.model.api.id,
+              argsKind: summary.kind,
+              argsKeys: summary.keys,
+              argsPreview: summary.preview,
+            })
+          }
           yield* input.processor.startToolCall({
             id: opts.toolCallId,
             name: key,

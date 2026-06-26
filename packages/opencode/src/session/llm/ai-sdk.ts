@@ -2,6 +2,7 @@ import { FinishReason, LLMEvent, ProviderMetadata, ToolResultValue } from "@open
 import { Effect, Schema } from "effect"
 import { type streamText } from "ai"
 import { errorMessage } from "@/util/error"
+import { inputSummary, logToolArgs } from "@/tool/debug-args"
 
 type Result = Awaited<ReturnType<typeof streamText>>
 type AISDKEvent = Result["fullStream"] extends AsyncIterable<infer T> ? T : never
@@ -161,6 +162,12 @@ export function toLLMEvents(
     case "tool-input-start":
       return Effect.sync(() => {
         state.toolNames[event.id] = event.toolName
+        logToolArgs("ai-sdk.tool-input-start", {
+          id: event.id,
+          toolName: event.toolName,
+          providerExecuted: "providerExecuted" in event ? event.providerExecuted : undefined,
+          hasProviderMetadata: event.providerMetadata != null,
+        })
         return [
           LLMEvent.toolInputStart({
             id: event.id,
@@ -180,6 +187,11 @@ export function toLLMEvents(
       ])
 
     case "tool-input-end":
+      logToolArgs("ai-sdk.tool-input-end", {
+        id: event.id,
+        toolName: state.toolNames[event.id] ?? "unknown",
+        hasProviderMetadata: event.providerMetadata != null,
+      })
       return Effect.succeed([
         LLMEvent.toolInputEnd({
           id: event.id,
@@ -191,6 +203,20 @@ export function toLLMEvents(
     case "tool-call":
       return Effect.sync(() => {
         state.toolNames[event.toolCallId] = event.toolName
+        // Diagnostic only: capture the AI SDK `event.input` shape so we can
+        // tell whether `{}` originates upstream (model / provider / AI SDK)
+        // or downstream (opencode processor / tool wrapper). Disabled in
+        // normal runs by OPENCODE_DEBUG_TOOL_ARGS env gate.
+        const raw = inputSummary(event.input)
+        logToolArgs("ai-sdk.tool-call", {
+          id: event.toolCallId,
+          toolName: event.toolName,
+          providerExecuted: "providerExecuted" in event ? event.providerExecuted : undefined,
+          hasProviderMetadata: event.providerMetadata != null,
+          inputKind: raw.kind,
+          inputKeys: raw.keys,
+          inputPreview: raw.preview,
+        })
         return [
           LLMEvent.toolCall({
             id: event.toolCallId,
