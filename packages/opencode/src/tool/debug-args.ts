@@ -4,12 +4,12 @@ import * as Log from "@opencode-ai/core/util/log"
 // `OPENCODE_DEBUG_TOOL_ARGS` is set to `1`/`true`/`yes` (case-insensitive).
 // The intent is to narrow down where `process` (or any other tool) is being
 // called with `{}` — the AI SDK adapter, the session processor, the AI SDK
-// `execute` bridge, or the tool wrapper's schema decode. This is a
-// no-op in normal runs: the gate short-circuits before any allocation.
+// `execute` bridge, or the tool wrapper's schema decode.
 //
-// Keeping this in a dedicated file (rather than re-declaring per-site) avoids
-// drift between logging sites and keeps the env name in one place. The
-// helper is intentionally minimal so it does not pull in extra dependencies.
+// Hot-path discipline: when the env is OFF, NO allocation, NO preview
+// generation, and NO field-builder invocation occurs. The lazy variant
+// `logToolArgsLazy` guarantees this by deferring the field builder until
+// after the env gate has accepted the call.
 
 const MAX_PREVIEW_CHARS = 8_000
 
@@ -31,9 +31,21 @@ export function debugToolArgsEnabled(): boolean {
 // Summarize a tool-call input value so the diagnostic log shows enough shape
 // to tell apart `{}`, `undefined`, `null`, a string, an array, or an object
 // with keys — without dumping unbounded payload. Returned shape is JSON-safe
-// and stable across log sites.
+// and stable across log sites. Pure and allocation-light; safe to call from
+// inside the field builder passed to `logToolArgsLazy`.
 export function inputSummary(value: unknown): {
-  readonly kind: "undefined" | "null" | "string" | "number" | "boolean" | "array" | "object" | "function" | "symbol" | "bigint" | "unknown"
+  readonly kind:
+    | "undefined"
+    | "null"
+    | "string"
+    | "number"
+    | "boolean"
+    | "array"
+    | "object"
+    | "function"
+    | "symbol"
+    | "bigint"
+    | "unknown"
   readonly keys: ReadonlyArray<string> | undefined
   readonly preview: string
 } {
@@ -47,20 +59,40 @@ export function inputSummary(value: unknown): {
   return { kind: typeof value as never, keys: undefined, preview: safePreview(value) }
 }
 
+// Robust preview generator. `JSON.stringify` returns `undefined` (not throw)
+// for values it cannot represent — functions, symbols, `undefined`, and
+// BigInt — and a plain `length` access would crash. We coerce to a string
+// and only then bound by length.
 function safePreview(value: unknown): string {
   let raw: string
   try {
-    raw = JSON.stringify(value)
+    const json = JSON.stringify(value)
+    raw = json === undefined ? String(value) : json
   } catch {
+    // Circular structures and other JSON.stringify failures fall back to
+    // String(value) — best-effort, never throws out of this function.
     raw = String(value)
   }
   if (raw.length <= MAX_PREVIEW_CHARS) return raw
   return raw.slice(0, MAX_PREVIEW_CHARS) + "...<truncated>"
 }
 
-// Single entry point used by every log site. Keeps the log line shape
-// uniform so the caller can grep for `stage=` across files.
-export function logToolArgs(stage: string, fields: Record<string, unknown>): void {
+// Lazy variant. The field builder runs ONLY after the env gate has accepted
+// the call, so env-off traffic pays nothing — no `inputSummary`, no
+// `JSON.stringify`, no object allocation. This is the variant every hot-path
+// tool call site should use.
+export function logToolArgsLazy(stage: string, fields: () => Record<string, unknown>): void {
   if (!debugToolArgsEnabled()) return
-  log.debug("tool args diagnostic", { stage, ...fields })
+  // Wrap in try/catch so a buggy field builder cannot break the tool call.
+  // The env gate is intentionally inside the gate, not inside the catch:
+  // we still want any error to surface in normal runs if a caller forgets
+  // the env gate, but we never want the helper itself to throw across the
+  // tool boundary.
+  let payload: Record<string, unknown>
+  try {
+    payload = fields()
+  } catch (error) {
+    payload = { builderError: error instanceof Error ? error.message : String(error) }
+  }
+  log.debug("tool args diagnostic", { stage, ...payload })
 }

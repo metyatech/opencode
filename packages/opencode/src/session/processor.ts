@@ -22,7 +22,7 @@ import { Question } from "@/question"
 import { errorMessage } from "@/util/error"
 import * as Log from "@opencode-ai/core/util/log"
 import { isRecord } from "@/util/record"
-import { inputSummary, logToolArgs } from "@/tool/debug-args"
+import { inputSummary, logToolArgsLazy } from "@/tool/debug-args"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { SessionEvent } from "@opencode-ai/core/session-event"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -495,14 +495,19 @@ export const layer = Layer.effect(
               throw new Error(`Tool call not allowed while generating summary: ${value.name}`)
             }
             const toolCall = yield* ensureToolCall(value)
+            // Compute the normalized `input` first — it is needed for the
+            // downstream processor flow regardless of the env gate, so we
+            // never want to call `toolInput(value.input)` twice. The lazy
+            // helper reuses this single value inside its field builder.
+            const input = toolInput(value.input)
             // Diagnostic: compare raw `value.input` against the normalized
             // `input` produced by `toolInput`. If raw is `{}` upstream, both
             // are `{}`. If raw is non-record, `toolInput` wraps it as
             // `{ value }` — useful signal when narrowing the `{}` source.
-            {
+            logToolArgsLazy("processor.tool-call", () => {
               const raw = inputSummary(value.input)
-              const normalized = inputSummary(toolInput(value.input))
-              logToolArgs("processor.tool-call", {
+              const normalized = inputSummary(input)
+              return {
                 id: value.id,
                 toolName: value.name,
                 providerExecuted: value.providerExecuted,
@@ -514,9 +519,8 @@ export const layer = Layer.effect(
                 normalizedInputKind: normalized.kind,
                 normalizedInputKeys: normalized.keys,
                 normalizedInputPreview: normalized.preview,
-              })
-            }
-            const input = toolInput(value.input)
+              }
+            })
             if (!toolCall.call.inputEnded) {
               // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
               if (flags.experimentalEventSystem) {

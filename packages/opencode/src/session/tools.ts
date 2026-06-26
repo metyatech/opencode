@@ -18,7 +18,7 @@ import { SessionProcessor } from "./processor"
 import { PartID } from "./schema"
 import * as Log from "@opencode-ai/core/util/log"
 import { EffectBridge } from "@/effect/bridge"
-import { inputSummary, logToolArgs } from "@/tool/debug-args"
+import { inputSummary, logToolArgsLazy } from "@/tool/debug-args"
 
 const log = Log.create({ service: "session.tools" })
 
@@ -90,9 +90,9 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
             // shape coming straight from the SDK so we can distinguish
             // "AI SDK passed `{}`" from "args were correct here and
             // something later mutated them".
-            {
+            logToolArgsLazy("session-tools.execute", () => {
               const summary = inputSummary(args)
-              logToolArgs("session-tools.execute", {
+              return {
                 id: item.id,
                 toolCallId: options.toolCallId,
                 agent: input.agent.name,
@@ -101,8 +101,8 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
                 argsKind: summary.kind,
                 argsKeys: summary.keys,
                 argsPreview: summary.preview,
-              })
-            }
+              }
+            })
             yield* input.processor.startToolCall({
               id: options.toolCallId,
               name: item.id,
@@ -150,9 +150,9 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
           // Diagnostic: same as the registry-backed tools.execute above.
           // MCP tools have a separate execute wrapper; log here too so we
           // can tell whether `{}` arrives via the MCP path specifically.
-          {
+          logToolArgsLazy("session-tools.execute", () => {
             const summary = inputSummary(args)
-            logToolArgs("session-tools.execute", {
+            return {
               id: key,
               toolCallId: opts.toolCallId,
               agent: input.agent.name,
@@ -161,8 +161,8 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
               argsKind: summary.kind,
               argsKeys: summary.keys,
               argsPreview: summary.preview,
-            })
-          }
+            }
+          })
           yield* input.processor.startToolCall({
             id: opts.toolCallId,
             name: key,

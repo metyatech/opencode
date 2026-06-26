@@ -5,7 +5,7 @@ import type { Permission } from "../permission"
 import type { SessionID, MessageID } from "../session/schema"
 import * as Truncate from "./truncate"
 import { Agent } from "@/agent/agent"
-import { inputSummary, logToolArgs } from "./debug-args"
+import { inputSummary, logToolArgsLazy } from "./debug-args"
 
 interface Metadata {
   [key: string]: any
@@ -119,18 +119,18 @@ function wrap<Parameters extends Schema.Decoder<unknown>, Result extends Metadat
         // Diagnostic: capture the args shape reaching the tool wrapper. If
         // they are already `{}` here, the source is upstream of the schema
         // decoder; if they are non-empty here, the failure is in the schema
-        // itself or in the schema's expected input. Disabled unless
-        // OPENCODE_DEBUG_TOOL_ARGS is set.
-        {
+        // itself or in the schema's expected input. Lazy: env-off runs pay
+        // nothing.
+        logToolArgsLazy("tool-wrapper.before-decode", () => {
           const summary = inputSummary(args)
-          logToolArgs("tool-wrapper.before-decode", {
+          return {
             tool: id,
             callID: ctx.callID,
             argsKind: summary.kind,
             argsKeys: summary.keys,
             argsPreview: summary.preview,
-          })
-        }
+          }
+        })
         return Effect.gen(function* () {
           const decoded = yield* decode(args).pipe(
             Effect.mapError(
@@ -140,9 +140,9 @@ function wrap<Parameters extends Schema.Decoder<unknown>, Result extends Metadat
                 // payload. The original error is still surfaced verbatim
                 // through InvalidArgumentsError.message; we only add a log
                 // entry under the env gate.
-                {
+                logToolArgsLazy("tool-wrapper.decode-error", () => {
                   const summary = inputSummary(args)
-                  logToolArgs("tool-wrapper.decode-error", {
+                  return {
                     tool: id,
                     callID: ctx.callID,
                     argsKind: summary.kind,
@@ -151,8 +151,8 @@ function wrap<Parameters extends Schema.Decoder<unknown>, Result extends Metadat
                     errorDetail: toolInfo.formatValidationError
                       ? toolInfo.formatValidationError(error)
                       : String(error),
-                  })
-                }
+                  }
+                })
                 return new InvalidArgumentsError({
                   tool: id,
                   detail: toolInfo.formatValidationError ? toolInfo.formatValidationError(error) : String(error),
