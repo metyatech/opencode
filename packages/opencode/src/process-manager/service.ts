@@ -416,7 +416,7 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
       rec: Record,
       options?: { readonly stopLive?: boolean },
     ) {
-      if (options?.stopLive && isLive(rec) && rec.pid !== null) {
+      if (options?.stopLive && isLive(rec)) {
         // Mutate `rec` itself to a terminal snapshot BEFORE deleting it from
         // the map. Parked long polls in `poll(...)` fall back to `rec` when
         // the map lookup misses (the record was just removed), and they
@@ -425,13 +425,20 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
         // poller captured on entry would still report `running` and the
         // poller would either (a) sleep through the deadline, or (b) wake
         // and report a stale "running" snapshot. Mutating in place is
-        // intentional and scoped to this prune path.
+        // intentional and scoped to this prune path. The condition is
+        // intentionally pid-independent: pid is only consulted to decide
+        // whether `adapter.stop` is callable. Internal-only records (e.g.
+        // adapters or tests that promote with `pid: null`) are still live
+        // and must wake any parked poller — otherwise a long poll against
+        // a pidless live victim would sleep out the full wait window.
         const endedAt = yield* Clock.currentTimeMillis
         rec.stopping = true
         rec.state = "stopped"
         rec.endedAt = endedAt
         rec.terminationReason = "stopped"
-        yield* adapter.stop({ pid: rec.pid, graceMs: 200 }).pipe(Effect.ignore)
+        if (rec.pid !== null) {
+          yield* adapter.stop({ pid: rec.pid, graceMs: 200 }).pipe(Effect.ignore)
+        }
         void Deferred.succeed(rec.onExit, { exitCode: rec.exitCode, signal: rec.signal })
         // Wake any poller parked on this record's notifier. The pruner is
         // the only terminal path that does not already wake pollers (the

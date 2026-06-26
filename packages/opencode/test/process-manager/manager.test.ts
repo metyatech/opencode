@@ -524,4 +524,77 @@ describe("ProcessManager global cap pruning wakes long polls", () => {
       expect(result!.info.terminationReason).toBe("stopped")
     }),
   )
+
+  it.instance("removeRecord({ stopLive: true }) also wakes a pid:null live victim as terminal", () =>
+    Effect.gen(function* () {
+      const manager = yield* ProcessManager.Service
+      const sessionID = "ses_cap_prune_long_poll_pidless"
+      // The previous implementation gated the entire stopLive path on
+      // `pid !== null`, so a pidless live victim would have been silently
+      // skipped: no mutate, no wake, and the parked long poll would have
+      // slept through the 300s deadline. This test pins the fix.
+      const victimExit = yield* Deferred.make<number, never>()
+      const victimInfo = yield* manager.promote({
+        sessionID,
+        command: "victim-pidless",
+        cwd: "/",
+        pid: null,
+        stdinAvailable: false,
+        child: {
+          pid: null,
+          exitCode: Effect.flatMap(Deferred.await(victimExit), (n) => Effect.succeed(n)),
+          kill: () => {},
+        },
+      })
+      const parked = yield* manager
+        .poll({ sessionID, handle: victimInfo.handle, cursor: 0, waitMs: 300_000 })
+        .pipe(Effect.forkChild)
+      yield* Effect.sleep("20 millis")
+      // Fill the global cap (64) with live records in the same session.
+      // All fillers use pid:null too so the cap pruner sees no terminal
+      // victim available and falls back to the oldest live victim in
+      // this session — which is the one we just parked a poll on.
+      for (let i = 0; i < 63; i++) {
+        const exit = yield* Deferred.make<number, never>()
+        yield* manager.promote({
+          sessionID,
+          command: `filler-${i}`,
+          cwd: "/",
+          pid: null,
+          stdinAvailable: false,
+          child: {
+            pid: null,
+            exitCode: Effect.flatMap(Deferred.await(exit), (n) => Effect.succeed(n)),
+            kill: () => {},
+          },
+        })
+      }
+      // The 65th live promote trips the cap. No terminal victim exists
+      // and all entries share the same session, so the oldest unprotected
+      // live record — the victim — is selected.
+      const triggerExit = yield* Deferred.make<number, never>()
+      yield* manager.promote({
+        sessionID,
+        command: "trigger",
+        cwd: "/",
+        pid: null,
+        stdinAvailable: false,
+        child: {
+          pid: null,
+          exitCode: Effect.flatMap(Deferred.await(triggerExit), (n) => Effect.succeed(n)),
+          kill: () => {},
+        },
+      })
+      // Parked long poll must return within 5s. No adapter.stop is
+      // callable for a pidless record, but the wake path must still fire.
+      const result = yield* Fiber.join(parked).pipe(Effect.timeout("5 seconds"))
+      expect(result).toBeDefined()
+      expect(result!.waitStatus).toBe("terminal")
+      expect(result!.waitStatus).not.toBe("timeout")
+      expect(result!.info.state).toBe("stopped")
+      expect(result!.info.state).not.toBe("running")
+      expect(result!.info.pid).toBeNull()
+      expect(result!.info.terminationReason).toBe("stopped")
+    }),
+  )
 })
