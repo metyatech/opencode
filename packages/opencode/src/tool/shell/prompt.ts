@@ -49,7 +49,7 @@ export function parameterSchema(description: string, defaultBackgroundAfterMs: n
         ),
       ]),
     ).annotate({
-      description: `Initial yield time in milliseconds, equivalent to Codex \`yield_time_ms\`. If the command completes before this time, the tool returns a foreground result. If it is still running, the tool returns a managed process handle; elapsed time alone does not kill it after yielding. Use process poll to read output and process stop to terminate. Set 0 to disable yielding and keep legacy foreground execution. Defaults to ${defaultBackgroundAfterMs}ms. Valid values are 0 or ${MIN_BACKGROUND_AFTER_MS}..${MAX_BACKGROUND_AFTER_MS}.`,
+      description: `Initial yield time in milliseconds, equivalent to Codex \`yield_time_ms\`. If the command completes before this time, the tool returns a foreground result. If it is still running, the tool returns a managed process handle; elapsed time alone does not kill it after yielding. Use process poll to read output and process stop to terminate. Set 0 to disable yielding and keep legacy foreground execution. Defaults to ${defaultBackgroundAfterMs}ms. Valid values are 0 or ${MIN_BACKGROUND_AFTER_MS}..${MAX_BACKGROUND_AFTER_MS}. On Windows the effective minimum initial yield is 2000ms (smaller positive values are raised to 2000ms); polling after yielding is identical on all platforms.`,
     }),
   })
 }

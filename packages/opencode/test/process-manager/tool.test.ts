@@ -82,3 +82,25 @@ describe("process tool action guidance", () => {
     }),
   )
 })
+
+describe("process tool poll output", () => {
+  it.instance("poll output JSON includes wait_status", () =>
+    Effect.gen(function* () {
+      const manager = yield* ProcessManager.Service
+      const info = yield* manager.promote({
+        sessionID: ctx.sessionID as unknown as string,
+        command: "x",
+        cwd: "/",
+        pid: 9100,
+        stdinAvailable: false,
+        child: { pid: 9100, exitCode: Effect.succeed(0), kill: () => {} },
+        prePromoteOutput: { stdout: "hi\n", stderr: "" },
+      })
+      const def = yield* Tool.init(yield* ProcessTool)
+      const result = yield* def.execute({ action: "poll", handle: info.handle, cursor: 0 } as never, ctx)
+      const parsed = JSON.parse(result.output) as { wait_status?: string }
+      expect(parsed.wait_status).toBeDefined()
+      expect(["immediate", "output", "terminal", "timeout"]).toContain(parsed.wait_status!)
+    }),
+  )
+})

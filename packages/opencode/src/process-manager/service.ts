@@ -1,14 +1,15 @@
-import { Clock, Context, Deferred, Effect, Fiber, Layer, Scope, Stream, SynchronizedRef } from "effect"
+import { Clock, Context, Deferred, Effect, Fiber, Layer, Option, Scope, Stream, SynchronizedRef } from "effect"
 
 import { liveProcessAdapter, ProcessAdapter } from "./adapter"
 import { DEFAULT_MAX_BYTES, RingBuffer } from "./buffer"
 import { ProcessHandle } from "./id"
 import {
   POLL_DEFAULT_MAX_BYTES,
-  POLL_DEFAULT_WAIT_MS,
   POLL_MAX_BYTES_HARD_CAP,
   POLL_MAX_WAIT_MS,
+  POLL_MIN_WAIT_MS,
   type PollInput,
+  type PollWaitStatus,
   type PromoteInput,
 } from "./schema"
 import { ProcessError, ProcessInfo } from "./types"
@@ -80,6 +81,10 @@ type Record = {
   // first terminal transition; further transitions see it as already
   // closed and skip the release call.
   ownedScopeClosed: boolean
+  // Long-poll wake channel. Output appends and terminal transitions complete
+  // the current deferred so any fiber parked inside `poll` returns before its
+  // deadline. Shared by reference across immutable record copies.
+  readonly pollNotifier: PollNotifier
 }
 
 // Per-directory state. The `scope` is captured at InstanceState-make time
@@ -100,6 +105,28 @@ export type PollResponse = {
   }>
   readonly nextCursor: number
   readonly truncatedBeforeCursor: boolean
+  readonly waitStatus: PollWaitStatus
+}
+
+// Why a long-poll waiter was woken. Output appends and terminal transitions
+// both wake any fiber parked inside `poll`.
+type PollWakeReason = "output" | "terminal"
+
+// Shared, mutable notifier carried on each record. We hold a plain object with
+// a swappable `Deferred` instead of putting the `Deferred` directly on the
+// record so the immutable record copies (`{ ...cur }`) all observe the SAME
+// notifier reference — completing the deferred wakes every parked poller, and
+// the next wait round installs a fresh deferred.
+type PollNotifier = {
+  deferred: Deferred.Deferred<PollWakeReason, never>
+}
+
+// Normalize an empty-poll `wait_ms` to Codex bounds. `undefined`/`<= 0` means a
+// non-blocking immediate poll; any positive value is clamped into
+// [POLL_MIN_WAIT_MS, POLL_MAX_WAIT_MS]. Exported for direct unit testing.
+export function normalizePollWaitMs(value: number | undefined): number {
+  if (value === undefined || value <= 0) return 0
+  return Math.min(Math.max(value, POLL_MIN_WAIT_MS), POLL_MAX_WAIT_MS)
 }
 
 export interface FeedInput {
@@ -192,6 +219,7 @@ function drainStream(
   stream: unknown,
   buffer: RingBuffer,
   kind: "stdout" | "stderr",
+  notify: Effect.Effect<void, never, never>,
 ): Effect.Effect<void, never, Scope.Scope> {
   // One decoder for the entire stream lifetime. Reused on every chunk so
   // split UTF-8 sequences are reassembled before we append text to the
@@ -199,13 +227,12 @@ function drainStream(
   // breaks characters whose bytes are split across `stdout.write` calls
   // — `こんにちは` becomes `ããããã` or drops bytes.
   const decoder = new TextDecoder()
-  const appendChunk = (chunk: Uint8Array) => {
-    const text = decoder.decode(chunk, { stream: true })
-    if (text.length > 0) buffer.append(kind, text, Date.now())
-  }
-  const flushTail = () => {
-    const tail = decoder.decode()
-    if (tail.length > 0) buffer.append(kind, tail, Date.now())
+  // Append decoded text and return whether anything was appended, so the
+  // caller can wake parked pollers ONLY on a real output event.
+  const append = (text: string) => {
+    if (text.length === 0) return false
+    buffer.append(kind, text, Date.now())
+    return true
   }
 
   // Path 1: Web ReadableStream. Iterate chunks via reader.read().
@@ -223,7 +250,7 @@ function drainStream(
         while (true) {
           const { value, done } = yield* Effect.promise(() => reader.read())
           if (done) break
-          if (value) appendChunk(value)
+          if (value && append(decoder.decode(value, { stream: true }))) yield* notify
         }
       } catch {
         // Best-effort: errors during read mean the underlying handle is
@@ -233,22 +260,29 @@ function drainStream(
       // Always flush at end-of-stream / on interruption so any partial
       // multi-byte sequences surface as text (or the U+FFFD replacement)
       // rather than being silently dropped.
-      flushTail()
+      if (append(decoder.decode())) yield* notify
     }).pipe(Effect.ignore)
   }
 
   // Path 2: Effect Stream. Use the typed runner for Stream<Uint8Array>.
   // The runner's end-of-stream is signalled by forEach returning; we
-  // wrap it in `Effect.ensuring` so `flushTail()` runs on the happy
+  // wrap it in `Effect.ensuring` so the tail flush runs on the happy
   // path, on error, AND on interruption. The decoder instance is the
   // same one the chunk callback used, so any buffered tail bytes that
   // did not yet form a complete code point are emitted as text.
   if (Stream.isStream(stream)) {
     return Stream.runForEach(
       stream as Stream.Stream<Uint8Array, never, never>,
-      (chunk) => Effect.sync(() => appendChunk(chunk)),
+      (chunk) =>
+        Effect.gen(function* () {
+          if (append(decoder.decode(chunk, { stream: true }))) yield* notify
+        }),
     ).pipe(
-      Effect.ensuring(Effect.sync(() => flushTail())),
+      Effect.ensuring(
+        Effect.gen(function* () {
+          if (append(decoder.decode())) yield* notify
+        }),
+      ),
       Effect.ignore,
     )
   }
@@ -363,6 +397,20 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
     )
 
     const isLive = (rec: Record) => rec.state === "starting" || rec.state === "running"
+    const isTerminal = (rec: Record) => !isLive(rec)
+
+    // Wake every fiber parked on this record's notifier and install a fresh
+    // deferred for the next wait round. Completing the captured deferred is
+    // idempotent and never fails (the channel error type is `never`); a
+    // double-complete from a racing wake is ignored.
+    const wakeNotifier = Effect.fn("ProcessManager.wakeNotifier")(function* (
+      notifier: PollNotifier,
+      reason: PollWakeReason,
+    ) {
+      const current = notifier.deferred
+      notifier.deferred = yield* Deferred.make<PollWakeReason, never>()
+      yield* Deferred.succeed(current, reason).pipe(Effect.ignore)
+    })
 
     const removeRecord = Effect.fn("ProcessManager.removeRecord")(function* (
       rec: Record,
@@ -482,6 +530,7 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
         // own scope.
         ownedRelease: (input.release ?? null) as OwnedScopeRelease | null,
         ownedScopeClosed: false,
+        pollNotifier: { deferred: yield* Deferred.make<PollWakeReason, never>() },
       }
 
       const { scope } = yield* InstanceState.get(state)
@@ -510,6 +559,7 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
           })
           if (next) {
             yield* closeOwnedScope(next)
+            yield* wakeNotifier(next.pollNotifier, "terminal")
             void Deferred.succeed(onExit, { exitCode, signal: null })
           }
         }).pipe(
@@ -550,6 +600,7 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
                 }
                 if (next) {
                   yield* closeOwnedScope(next)
+                  yield* wakeNotifier(next.pollNotifier, "terminal")
                   void Deferred.succeed(next.onExit, { exitCode: null, signal: "TIMEOUT" })
                 }
               }).pipe(
@@ -568,14 +619,24 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
       const captureFibers: Array<Fiber.Fiber<void, unknown>> = []
       if (input.stdout) {
         const f = yield* Effect.forkIn(
-          drainStream(input.stdout, record.buffer, "stdout").pipe(Effect.asVoid),
+          drainStream(
+            input.stdout,
+            record.buffer,
+            "stdout",
+            wakeNotifier(record.pollNotifier, "output"),
+          ).pipe(Effect.asVoid),
           scope,
         )
         captureFibers.push(f)
       }
       if (input.stderr) {
         const f = yield* Effect.forkIn(
-          drainStream(input.stderr, record.buffer, "stderr").pipe(Effect.asVoid),
+          drainStream(
+            input.stderr,
+            record.buffer,
+            "stderr",
+            wakeNotifier(record.pollNotifier, "output"),
+          ).pipe(Effect.asVoid),
           scope,
         )
         captureFibers.push(f)
@@ -643,40 +704,19 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
       yield* mutate(input.handle, (cur) => ({ ...cur, lastUsedAt: now }))
 
       const maxBytes = Math.min(input.maxBytes ?? POLL_DEFAULT_MAX_BYTES, POLL_MAX_BYTES_HARD_CAP)
-      const waitMs = Math.min(input.waitMs ?? POLL_DEFAULT_WAIT_MS, POLL_MAX_WAIT_MS)
-
-      if (
-        waitMs > 0 &&
-        rec.state !== "exited" &&
-        rec.state !== "failed" &&
-        rec.state !== "stopped"
-      ) {
-        yield* Effect.sleep(`${waitMs} millis`)
-      }
-
+      const waitMs = normalizePollWaitMs(input.waitMs)
       const cursor = input.cursor ?? 0
-      const latest = (yield* lookup(input.handle, input.sessionID)) ?? rec
-      const { events, nextCursor, truncatedBeforeCursor } = latest.buffer.since(cursor)
+      // The notifier reference is stable across immutable record copies, so we
+      // capture it once. Capturing the deferred BEFORE each buffer read closes
+      // the lost-wakeup window: an append/terminal that races a parked poller
+      // either lands in the buffer we re-read or completes the deferred we await.
+      const notifier = rec.pollNotifier
 
-      // Apply per-call maxBytes on the response (cumulative cap on the wire,
-      // separate from the buffer's internal cap). Walk from the newest event
-      // backward, accumulating bytes; drop everything older than the
-      // overflow point. Always keep at least the last event.
-      let start = 0
-      if (events.length > 0) {
-        let total = 0
-        for (let i = events.length - 1; i >= 0; i--) {
-          const cost = byteLength(events[i]!.text)
-          if (total + cost > maxBytes) {
-            start = i + 1
-            break
-          }
-          total += cost
-          if (i === 0) start = 0
-        }
-      }
-      const trimmed = events.slice(start)
-
+      // Build the LLM-facing response from the freshest record + buffer state.
+      // Applies the per-call maxBytes cap (cumulative cap on the wire, separate
+      // from the buffer's internal cap): walk newest→oldest, dropping events
+      // older than the overflow point while always keeping the last event.
+      //
       // Terminal records are NOT removed here. The exit watcher and the
       // stdout/stderr capture fibers complete independently, so the child's
       // `exitCode` resolving does not guarantee the capture fibers have
@@ -684,14 +724,72 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
       // that observes a terminal state could interrupt an in-flight capture
       // fiber and drop the command's final output. Instead, terminal records
       // stay readable by handle (and hidden from `list`, which is live-only)
-      // until the 30-minute TTL purge removes them. This is the documented
-      // difference from Codex, which prunes a yielded process from its store
-      // as soon as the final output is read.
-      return {
-        info: snapshot(latest),
-        events: trimmed,
-        nextCursor: trimmed.length === 0 ? nextCursor : trimmed[trimmed.length - 1]!.seq,
-        truncatedBeforeCursor: truncatedBeforeCursor || start > 0,
+      // until the 30-minute TTL purge removes them.
+      const build = (latest: Record, waitStatus: PollWaitStatus): PollResponse => {
+        const { events, nextCursor, truncatedBeforeCursor } = latest.buffer.since(cursor)
+        let start = 0
+        if (events.length > 0) {
+          let total = 0
+          for (let i = events.length - 1; i >= 0; i--) {
+            const cost = byteLength(events[i]!.text)
+            if (total + cost > maxBytes) {
+              start = i + 1
+              break
+            }
+            total += cost
+            if (i === 0) start = 0
+          }
+        }
+        const trimmed = events.slice(start)
+        return {
+          info: snapshot(latest),
+          events: trimmed,
+          nextCursor: trimmed.length === 0 ? nextCursor : trimmed[trimmed.length - 1]!.seq,
+          truncatedBeforeCursor: truncatedBeforeCursor || start > 0,
+          waitStatus,
+        }
+      }
+
+      // Resolve the freshest record and classify it against the cursor. Output
+      // is preferred over terminal when both are observable in the same read.
+      const observe = Effect.fnUntraced(function* () {
+        const latest = (yield* lookup(input.handle, input.sessionID)) ?? rec
+        const hasOutput = latest.buffer.since(cursor).events.length > 0
+        return { latest, hasOutput, terminal: isTerminal(latest) } as const
+      })
+
+      // Immediate poll: never block, just report the current view. `wait_ms`
+      // of 0 (or omitted) returns "immediate" regardless of output/terminal.
+      if (waitMs === 0) {
+        const { latest } = yield* observe()
+        return build(latest, "immediate")
+      }
+
+      // Long poll: return as soon as new output arrives, the process reaches a
+      // terminal state, or the wait window elapses. We park on the notifier's
+      // deferred rather than sleeping, so output/terminal wakes return early.
+      const deadline = now + waitMs
+      while (true) {
+        // Capture the wake channel before re-reading so a concurrent
+        // append/terminal cannot slip between the read and the await.
+        const waiter = notifier.deferred
+        const first = yield* observe()
+        if (first.hasOutput) return build(first.latest, "output")
+        if (first.terminal) return build(first.latest, "terminal")
+
+        const remaining = deadline - (yield* Clock.currentTimeMillis)
+        if (remaining <= 0) return build(first.latest, "timeout")
+
+        const woke = yield* Deferred.await(waiter).pipe(Effect.timeoutOption(`${remaining} millis`))
+        if (Option.isNone(woke)) {
+          // Deadline elapsed while parked. Re-read once more so output/terminal
+          // that landed exactly at the boundary still wins over "timeout".
+          const final = yield* observe()
+          if (final.hasOutput) return build(final.latest, "output")
+          if (final.terminal) return build(final.latest, "terminal")
+          return build(final.latest, "timeout")
+        }
+        // Woke on output/terminal — loop to re-read and classify.
       }
     })
 
@@ -699,6 +797,7 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
       const rec = yield* lookup(input.handle, input.sessionID)
       if (!rec) return false
       rec.buffer.append(input.kind, input.text, Date.now())
+      yield* wakeNotifier(rec.pollNotifier, "output")
       return true
     })
 
@@ -738,6 +837,7 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
         }))
         if (next) {
           yield* closeOwnedScope(next)
+          yield* wakeNotifier(next.pollNotifier, "terminal")
           void Deferred.succeed(updated.onExit, { exitCode: null, signal: null })
         }
         return snapshot(next ?? { ...updated, state: "stopped", endedAt, exitCode: null, signal: null, terminationReason: "stopped" })
@@ -756,6 +856,7 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
       }))
       if (final) {
         yield* closeOwnedScope(final)
+        yield* wakeNotifier(final.pollNotifier, "terminal")
         void Deferred.succeed(updated.onExit, { exitCode: final.exitCode, signal: final.signal })
       }
       return snapshot(final ?? { ...updated, state: "stopped", endedAt, exitCode: updated.exitCode, signal: updated.signal, terminationReason: "stopped", stopping: true })
@@ -796,6 +897,7 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
         }))
         if (next) {
           yield* closeOwnedScope(next)
+          yield* wakeNotifier(next.pollNotifier, "terminal")
           void Deferred.succeed(next.onExit, { exitCode: next.exitCode, signal: next.signal })
         }
       }
@@ -824,6 +926,7 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
         }))
         if (next) {
           yield* closeOwnedScope(next)
+          yield* wakeNotifier(next.pollNotifier, "terminal")
           void Deferred.succeed(next.onExit, { exitCode: next.exitCode, signal: next.signal })
         }
       }

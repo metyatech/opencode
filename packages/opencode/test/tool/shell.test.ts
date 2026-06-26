@@ -1160,10 +1160,12 @@ describe("tool.shell background promotion guidance", () => {
             expect(metadata.listHint?.startsWith("Use the process tool with ")).toBe(true)
             expect(result.output).toContain("Command is still running in the background.")
             expect(result.output).toContain(
-              `Use the process tool with {"action":"poll","handle":"${handle}","cursor":0} to read output.`,
+              `{"action":"poll","handle":"${handle}","cursor":0,"wait_ms":300000}`,
             )
+            expect(result.output).toContain("wait_ms:300000 waits until new output arrives or the command exits")
+            expect(result.output).toContain("pass the previous result's next_cursor as cursor")
             expect(result.output).toContain(
-              `Use the process tool with {"action":"stop","handle":"${handle}"} to terminate it.`,
+              `Use the process tool with {"action":"stop","handle":"${handle}"} only if you want to terminate it.`,
             )
             expect(result.output).toContain(`If unsure, call the process tool with {"action":"list"} first.`)
             expect(result.output).not.toContain("Use process poll to read output, process stop to terminate.")

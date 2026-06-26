@@ -75,6 +75,7 @@ describe("process-manager schema", () => {
       events: [{ kind: "stdout", seq: 1, text: "hi", at: 10 }],
       next_cursor: 1,
       truncated_before_cursor: false,
+      wait_status: "output",
     })
     const encoded = Schema.encodeSync(PollResult)(result)
     // Schema.Class encodeSync returns a plain object form; the test asserts

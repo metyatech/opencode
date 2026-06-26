@@ -39,6 +39,15 @@ export const Action = Schema.Union([ListAction, PollAction, StopAction])
 
 export type Action = Schema.Schema.Type<typeof Action>
 
+// Why a poll returned. Codex-style long poll semantics:
+//   - "immediate": caller passed wait_ms 0 (or omitted it); returned at once.
+//   - "output": new output was available (or arrived during the wait).
+//   - "terminal": the process is in a terminal state (exited/failed/stopped).
+//   - "timeout": the process is still live and the wait window elapsed with no
+//     new output. This is NOT a failure — it means "still running".
+export const PollWaitStatus = Schema.Literals(["immediate", "output", "terminal", "timeout"])
+export type PollWaitStatus = Schema.Schema.Type<typeof PollWaitStatus>
+
 // Result payloads. The tool JSON-serializes these and returns them in
 // `output`. `Metadata` carries `{ action, state, handle? }` for tool-level
 // telemetry — keep it minimal.
@@ -55,6 +64,7 @@ export class PollResult extends Schema.Class<PollResult>("ProcessPollResult")({
   ),
   next_cursor: Schema.Int,
   truncated_before_cursor: Schema.Boolean,
+  wait_status: PollWaitStatus,
 }) {}
 
 export class ListResult extends Schema.Class<ListResult>("ProcessListResult")({
@@ -68,8 +78,12 @@ export class StopResult extends Schema.Class<StopResult>("ProcessStopResult")({
 // Bound helpers — what the manager actually clamps to internally.
 export const POLL_MAX_BYTES_HARD_CAP = 64 * 1024
 export const POLL_DEFAULT_MAX_BYTES = 64 * 1024
+// Codex-style empty-poll bounds. An explicit positive `wait_ms` is clamped to
+// [POLL_MIN_WAIT_MS, POLL_MAX_WAIT_MS] by the manager; `0` (or omitted) means a
+// non-blocking immediate poll.
 export const POLL_DEFAULT_WAIT_MS = 0
-export const POLL_MAX_WAIT_MS = 5000
+export const POLL_MIN_WAIT_MS = 5_000
+export const POLL_MAX_WAIT_MS = 300_000
 
 // Service-level input shapes. The tool layer translates the snake_case LLM
 // fields into these camelCase shapes before crossing into the manager.
@@ -145,5 +159,6 @@ export const PollResponse = Schema.Struct({
   ),
   nextCursor: Schema.Int,
   truncatedBeforeCursor: Schema.Boolean,
+  waitStatus: PollWaitStatus,
 })
 export type PollResponse = Schema.Schema.Type<typeof PollResponse>

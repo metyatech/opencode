@@ -1,5 +1,5 @@
-import { describe, expect } from "bun:test"
-import { Deferred, Effect, Layer } from "effect"
+import { describe, expect, test } from "bun:test"
+import { Deferred, Effect, Fiber, Layer } from "effect"
 import { ProcessAdapter, type ProcessAdapterService } from "../../src/process-manager/adapter"
 import { ProcessManager } from "../../src/process-manager/service"
 import { ProcessHandle } from "../../src/process-manager/id"
@@ -367,4 +367,91 @@ describe("ProcessManager service", () => {
       expect(r!.events.length).toBe(0)
     }),
   )
+
+  it.instance("immediate poll (no waitMs) reports waitStatus immediate", () =>
+    Effect.gen(function* () {
+      const manager = yield* ProcessManager.Service
+      const exit = yield* Deferred.make<number, never>()
+      const child = makeFakeChild({ pid: 8100, exit, stdin: true })
+      const info = yield* manager.promote({
+        sessionID: "ses_immediate",
+        command: "x",
+        cwd: "/",
+        pid: 8100,
+        stdinAvailable: true,
+        child,
+      })
+      const r = yield* manager.poll({ sessionID: "ses_immediate", handle: info.handle, cursor: 0 })
+      expect(r).toBeDefined()
+      expect(r!.waitStatus).toBe("immediate")
+    }),
+  )
+
+  it.instance("long poll returns when output is appended before the deadline", () =>
+    Effect.gen(function* () {
+      const manager = yield* ProcessManager.Service
+      const exit = yield* Deferred.make<number, never>()
+      const child = makeFakeChild({ pid: 8200, exit, stdin: true })
+      const info = yield* manager.promote({
+        sessionID: "ses_long_output",
+        command: "x",
+        cwd: "/",
+        pid: 8200,
+        stdinAvailable: true,
+        child,
+      })
+      // Park a long poll, then feed output from a sibling fiber. The append
+      // wakes the poller well before the 300s deadline.
+      const fiber = yield* manager
+        .poll({ sessionID: "ses_long_output", handle: info.handle, cursor: 0, waitMs: 300_000 })
+        .pipe(Effect.forkChild)
+      yield* Effect.sleep("20 millis")
+      yield* manager.feed({ sessionID: "ses_long_output", handle: info.handle, kind: "stdout", text: "done" })
+      const r = yield* Fiber.join(fiber)
+      expect(r).toBeDefined()
+      expect(r!.events.length).toBe(1)
+      expect(r!.events[0]!.text).toBe("done")
+      expect(r!.waitStatus).toBe("output")
+    }),
+  )
+
+  it.instance("long poll returns when the process exits before the deadline", () =>
+    Effect.gen(function* () {
+      const manager = yield* ProcessManager.Service
+      const exit = yield* Deferred.make<number, never>()
+      const child = makeFakeChild({ pid: 8300, exit, stdin: true })
+      const info = yield* manager.promote({
+        sessionID: "ses_long_terminal",
+        command: "x",
+        cwd: "/",
+        pid: 8300,
+        stdinAvailable: true,
+        child,
+      })
+      const fiber = yield* manager
+        .poll({ sessionID: "ses_long_terminal", handle: info.handle, cursor: 0, waitMs: 300_000 })
+        .pipe(Effect.forkChild)
+      yield* Effect.sleep("20 millis")
+      // Resolve the child's exit; the exit watcher flips the record to
+      // "exited" and wakes the parked poller.
+      yield* Deferred.succeed(exit, 0)
+      const r = yield* Fiber.join(fiber)
+      expect(r).toBeDefined()
+      expect(r!.events.length).toBe(0)
+      expect(r!.info.state).toBe("exited")
+      expect(r!.waitStatus).toBe("terminal")
+    }),
+  )
+})
+
+describe("normalizePollWaitMs", () => {
+  test("clamps to Codex empty-poll bounds", () => {
+    expect(ProcessManager.normalizePollWaitMs(undefined)).toBe(0)
+    expect(ProcessManager.normalizePollWaitMs(0)).toBe(0)
+    expect(ProcessManager.normalizePollWaitMs(1)).toBe(5000)
+    expect(ProcessManager.normalizePollWaitMs(4999)).toBe(5000)
+    expect(ProcessManager.normalizePollWaitMs(5000)).toBe(5000)
+    expect(ProcessManager.normalizePollWaitMs(300000)).toBe(300000)
+    expect(ProcessManager.normalizePollWaitMs(300001)).toBe(300000)
+  })
 })

@@ -1,11 +1,11 @@
-import { describe, expect } from "bun:test"
+import { describe, expect, test } from "bun:test"
 import { Cause, Deferred, Effect, Exit, Layer, Ref } from "effect"
 import path from "path"
 import { Config } from "@/config/config"
 import { ProcessManager } from "@/process-manager"
 import { ProcessHandle } from "@/process-manager/id"
 import { Shell } from "../../src/shell/shell"
-import { ShellTool } from "../../src/tool/shell"
+import { ShellTool, effectiveBackgroundAfterMs } from "../../src/tool/shell"
 import { provideInstance } from "../fixture/fixture"
 import { Agent } from "@/agent/agent"
 import { Truncate } from "@/tool/truncate"
@@ -595,6 +595,52 @@ describe("ShellTool background_after_ms promotion", () => {
         expect(def.description).toContain("10000")
       }),
   )
+
+  it.live(
+    "background result advertises a wait_ms:300000 poll hint and intact stop/list hints",
+    () =>
+      Effect.gen(function* () {
+        const result = yield* run(
+          {
+            command: fixture(sleepsThenExits(5000)),
+            description: "background poll hint",
+            timeout: 30_000,
+            background_after_ms: 250,
+          },
+          ctx,
+        )
+        const metadata = result.metadata as {
+          background?: boolean
+          processHandle?: string
+          pollHint?: string
+          stopHint?: string
+          listHint?: string
+        }
+        expect(metadata.background).toBe(true)
+        // The long-poll hint must carry wait_ms:300000 in both the output and
+        // the metadata pollHint so the model waits instead of busy-polling.
+        expect(result.output).toContain('"wait_ms":300000')
+        expect(metadata.pollHint).toContain('"wait_ms":300000')
+        expect(metadata.pollHint).toContain('"action":"poll"')
+        expect(metadata.stopHint).toContain('"action":"stop"')
+        expect(metadata.listHint).toContain('"action":"list"')
+        const manager = yield* ProcessManager.Service
+        yield* manager
+          .stop({ sessionID: ctx.sessionID, handle: metadata.processHandle! as ProcessHandle })
+          .pipe(Effect.ignore)
+      }).pipe(provideInstance(__dirname)),
+  )
+})
+
+describe("effectiveBackgroundAfterMs", () => {
+  test("applies the 2000ms Windows floor only to positive values", () => {
+    expect(effectiveBackgroundAfterMs("win32", 250)).toBe(2000)
+    expect(effectiveBackgroundAfterMs("win32", 5000)).toBe(5000)
+    expect(effectiveBackgroundAfterMs("win32", 0)).toBe(0)
+    expect(effectiveBackgroundAfterMs("linux", 250)).toBe(250)
+    expect(effectiveBackgroundAfterMs("linux", 0)).toBe(0)
+    expect(effectiveBackgroundAfterMs("darwin", 250)).toBe(250)
+  })
 })
 
 // Catch-all so unused imports don't fail the lint.

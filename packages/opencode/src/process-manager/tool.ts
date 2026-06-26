@@ -35,10 +35,15 @@ List processes in this session:
 Poll output from a background process:
 {"action":"poll","handle":"proc_...","cursor":0}
 
+Poll and wait for new output or exit (long poll, up to 300000ms):
+{"action":"poll","handle":"proc_...","cursor":0,"wait_ms":300000}
+
 Stop a background process:
 {"action":"stop","handle":"proc_..."}
 
 If you need a handle but do not know it, call {"action":"list"} first.
+
+To wait for a long-running command to finish, poll with wait_ms:300000. A poll with wait_ms waits until new output arrives, the process exits, or the wait window elapses (whichever comes first). An omitted wait_ms (or wait_ms:0) returns immediately. On each subsequent poll, pass the previous result's next_cursor as cursor so you only receive new output. The result includes wait_status: "immediate" (returned at once), "output" (new output), "terminal" (process ended), or "timeout". A "timeout" result with info.state "running" is not a failure: the command is still running and the wait window elapsed, so poll again.
 
 There is intentionally no \`write\` action: the bash tool spawns every command with stdin set to "ignore", so no stdin pipe is exposed to backgrounded processes today. Use \`poll\` to observe natural exit and \`stop\` to terminate a live backgrounded process.`
 
@@ -111,6 +116,7 @@ export const ProcessTool = Tool.define<typeof Action, Metadata, ProcessManager.S
                   events: result.events,
                   next_cursor: result.nextCursor,
                   truncated_before_cursor: result.truncatedBeforeCursor,
+                  wait_status: result.waitStatus,
                 }),
               }
             }

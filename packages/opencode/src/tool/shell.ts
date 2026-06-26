@@ -27,6 +27,16 @@ import { ProcessError, ProcessInfo } from "@/process-manager/types"
 
 export { Parameters } from "./shell/prompt"
 
+// Windows-only floor for the initial background yield. Codex applies a 2000ms
+// floor to the first exec yield on Windows because process/shell startup is
+// observed more slowly there than on Unix; yielding at e.g. 250ms risks
+// backgrounding before startup failure or first output can be captured. The
+// floor applies ONLY to this initial foreground yield — `process poll` and all
+// post-yield behavior are OS-common. `0` (yield disabled) is preserved as-is.
+export function effectiveBackgroundAfterMs(platform: NodeJS.Platform, backgroundAfterMs: number): number {
+  return platform === "win32" && backgroundAfterMs > 0 ? Math.max(backgroundAfterMs, 2_000) : backgroundAfterMs
+}
+
 const MAX_METADATA_LENGTH = 30_000
 const CWD = new Set(["cd", "chdir", "popd", "pushd", "push-location", "set-location"])
 const FILES = new Set([
@@ -875,15 +885,17 @@ export const ShellTool = Tool.define(
             yield* Ref.set(promoted, true)
 
             const info = promotedInfo
-            const processPollArgs = JSON.stringify({ action: "poll", handle: info.handle, cursor: 0 })
+            const processPollArgs = JSON.stringify({ action: "poll", handle: info.handle, cursor: 0, wait_ms: 300000 })
             const processStopArgs = JSON.stringify({ action: "stop", handle: info.handle })
             const processListArgs = JSON.stringify({ action: "list" })
             const outputText =
               `Command is still running in the background.\n` +
               `Handle: ${info.handle}\n` +
               `State: ${info.state}\n` +
-              `Use the process tool with ${processPollArgs} to read output.\n` +
-              `Use the process tool with ${processStopArgs} to terminate it.\n` +
+              `To wait for it to finish, use the process tool with ${processPollArgs} to read output; ` +
+              `wait_ms:300000 waits until new output arrives or the command exits.\n` +
+              `On each subsequent poll, pass the previous result's next_cursor as cursor.\n` +
+              `Use the process tool with ${processStopArgs} only if you want to terminate it.\n` +
               `If unsure, call the process tool with ${processListArgs} first.`
             const metadataOut = prePromoteSnapshot || "(no output yet)"
             yield* ctx
@@ -1031,8 +1043,10 @@ export const ShellTool = Tool.define(
                 throw new Error(`Invalid timeout value: ${params.timeout}. Timeout must be a positive number.`)
               }
               const timeout = params.timeout ?? defaultTimeoutMs
-              const backgroundAfterMs =
-                params.background_after_ms === undefined ? DEFAULT_BACKGROUND_AFTER_MS : params.background_after_ms
+              const backgroundAfterMs = effectiveBackgroundAfterMs(
+                process.platform,
+                params.background_after_ms === undefined ? DEFAULT_BACKGROUND_AFTER_MS : params.background_after_ms,
+              )
               const ps = Shell.ps(shell)
               yield* Effect.scoped(
                 Effect.gen(function* () {
