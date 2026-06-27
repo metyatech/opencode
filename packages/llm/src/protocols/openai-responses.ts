@@ -66,11 +66,13 @@ const OpenAIResponsesItemReference = Schema.Struct({
 // array of content items so tools can return images in addition to text.
 // https://platform.openai.com/docs/api-reference/responses/object
 const OpenAIResponsesFunctionCallOutputContent = Schema.Union([OpenAIResponsesInputText, OpenAIResponsesInputImage])
+type OpenAIResponsesFunctionCallOutputContent = Schema.Schema.Type<typeof OpenAIResponsesFunctionCallOutputContent>
 
 const OpenAIResponsesFunctionCallOutput = Schema.Union([
   Schema.String,
   Schema.Array(OpenAIResponsesFunctionCallOutputContent),
 ])
+type OpenAIResponsesFunctionCallOutput = Schema.Schema.Type<typeof OpenAIResponsesFunctionCallOutput>
 
 const OpenAIResponsesInputItem = Schema.Union([
   Schema.Struct({ role: Schema.tag("system"), content: Schema.String }),
@@ -303,7 +305,12 @@ const lowerUserContent = Effect.fn("OpenAIResponses.lowerUserContent")(function*
 })
 
 // Tool results may carry structured text/images. Keep media as provider-native
-// content instead of JSON-stringifying base64 into a prompt string.
+// content instead of JSON-stringifying base64 into a prompt string. Mirrors
+// the Anthropic Messages lowering (`anthropic-messages.ts`): keep
+// `Effect.fn` for the parser-state tracing, and explicitly annotate the
+// narrowed `part.result.value` so `Effect.forEach` picks the typed-array
+// overload. Without the annotation TS widens the value to `unknown` because
+// the other `ToolResultValue` variants carry `Schema.Unknown` payloads.
 const lowerToolResultContentItem = Effect.fn("OpenAIResponses.lowerToolResultContentItem")(function* (
   item: ToolResultContentPart,
 ) {
@@ -320,7 +327,13 @@ const lowerToolResultOutput = Effect.fn("OpenAIResponses.lowerToolResultOutput")
   // Text/json/error results are encoded as a plain string for backward
   // compatibility with existing cassettes and provider expectations.
   if (part.result.type !== "content") return ProviderShared.toolResultText(part)
-  return yield* Effect.forEach(part.result.value, lowerToolResultContentItem)
+  // Preserve the narrowed array element type when compiled through a
+  // consumer package. The negated narrowing above widens `value` to
+  // `unknown` because the other ToolResultValue variants carry
+  // `Schema.Unknown` payloads; the explicit annotation below re-asserts
+  // the narrowed shape for the forEach call.
+  const content: ReadonlyArray<ToolResultContentPart> = part.result.value
+  return yield* Effect.forEach(content, lowerToolResultContentItem)
 })
 
 const lowerMessages = Effect.fn("OpenAIResponses.lowerMessages")(function* (request: LLMRequest) {

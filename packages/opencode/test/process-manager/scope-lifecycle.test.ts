@@ -138,7 +138,11 @@ describe("ProcessManager owned-scope lifecycle", () => {
         const manager = yield* ProcessManager.Service
         const e1 = yield* Deferred.make<number, never>()
         const e2 = yield* Deferred.make<number, never>()
-        yield* manager.promote({
+        // Hold the `promote` returns so we can look up each record by handle
+        // after `killAllForSession` runs. `manager.list()` is live-only and
+        // returns terminal records as empty, so the post-killAll inspection
+        // has to go through `manager.info()` per handle.
+        const first = yield* manager.promote({
           sessionID: "ses_lifecycle_killall",
           command: "x",
           cwd: "/",
@@ -147,7 +151,7 @@ describe("ProcessManager owned-scope lifecycle", () => {
           child: makeFakeChild({ pid: 9003, exit: e1 }),
           release: makeOwnedScope().release as unknown,
         })
-        yield* manager.promote({
+        const second = yield* manager.promote({
           sessionID: "ses_lifecycle_killall",
           command: "y",
           cwd: "/",
@@ -156,15 +160,35 @@ describe("ProcessManager owned-scope lifecycle", () => {
           child: makeFakeChild({ pid: 9004, exit: e2 }),
           release: makeOwnedScope().release as unknown,
         })
+
         yield* manager.killAllForSession("ses_lifecycle_killall")
-        const after = yield* manager.list({ sessionID: "ses_lifecycle_killall" })
-        expect(after.length).toBe(2)
-        expect(
-          after.every((r) => r.state === "stopped" && r.terminationReason === "stopped"),
-        ).toBe(true)
-        // Every record's `endedAt` is set — terminate finalizeRecord
-        // path ran for every record.
-        expect(after.every((r) => r.endedAt !== undefined && r.endedAt !== null)).toBe(true)
+
+        const afterFirst = yield* manager.info({
+          sessionID: "ses_lifecycle_killall",
+          handle: first.handle as ProcessHandle,
+        })
+        const afterSecond = yield* manager.info({
+          sessionID: "ses_lifecycle_killall",
+          handle: second.handle as ProcessHandle,
+        })
+
+        // Every record is now terminal — terminate finalizeRecord ran
+        // for every record (state flipped to "stopped", `endedAt` set,
+        // and the owned-scope release fired exactly once).
+        expect(afterFirst).toBeDefined()
+        expect(afterSecond).toBeDefined()
+        expect(afterFirst!.state).toBe("stopped")
+        expect(afterSecond!.state).toBe("stopped")
+        expect(afterFirst!.terminationReason).toBe("stopped")
+        expect(afterSecond!.terminationReason).toBe("stopped")
+        expect(afterFirst!.endedAt).toBeDefined()
+        expect(afterSecond!.endedAt).toBeDefined()
+
+        // `list()` is live-only by design: terminal records are filtered
+        // out at the source. Asserting live count here would have been the
+        // wrong signal even before this fix.
+        const liveAfter = yield* manager.list({ sessionID: "ses_lifecycle_killall" })
+        expect(liveAfter.length).toBe(0)
       }),
   )
 
