@@ -52,20 +52,16 @@ describe("process tool action guidance", () => {
     }),
   )
 
-  it.instance("process({}) error contains concrete JSON examples", () =>
+  it.instance("process({}) is normalized to list", () =>
     Effect.gen(function* () {
       const def = yield* Tool.init(yield* ProcessTool)
-      const exit = yield* Effect.exit(def.execute({} as never, ctx))
-      expect(Exit.isFailure(exit)).toBe(true)
-      if (!Exit.isFailure(exit)) return
-      const err = Cause.squash(exit.cause) as Error
-      const message = err.message
-      expect(message).toContain("The process tool requires an action and must never be called with empty arguments.")
-      expect(message).toContain('{"action":"list"}')
-      expect(message).toContain('{"action":"poll","handle":"proc_...","cursor":0}')
-      expect(message).toContain('{"action":"stop","handle":"proc_..."}')
-      expect(message).toContain('If the handle is unknown, call {"action":"list"} first.')
-      expect(message).toContain("Original schema error:")
+      const result = yield* def.execute({} as never, ctx)
+
+      expect(result.title).toBe("list")
+      expect(result.metadata.action).toBe("list")
+
+      const parsed = JSON.parse(result.output) as { processes?: unknown[] }
+      expect(Array.isArray(parsed.processes)).toBe(true)
     }),
   )
 
@@ -209,9 +205,13 @@ describe("normalizeProcessToolArgs", () => {
     expect(normalizeProcessToolArgs(input)).toBe(input)
   })
 
-  test("returns empty object unchanged", () => {
-    const input = {}
+  test("does not infer action for non-empty object without action", () => {
+    const input = { handle: "proc_test" }
     expect(normalizeProcessToolArgs(input)).toBe(input)
+  })
+
+  test("normalizes empty object to list action", () => {
+    expect(normalizeProcessToolArgs({})).toEqual({ action: "list" })
   })
 
   test("returns null unchanged", () => {

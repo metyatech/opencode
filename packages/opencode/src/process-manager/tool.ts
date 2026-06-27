@@ -33,6 +33,18 @@ export function normalizeProcessToolArgs(args: unknown): unknown {
   if (args === null || typeof args !== "object" || Array.isArray(args)) return args
 
   const record = args as Record<string, unknown>
+  // An empty object `{}` is the process tool's safe-fallback shape: it has
+  // no action and no handle, but it is a recoverable, non-destructive
+  // request — `list` is read-only and the documented entry point when the
+  // caller does not know the handle. We normalize ONLY when the object is
+  // strictly empty; non-empty but malformed inputs (e.g. `{ handle: "proc_xxx" }`
+  // with no action) are intentionally left alone so the schema decoder
+  // produces the same validation error it always did. Silently widening
+  // `{}` to any other action (poll/stop) would mask real caller mistakes.
+  if (Object.keys(record).length === 0) {
+    return { action: "list" } as const
+  }
+
   // Normalization is gated on `action === "poll"` so list/stop and any
   // future action are unaffected. A typo'd action (e.g. `"pol"`) reaches
   // the schema decoder unchanged and is rejected there.
