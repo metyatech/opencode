@@ -5,6 +5,58 @@ import { ProcessManager } from "./service"
 import { ProcessError } from "./types"
 import * as Tool from "../tool/tool"
 
+// Process tool raw-input normalization. The LLM occasionally emits poll
+// numerics as decimal-integer strings (e.g. `"0"` for `cursor`) which the
+// strict Effect schema rejects. We coerce ONLY the three documented poll
+// numerics, ONLY for the `poll` action, ONLY when the value is an ASCII
+// decimal non-negative integer string within the JavaScript safe-integer
+// range. Anything else (`""`, `"abc"`, `"1.5"`, `"-1"`, `"0x10"`, `"01"`,
+// values past `Number.MAX_SAFE_INTEGER`, non-`poll` actions, non-object
+// inputs) is returned unchanged so the existing schema validation handles
+// it the same way as before. `list` / `stop` are explicitly not normalized
+// — those actions don't carry these fields in the documented shape, and
+// silently widening them would mask real caller mistakes.
+const PROCESS_POLL_NUMERIC_FIELDS = ["cursor", "wait_ms", "max_bytes"] as const
+
+function parseNonNegativeSafeIntegerString(value: string): number | undefined {
+  // ASCII decimal only: reject `""`, `" 1"`, `"1.5"`, `"0x10"`, `"-1"`,
+  // `"01"`, and any leading/trailing whitespace. The leading-zero rule
+  // (`01`) is strict on purpose — the LLM should send a number, not a
+  // zero-padded string.
+  if (!/^(0|[1-9]\d*)$/.test(value)) return undefined
+  const parsed = Number(value)
+  if (!Number.isSafeInteger(parsed)) return undefined
+  return parsed
+}
+
+export function normalizeProcessToolArgs(args: unknown): unknown {
+  if (args === null || typeof args !== "object" || Array.isArray(args)) return args
+
+  const record = args as Record<string, unknown>
+  // Normalization is gated on `action === "poll"` so list/stop and any
+  // future action are unaffected. A typo'd action (e.g. `"pol"`) reaches
+  // the schema decoder unchanged and is rejected there.
+  if (record.action !== "poll") return args
+
+  let changed = false
+  const normalized: Record<string, unknown> = { ...record }
+
+  for (const key of PROCESS_POLL_NUMERIC_FIELDS) {
+    const value = record[key]
+    if (typeof value !== "string") continue
+
+    const parsed = parseNonNegativeSafeIntegerString(value)
+    if (parsed === undefined) continue
+
+    normalized[key] = parsed
+    changed = true
+  }
+
+  // Reference-equal return when nothing changed — lets the wrapper's
+  // `decode(args)` skip the normalization branch entirely downstream.
+  return changed ? normalized : args
+}
+
 function errorToResult(action: Metadata["action"], err: unknown, handle?: string): Tool.ExecuteResult<Metadata> {
   const message =
     err instanceof Error
@@ -89,6 +141,7 @@ export const ProcessTool = Tool.define<typeof Action, Metadata, ProcessManager.S
     return {
       description: DESCRIPTION,
       parameters: Action,
+      normalizeInput: normalizeProcessToolArgs,
       formatValidationError: formatProcessValidationError,
       execute: (params, ctx: Tool.Context<Metadata>) =>
         Effect.gen(function* () {

@@ -59,6 +59,16 @@ export interface Def<
   description: string
   parameters: Parameters
   jsonSchema?: JSONSchema7
+  /**
+   * Optional raw-input normalizer run BEFORE schema decode. Used by tools
+   * (notably `process`) to coerce JSON shapes the LLM sometimes emits (for
+   * example, decimal-integer strings for `cursor`/`wait_ms`/`max_bytes`)
+   * into the typed shape the schema expects. Returns the value to feed to
+   * the schema decoder. Returning the same reference signals no change.
+   * Logging and validation error formatting always see the ORIGINAL `args`,
+   * never the normalized form.
+   */
+  normalizeInput?(args: unknown): unknown
   execute(args: Schema.Schema.Type<Parameters>, ctx: Context): Effect.Effect<ExecuteResult<M>>
   formatValidationError?(error: unknown, args?: unknown): string
 }
@@ -147,7 +157,14 @@ function wrap<Parameters extends Schema.Decoder<unknown>, Result extends Metadat
           }
         })
         return Effect.gen(function* () {
-          const decoded = yield* decode(args).pipe(
+          // Apply the tool-specific raw-input normalizer (if any) BEFORE the
+          // schema decoder. The original `args` is kept for logging and for
+          // `formatValidationError`, which must reflect what the caller
+          // actually sent. Tools like `process` use this to coerce
+          // decimal-integer-string numerics (`cursor:"0"`) into the number
+          // shape the schema requires.
+          const decodeArgs = toolInfo.normalizeInput ? toolInfo.normalizeInput(args) : args
+          const decoded = yield* decode(decodeArgs).pipe(
             Effect.mapError(
               (error) => {
                 // Diagnostic: schema rejection — useful to see exactly
