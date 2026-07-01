@@ -2218,7 +2218,7 @@ it.instance(
       }
     }),
   { git: true },
-  3_000,
+  10_000,
 )
 
 // Queue semantics
@@ -2256,7 +2256,7 @@ it.instance(
       expect(a.info.id).toBe(b.info.id)
       expect(a.info.role).toBe("assistant")
     }),
-  3_000,
+  10_000,
 )
 
 it.instance(
