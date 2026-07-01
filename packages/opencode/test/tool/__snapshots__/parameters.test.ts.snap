@@ -34,7 +34,7 @@ exports[`tool parameters JSON Schema (wire shape) bash 1`] = `
           "type": "integer",
         },
       ],
-      "description": "Initial yield time in milliseconds, equivalent to Codex \`yield_time_ms\`. If the command completes before this time, the tool returns a foreground result. If it is still running, the tool returns a managed process handle; elapsed time alone does not kill it after yielding. Use process poll to read output and process stop to terminate. Set 0 to disable yielding and keep legacy foreground execution. Defaults to 10000ms. Valid values are 0 or 250..30000.",
+      "description": "Initial yield time in milliseconds, equivalent to Codex \`yield_time_ms\`. If the command completes before this time, the tool returns a foreground result. If it is still running, the tool returns a managed process handle; elapsed time alone does not kill it after yielding. Use process poll to read output and process stop to terminate. Set 0 to disable yielding and keep legacy foreground execution. Defaults to 10000ms. Valid values are 0 or 250..30000. On Windows the effective minimum initial yield is 2000ms (smaller positive values are raised to 2000ms); polling after yielding is identical on all platforms.",
     },
     "command": {
       "description": "The command to execute",

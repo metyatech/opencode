@@ -113,6 +113,28 @@ describe("tool parameters", () => {
     test("rejects missing command", () => {
       expect(accepts(Shell, { description: "list" })).toBe(false)
     })
+    test("accepts background_after_ms bounds", () => {
+      expect(
+        parse(Shell, { command: "sleep 1", description: "Sleep briefly", background_after_ms: 0 })
+          .background_after_ms,
+      ).toBe(0)
+      expect(
+        parse(Shell, { command: "sleep 1", description: "Sleep briefly", background_after_ms: 250 })
+          .background_after_ms,
+      ).toBe(250)
+      expect(
+        parse(Shell, { command: "sleep 1", description: "Sleep briefly", background_after_ms: 30000 })
+          .background_after_ms,
+      ).toBe(30000)
+    })
+    test("rejects background_after_ms outside bounds", () => {
+      expect(
+        accepts(Shell, { command: "sleep 1", description: "Sleep briefly", background_after_ms: 249 }),
+      ).toBe(false)
+      expect(
+        accepts(Shell, { command: "sleep 1", description: "Sleep briefly", background_after_ms: 30001 }),
+      ).toBe(false)
+    })
   })
 
   describe("edit", () => {
