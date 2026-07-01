@@ -1,8 +1,5 @@
 {
-  "source": "github:metyatech/agent-rules",
-  "output": "AGENTS.md",
-  "extra": [
-    "agent-rules-local/repo-existing-instructions.md",
-    "agent-rules-local/high-quality-workflow.md"
-  ]
+  "sources": ["github:metyatech/agent-rules"],
+  "profile": "opencode",
+  "output": "AGENTS.md"
 }
