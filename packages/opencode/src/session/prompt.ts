@@ -902,7 +902,8 @@ export const layer = Layer.effect(
           .where(eq(SessionTable.id, input.sessionID))
           .get(),
       )
-      const managedModel = managedAgentModel(ag)
+      const forceInputModel = input.modelOverride === "force"
+      const managedModel = forceInputModel ? undefined : managedAgentModel(ag)
       const clientModel = managedModel ? undefined : input.model
       const clientVariant = managedModel ? undefined : input.variant
       const model = clientModel ?? managedModel ?? ag.model ?? (yield* currentModel(input.sessionID))
@@ -2155,6 +2156,21 @@ export const PromptInput = Schema.Struct({
   system: Schema.optional(Schema.String),
   transientSystem: Schema.optional(Schema.String),
   variant: Schema.optional(Schema.String),
+  /**
+   * API-side model resolution policy. `"force"` instructs
+   * `createUserMessage` to ignore the agent's managed-model pin and
+   * adopt `input.model` / `input.variant` as the resolved model for
+   * this user message. This is the prompt-side counterpart to
+   * `RetryInput.modelOverride` and lets background-agent fallback
+   * retries specify a non-managed model without losing the caller's
+   * authority over the resolved model.
+   *
+   * It does NOT alter the provider prompt prefix. Body fields such
+   * as `system`, `transientSystem`, `parts` remain caller-controlled
+   * and prefix-preserving retry paths can safely route through this
+   * flag without invalidating prompt caches.
+   */
+  modelOverride: Schema.optional(Schema.Literal("force")),
   parts: Schema.Array(
     Schema.Union([
       MessageV2.TextPartInput,

@@ -220,4 +220,49 @@ describe("managed agent model enforcement", () => {
       config: config({ model_selection: "user" }),
     },
   )
+
+  it.instance(
+    "managed agent prompt with modelOverride force adopts input model",
+    () =>
+      Effect.gen(function* () {
+        const prompt = yield* SessionPrompt.Service
+        const sessions = yield* Session.Service
+        const session = yield* sessions.create({
+          title: "Managed prompt force override",
+          model: { providerID, id: sessionModelID },
+        })
+        const result = yield* prompt.prompt({
+          sessionID: session.id,
+          agent: "managed",
+          model: { providerID, modelID: clientModelID },
+          variant: "client-variant",
+          modelOverride: "force",
+          noReply: true,
+          parts: [{ type: "text", text: "hello" }],
+        })
+        const info = userInfo(result)
+
+        expect(info.model.providerID).toBe(providerID)
+        expect(info.model.modelID).toBe(clientModelID)
+        expect(info.model.variant).toBe("client-variant")
+      }),
+    {
+      config: config({ model_selection: "managed", model: "test/agent-model", variant: "agent-variant" }),
+    },
+  )
+
+  it.instance(
+    "managed agent prompt without modelOverride keeps managed pin (regression)",
+    () =>
+      Effect.gen(function* () {
+        const result = yield* promptOnce()
+        const info = userInfo(result)
+
+        expect(info.model.providerID).toBe(providerID)
+        expect(info.model.modelID).toBe(agentModelID)
+      }),
+    {
+      config: config({ model_selection: "managed", model: "test/agent-model" }),
+    },
+  )
 })
