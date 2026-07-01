@@ -1337,6 +1337,116 @@ it.instance("retry runs after an errored assistant when retry updates the latest
   }),
 )
 
+it.instance("retry keeps managed agent model pin unless modelOverride force is set", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig((url) => ({
+      ...providerWithFallbackCfg(url),
+      provider: {
+        ...providerWithFallbackCfg(url).provider,
+        test: {
+          ...providerWithFallbackCfg(url).provider.test,
+          models: {
+            ...providerWithFallbackCfg(url).provider.test.models,
+            "agent-model": {
+              ...providerWithFallbackCfg(url).provider.test.models["test-model"],
+              id: "agent-model",
+              name: "Agent Model",
+              variants: { managed: {} },
+            },
+          },
+        },
+      },
+      agent: {
+        build: {
+          model_selection: "managed",
+          model: "test/agent-model",
+          variant: "managed",
+        },
+      },
+    }))
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({ title: "Managed retry keeps pin" })
+    const original = yield* user(session.id, "continue the current work")
+    yield* erroredAssistant(session.id, original.id)
+    yield* llm.textMatch((hit) => hit.body.model === "agent-model", "managed retry reply")
+
+    const result = yield* prompt.retry({
+      sessionID: session.id,
+      messageID: original.id,
+      agent: "build",
+      model: {
+        providerID: ref.providerID,
+        modelID: ModelID.make("fallback-model"),
+      },
+      variant: "high",
+    })
+
+    expect(result.info.role).toBe("assistant")
+    if (result.info.role === "assistant") {
+      expect(result.info.modelID).toBe(ModelID.make("agent-model"))
+      expect(result.info.variant).toBe("managed")
+    }
+    expect((yield* llm.inputs).at(-1)?.model).toBe("agent-model")
+  }),
+)
+
+it.instance("retry uses input model for managed agent when modelOverride force is set", () =>
+  Effect.gen(function* () {
+    const managedConfig = providerWithFallbackCfg
+    const { llm } = yield* useServerConfig((url) => ({
+      ...managedConfig(url),
+      provider: {
+        ...managedConfig(url).provider,
+        test: {
+          ...managedConfig(url).provider.test,
+          models: {
+            ...managedConfig(url).provider.test.models,
+            "agent-model": {
+              ...managedConfig(url).provider.test.models["test-model"],
+              id: "agent-model",
+              name: "Agent Model",
+              variants: { managed: {} },
+            },
+          },
+        },
+      },
+      agent: {
+        build: {
+          model_selection: "managed",
+          model: "test/agent-model",
+          variant: "managed",
+        },
+      },
+    }))
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({ title: "Managed retry force override" })
+    const original = yield* user(session.id, "continue the current work")
+    yield* erroredAssistant(session.id, original.id)
+    yield* llm.textMatch((hit) => hit.body.model === "fallback-model", "forced managed retry reply")
+
+    const result = yield* prompt.retry({
+      sessionID: session.id,
+      messageID: original.id,
+      agent: "build",
+      model: {
+        providerID: ref.providerID,
+        modelID: ModelID.make("fallback-model"),
+      },
+      variant: "high",
+      modelOverride: "force",
+    })
+
+    expect(result.info.role).toBe("assistant")
+    if (result.info.role === "assistant") {
+      expect(result.info.modelID).toBe(ModelID.make("fallback-model"))
+      expect(result.info.variant).toBe("high")
+    }
+    expect((yield* llm.inputs).at(-1)?.model).toBe("fallback-model")
+  }),
+)
+
 it.instance("retry uses continuation system state without persisting it on the user turn", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(providerWithFallbackCfg)

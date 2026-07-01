@@ -1465,7 +1465,10 @@ export const layer = Layer.effect(
         throw error
       }
 
-      const managedModel = managedAgentModel(ag)
+      const forceInputModel = input.modelOverride === "force"
+      const managedModel = forceInputModel ? undefined : managedAgentModel(ag)
+      const retryModel = managedModel ?? input.model
+      const retryVariant = forceInputModel ? input.variant : managedModel ? ag.variant : input.variant
 
       const terminalReply = yield* sessions
         .findMessage(
@@ -1483,9 +1486,9 @@ export const layer = Layer.effect(
         agent: ag.name,
         system: stripRuntimeFallbackContinuationSystem(retryMessage.info.system),
         model: {
-          providerID: managedModel?.providerID ?? input.model.providerID,
-          modelID: managedModel?.modelID ?? input.model.modelID,
-          variant: managedModel ? ag.variant : input.variant,
+          providerID: retryModel.providerID,
+          modelID: retryModel.modelID,
+          variant: retryVariant,
         },
       }
 
@@ -2171,6 +2174,7 @@ export const RetryInput = Schema.Struct({
   variant: Schema.optional(Schema.String),
   system: Schema.optional(Schema.String),
   transientSystem: Schema.optional(Schema.String),
+  modelOverride: Schema.optional(Schema.Literal("force")),
 })
 export type RetryInput = Schema.Schema.Type<typeof RetryInput>
 
