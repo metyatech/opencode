@@ -543,16 +543,19 @@ describe("provider-request-watchdog state machine", () => {
     expect(decoded.data.modelID).toBe(MODEL_ID)
   })
 
-  test("timeout is not retried by SessionRetry.policy", () => {
+  test("first_event timeout is retried by SessionRetry.policy; stream_idle is not", () => {
+    const firstMessage = "Provider test-provider/test-model did not emit any event within 1000ms"
     const first = new MessageV2.ProviderRequestTimeoutError({
-      message: "Provider test-provider/test-model did not emit any event within 1000ms",
+      message: firstMessage,
       phase: "first_event",
       timeoutMs: 1000,
       providerID: PROVIDER_ID,
       modelID: MODEL_ID,
     }).toObject()
 
-    expect(SessionRetry.retryable(first, PROVIDER_ID)).toBeUndefined()
+    expect(SessionRetry.retryable(first, PROVIDER_ID)).toStrictEqual({
+      message: firstMessage,
+    })
 
     const idle = new MessageV2.ProviderRequestTimeoutError({
       message: "Provider test-provider/test-model stream was idle for more than 1000ms",

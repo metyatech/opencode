@@ -85,10 +85,17 @@ export function isQuotaExhausted(message: unknown): boolean {
 }
 
 export function retryable(error: Err, provider: string) {
-  // Provider-request timeouts are user-facing diagnostics; retrying the same
-  // model against the same window would just hit the same stall, so suppress.
-  if (MessageV2.ProviderRequestTimeoutError.isInstance(error)) return undefined
-  // context overflow errors should not be retried
+  // A first-event watchdog timeout means no normalized LLMEvent reached the
+  // processor yet. Replaying the already-prepared invocation is safe and keeps
+  // the same provider/model/request body. A stream-idle timeout may have
+  // already persisted assistant text/reasoning/tool parts, so do not retry it
+  // here.
+  if (MessageV2.ProviderRequestTimeoutError.isInstance(error)) {
+    if (error.data.phase === "first_event") {
+      return { message: error.data.message }
+    }
+    return undefined
+  }
   if (MessageV2.ContextOverflowError.isInstance(error)) return undefined
   if (MessageV2.APIError.isInstance(error)) {
     const status = error.data.statusCode
