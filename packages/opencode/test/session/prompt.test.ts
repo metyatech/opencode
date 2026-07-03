@@ -569,6 +569,7 @@ const addAssistantToolStep = Effect.fn("test.addAssistantToolStep")(function* (
     tool: string
     toolInput?: Record<string, unknown>
     snapshot?: string
+    output?: string
   },
 ) {
   const session = yield* Session.Service
@@ -599,7 +600,7 @@ const addAssistantToolStep = Effect.fn("test.addAssistantToolStep")(function* (
     state: {
       status: "completed",
       input: input.toolInput ?? {},
-      output: "",
+      output: input.output ?? "",
       title: input.tool,
       metadata: {},
       time: { start: now, end: now },
@@ -1034,6 +1035,33 @@ noLLMServer.instance(
             part.type === "text" && part.text.includes("repeated the same tool observations under the same request"),
         ),
       ).toBe(true)
+    }),
+  { config: cfg },
+)
+
+it.instance(
+  "loop ignores repeated process.poll tool observations and does not trigger no-progress guard",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({ title: "No progress guard process poll" })
+      const msg = yield* user(session.id, "continue")
+
+      for (let index = 0; index < 3; index++) {
+        yield* addAssistantToolStep(session.id, msg.id, {
+          tool: "process",
+          toolInput: { action: "poll", wait_ms: 100 },
+          output: JSON.stringify({ events: [], running: true, wait_status: "timeout" }),
+        })
+      }
+      yield* llm.text("continued after poll")
+
+      const result = yield* prompt.loop({ sessionID: session.id })
+      expect(yield* llm.calls).toBe(1)
+      expect(result.info.role).toBe("assistant")
+      expect(result.parts.some((part) => part.type === "text" && part.text === "continued after poll")).toBe(true)
     }),
   { config: cfg },
 )

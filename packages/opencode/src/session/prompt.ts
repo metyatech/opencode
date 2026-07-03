@@ -134,50 +134,18 @@ function sortJsonValue(value: unknown): unknown {
   )
 }
 
-// A live, empty `process poll` long-poll is a legitimate wait, not a stalled
-// loop: while a backgrounded command runs without new output, repeated polls
-// return the same `events:[] / running / same cursor` shape. The no-progress
-// guard must NOT treat that as a repeated tool observation. We exclude an
-// observation ONLY when ALL of these hold, so immediate polls, terminal polls,
-// error results, polls with output, and non-process tools stay fully guarded:
-//   - tool is "process", status completed
-//   - input.action === "poll" with a numeric input.wait_ms > 0
-//   - output parses as JSON with no `error`
-//   - info.state is "starting" or "running" (still live)
-//   - events is an empty array
-//   - wait_status is "timeout" (or absent, for forward/back compatibility)
-function isLiveEmptyProcessPollWaitObservation(part: MessageV2.ToolPart): boolean {
+// A `process poll` observation is a legitimate wait, not a stalled loop: while a
+// backgrounded command runs, repeated polls return the same shape. The no-progress
+// guard must NOT treat that as a repeated tool observation.
+function isProcessPollObservation(part: MessageV2.ToolPart): boolean {
   if (part.tool !== "process") return false
-  if (part.state.status !== "completed") return false
   const input = part.state.input
   if (!input || typeof input !== "object") return false
-  const request = input as Record<string, unknown>
-  if (request.action !== "poll") return false
-  if (typeof request.wait_ms !== "number" || request.wait_ms <= 0) return false
-  const output = part.state.output
-  if (typeof output !== "string") return false
-  const parsed = ((): Record<string, unknown> | undefined => {
-    try {
-      const value: unknown = JSON.parse(output)
-      return value && typeof value === "object" ? (value as Record<string, unknown>) : undefined
-    } catch {
-      return undefined
-    }
-  })()
-  if (!parsed) return false
-  if (parsed.error !== undefined) return false
-  const info = parsed.info
-  if (!info || typeof info !== "object") return false
-  const state = (info as Record<string, unknown>).state
-  if (state !== "starting" && state !== "running") return false
-  if (!Array.isArray(parsed.events) || parsed.events.length !== 0) return false
-  const waitStatus = parsed.wait_status
-  if (waitStatus !== undefined && waitStatus !== "timeout") return false
-  return true
+  return (input as Record<string, unknown>).action === "poll"
 }
 
 function toolObservation(part: MessageV2.ToolPart): Record<string, unknown> | undefined {
-  if (isLiveEmptyProcessPollWaitObservation(part)) return undefined
+  if (isProcessPollObservation(part)) return undefined
   if (part.state.status === "completed") {
     return {
       tool: part.tool,
@@ -257,7 +225,7 @@ function detectRepeatedToolObservationLoop(
 // booting the full session runtime.
 export const __test__ = {
   detectRepeatedToolObservationLoop,
-  isLiveEmptyProcessPollWaitObservation,
+  isProcessPollObservation,
 }
 
 function assistantTerminalTime(info: MessageV2.Assistant) {
