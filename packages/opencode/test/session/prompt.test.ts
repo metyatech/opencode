@@ -1039,31 +1039,46 @@ noLLMServer.instance(
   { config: cfg },
 )
 
-it.instance(
-  "loop ignores repeated process.poll tool observations and does not trigger no-progress guard",
-  () =>
-    Effect.gen(function* () {
-      const { llm } = yield* useServerConfig(providerCfg)
-      const prompt = yield* SessionPrompt.Service
-      const sessions = yield* Session.Service
-      const session = yield* sessions.create({ title: "No progress guard process poll" })
-      const msg = yield* user(session.id, "continue")
+it.instance("loop keeps going for repeated process poll observations", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({ title: "Process poll wait guard" })
+    const msg = yield* user(session.id, "continue")
+    const pollInput = {
+      action: "poll",
+      handle: "proc_test",
+      cursor: 0,
+      wait_ms: 600_000,
+    }
+    const pollOutput = JSON.stringify({
+      info: { state: "running" },
+      events: [],
+      cursor: 0,
+      wait_status: "timeout",
+    })
 
-      for (let index = 0; index < 3; index++) {
-        yield* addAssistantToolStep(session.id, msg.id, {
-          tool: "process",
-          toolInput: { action: "poll", wait_ms: 100 },
-          output: JSON.stringify({ events: [], running: true, wait_status: "timeout" }),
-        })
-      }
-      yield* llm.text("continued after poll")
+    for (let index = 0; index < 3; index++) {
+      yield* addAssistantToolStep(session.id, msg.id, {
+        tool: "process",
+        toolInput: pollInput,
+        output: pollOutput,
+      })
+    }
 
-      const result = yield* prompt.loop({ sessionID: session.id })
-      expect(yield* llm.calls).toBe(1)
-      expect(result.info.role).toBe("assistant")
-      expect(result.parts.some((part) => part.type === "text" && part.text === "continued after poll")).toBe(true)
-    }),
-  { config: cfg },
+    yield* llm.text("continued after process poll")
+
+    const result = yield* prompt.loop({ sessionID: session.id })
+    expect(yield* llm.calls).toBe(1)
+    expect(result.info.role).toBe("assistant")
+    expect(result.parts.some((part) => part.type === "text" && part.text === "continued after process poll")).toBe(true)
+    expect(
+      result.parts.some(
+        (part) => part.type === "text" && part.text.includes("repeated the same tool observations under the same request"),
+      ),
+    ).toBe(false)
+  }),
 )
 
 it.instance("loop keeps going when recent tool observations are not identical", () =>
