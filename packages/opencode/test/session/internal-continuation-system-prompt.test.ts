@@ -1,24 +1,47 @@
 import { describe, expect, test } from "bun:test"
 import { __test__ } from "../../src/session/prompt"
 import { MessageV2 } from "../../src/session/message-v2"
-import { MessageID } from "../../src/session/schema"
+import { MessageID, SessionID } from "../../src/session/schema"
+import { ModelID, ProviderID } from "../../src/provider/schema"
 
 const { internalContinuationInstructionText } = __test__
 
 const USER_ID = "msg_user" as unknown as MessageID
 const INTERNAL_ID = "msg_internal" as unknown as MessageID
 const ASSISTANT_ID = "msg_assistant" as unknown as MessageID
+const SESSION_ID = "session" as unknown as SessionID
+const PROVIDER_ID = "test" as unknown as ProviderID
+const MODEL_ID = "test" as unknown as ModelID
 
 function userMessage(id: MessageID, parts: MessageV2.Part[]): MessageV2.WithParts {
   return {
-    info: { role: "user", id, sessionID: "session" as unknown as MessageID, agent: "test", model: { providerID: "test" as any, modelID: "test" as any }, time: { created: 1 } },
+    info: {
+      role: "user",
+      id,
+      sessionID: SESSION_ID,
+      agent: "test",
+      model: { providerID: PROVIDER_ID, modelID: MODEL_ID },
+      time: { created: 1 },
+    },
     parts,
   } as unknown as MessageV2.WithParts
 }
 
 function assistantMessage(id: MessageID, parentID: MessageID): MessageV2.WithParts {
   return {
-    info: { role: "assistant", id, parentID, sessionID: "session" as unknown as MessageID, agent: "test", model: { providerID: "test" as any, modelID: "test" as any }, time: { created: 1 }, cost: 0, tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } }, mode: "build" },
+    info: {
+      role: "assistant",
+      id,
+      parentID,
+      sessionID: SESSION_ID,
+      agent: "test",
+      providerID: PROVIDER_ID,
+      modelID: MODEL_ID,
+      time: { created: 1 },
+      cost: 0,
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      mode: "build",
+    },
     parts: [],
   } as unknown as MessageV2.WithParts
 }
