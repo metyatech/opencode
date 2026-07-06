@@ -119,6 +119,39 @@ const NO_PROGRESS_LOOP_MESSAGE =
 const INTERNAL_CONTINUATION_SYSTEM_PROMPT =
   "The latest user-role message is an internal continuation marker generated after session compaction, not a new human request. Continue the in-progress request from retained state; do not restart request-intake, intent-routing, or turn-start procedures because of that marker."
 
+const INTERNAL_CONTINUATION_INSTRUCTION_SYSTEM_PROMPT =
+  "Internal continuation instruction. This is not a new human request, but it is mandatory execution context. Follow it to continue the in-progress request:"
+
+function stripInternalContinuationMarkers(text: string): string {
+  return text.replace(/\n*<!--\s*OMO_INTERNAL_INITIATOR\s*-->\s*/g, "\n").trim()
+}
+
+function internalContinuationInstructionText(
+  msgs: MessageV2.WithParts[],
+  internalContinuation: MessageV2.User | undefined,
+  pendingInternalContinuation: boolean,
+): string | undefined {
+  if (!pendingInternalContinuation || !internalContinuation) return undefined
+  const continuationMessage = msgs.find(
+    (msg) =>
+      msg.info.role === "user" &&
+      msg.info.id === internalContinuation.id &&
+      MessageV2.isInternalContinuationMessage(msg),
+  )
+  if (!continuationMessage) return undefined
+
+  const text = continuationMessage.parts
+    .filter((part): part is MessageV2.TextPart => part.type === "text")
+    .map((part) => stripInternalContinuationMarkers(part.text))
+    .filter(Boolean)
+    .join("\n\n")
+    .trim()
+
+  if (!text) return undefined
+
+  return [INTERNAL_CONTINUATION_INSTRUCTION_SYSTEM_PROMPT, text].join("\n\n")
+}
+
 function stableJson(value: unknown): string {
   return JSON.stringify(sortJsonValue(value))
 }
@@ -226,6 +259,7 @@ function detectRepeatedToolObservationLoop(
 export const __test__ = {
   detectRepeatedToolObservationLoop,
   isProcessPollObservation,
+  internalContinuationInstructionText,
 }
 
 function assistantTerminalTime(info: MessageV2.Assistant) {
@@ -1837,6 +1871,14 @@ export const layer = Layer.effect(
             }
             if (pendingInternalContinuation) {
               system.push(INTERNAL_CONTINUATION_SYSTEM_PROMPT)
+              const internalContinuationText = internalContinuationInstructionText(
+                msgs,
+                internalContinuation,
+                pendingInternalContinuation,
+              )
+              if (internalContinuationText) {
+                system.push(internalContinuationText)
+              }
             }
             const format = lastUser.format ?? { type: "text" as const }
             if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
