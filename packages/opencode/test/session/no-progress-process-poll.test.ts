@@ -94,6 +94,30 @@ describe("isLiveEmptyProcessPollWaitObservation", () => {
   test("false for a non-process tool", () => {
     expect(isLiveEmptyProcessPollWaitObservation(toolPart("read", livePollInput, liveTimeoutOutput))).toBe(false)
   })
+
+  test("true for a positive decimal-integer string wait_ms", () => {
+    const input = { action: "poll", handle: "proc_x", cursor: 0, wait_ms: "300000" }
+    expect(isLiveEmptyProcessPollWaitObservation(toolPart("process", input, liveTimeoutOutput))).toBe(true)
+  })
+
+  test("repeated guard excludes a positive string wait_ms 3 times", () => {
+    const msgs = threeIdentical(() =>
+      toolPart(
+        "process",
+        { action: "poll", handle: "proc_x", cursor: 0, wait_ms: "300000" },
+        liveTimeoutOutput,
+      ),
+    )
+    expect(detectRepeatedToolObservationLoop(msgs, PARENT)).toBeUndefined()
+  })
+
+  test.each(["0", "", "01", " 1", "1 ", "1.5", "-1", "0x10", "9007199254740992"])(
+    "false when wait_ms string is %p",
+    (wait) => {
+      const input = { action: "poll", handle: "proc_x", cursor: 0, wait_ms: wait }
+      expect(isLiveEmptyProcessPollWaitObservation(toolPart("process", input, liveTimeoutOutput))).toBe(false)
+    },
+  )
 })
 
 describe("detectRepeatedToolObservationLoop with process poll waits", () => {

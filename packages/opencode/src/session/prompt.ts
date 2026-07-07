@@ -174,11 +174,18 @@ function sortJsonValue(value: unknown): unknown {
 // observation ONLY when ALL of these hold, so immediate polls, terminal polls,
 // error results, polls with output, and non-process tools stay fully guarded:
 //   - tool is "process", status completed
-//   - input.action === "poll" with a numeric input.wait_ms > 0
+//   - input.action === "poll" with a positive number or decimal-integer string input.wait_ms
 //   - output parses as JSON with no `error`
 //   - info.state is "starting" or "running" (still live)
 //   - events is an empty array
 //   - wait_status is "timeout"
+function isPositiveProcessPollWaitMs(value: unknown): boolean {
+  if (typeof value === "number") return Number.isSafeInteger(value) && value > 0
+  if (typeof value !== "string") return false
+  if (!/^(0|[1-9]\d*)$/.test(value)) return false
+  const parsed = Number(value)
+  return Number.isSafeInteger(parsed) && parsed > 0
+}
 function isLiveEmptyProcessPollWaitObservation(part: MessageV2.ToolPart): boolean {
   if (part.tool !== "process") return false
   if (part.state.status !== "completed") return false
@@ -186,7 +193,7 @@ function isLiveEmptyProcessPollWaitObservation(part: MessageV2.ToolPart): boolea
   if (input === null || typeof input !== "object" || Array.isArray(input)) return false
   const request = input as Record<string, unknown>
   if (request.action !== "poll") return false
-  if (typeof request.wait_ms !== "number" || request.wait_ms <= 0) return false
+  if (!isPositiveProcessPollWaitMs(request.wait_ms)) return false
   const output = part.state.output
   if (typeof output !== "string") return false
   const parsedUnknown: unknown = (() => {
