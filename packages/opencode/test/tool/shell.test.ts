@@ -1193,6 +1193,7 @@ describe("tool.shell background promotion guidance", () => {
               'If a poll returns wait_status:"timeout" with state running, the command is still running; poll again with the returned next_cursor.',
             )
             // Forbidden phrases must not appear in the background guidance.
+            expect(result.output).not.toContain("previous next_cursor")
             expect(result.output).not.toContain("returned result's")
             expect(result.output).not.toContain("same cursor")
             expect(result.output).not.toContain("reaped by the manager")
@@ -1810,34 +1811,28 @@ describe("STABLE_SHELL_ENV_OVERRIDES", () => {
 })
 
 describe("mergeShellEnv", () => {
-  test("applies base, then stable overrides, then caller overrides (in that order)", () => {
-    const base: NodeJS.ProcessEnv = {
-      PATH: "/usr/bin",
-      HOME: "/home/x",
+  test("mergeShellEnv applies stable shell defaults after process env and before plugin overrides", () => {
+    const base = {
+      PAGER: "less",
       TERM: "xterm-256color",
-      LANG: "en_US.UTF-8",
-    }
-    const overrides: NodeJS.ProcessEnv = {
-      PATH: "/custom/bin",
-      COLORTERM: "truecolor",
-    }
-    const result = mergeShellEnv(base, overrides)
-    // Stable overrides win over base.
+      CUSTOM_BASE: "base",
+    } as NodeJS.ProcessEnv
+    const plugin = {
+      PAGER: "plugin-pager",
+      CUSTOM_PLUGIN: "plugin",
+    } as NodeJS.ProcessEnv
+
+    const result = mergeShellEnv(base, plugin)
+
+    expect(result).toEqual({
+      ...base,
+      ...STABLE_SHELL_ENV_OVERRIDES,
+      ...plugin,
+    })
+    expect(result.PAGER).toBe("plugin-pager")
     expect(result.TERM).toBe(STABLE_SHELL_ENV_OVERRIDES.TERM)
-    expect(result.LANG).toBe(STABLE_SHELL_ENV_OVERRIDES.LANG)
-    expect(result.NO_COLOR).toBe(STABLE_SHELL_ENV_OVERRIDES.NO_COLOR)
-    expect(result.PAGER).toBe(STABLE_SHELL_ENV_OVERRIDES.PAGER)
-    expect(result.GIT_PAGER).toBe(STABLE_SHELL_ENV_OVERRIDES.GIT_PAGER)
-    expect(result.GH_PAGER).toBe(STABLE_SHELL_ENV_OVERRIDES.GH_PAGER)
-    expect(result.CODEX_CI).toBe(STABLE_SHELL_ENV_OVERRIDES.CODEX_CI)
-    expect(result.LC_CTYPE).toBe(STABLE_SHELL_ENV_OVERRIDES.LC_CTYPE)
-    expect(result.LC_ALL).toBe(STABLE_SHELL_ENV_OVERRIDES.LC_ALL)
-    // Caller overrides win last, including over stable overrides.
-    expect(result.COLORTERM).toBe("truecolor")
-    // Caller overrides win over base.
-    expect(result.PATH).toBe("/custom/bin")
-    // Base keys not touched by overrides or stable values pass through.
-    expect(result.HOME).toBe("/home/x")
+    expect(result.CUSTOM_BASE).toBe("base")
+    expect(result.CUSTOM_PLUGIN).toBe("plugin")
   })
 
   test("does not mutate the inputs", () => {
