@@ -1175,13 +1175,15 @@ describe("tool.shell background promotion guidance", () => {
               `{"action":"poll","handle":"${handle}","cursor":0,"wait_ms":300000}`,
             )
             expect(result.output).toContain("wait_ms:300000 waits until new output arrives or the command exits")
-            expect(result.output).toContain("pass the returned result's next_cursor as cursor")
+            expect(result.output).toContain(
+              "On each subsequent poll, pass the previous result's next_cursor as cursor.",
+            )
             expect(result.output).toContain(
               `Use the process tool with {"action":"stop","handle":"${handle}"} only if you want to terminate it.`,
             )
             expect(result.output).toContain(`If unsure, call the process tool with {"action":"list"} first.`)
             expect(result.output).not.toContain("Use process poll to read output, process stop to terminate.")
-            // New: background promotion must warn against re-running and
+            // Background promotion must warn against re-running and
             // explain the timeout/running poll-again contract using the
             // exact required sentences.
             expect(result.output).toContain(
@@ -1191,7 +1193,7 @@ describe("tool.shell background promotion guidance", () => {
               'If a poll returns wait_status:"timeout" with state running, the command is still running; poll again with the returned next_cursor.',
             )
             // Forbidden phrases must not appear in the background guidance.
-            expect(result.output).not.toContain("previous next_cursor")
+            expect(result.output).not.toContain("returned result's")
             expect(result.output).not.toContain("same cursor")
             expect(result.output).not.toContain("reaped by the manager")
           }).pipe(Effect.ensuring(manager.stop({ sessionID: ctx.sessionID, handle }).pipe(Effect.ignore)))
@@ -1917,23 +1919,22 @@ describe("tool.shell description advertises background-process-handle usage", ()
       // every rendered shell (bash, powershell, cmd). The host shell
       // determines which profile renders, so we only assert on text
       // that is identical across all three profiles.
-      expect(def.description).toContain("When the shell returns a background process handle")
+      expect(def.description).toContain("When a command returns a background process handle")
+      expect(def.description).toContain("do NOT run the same command again to wait for it")
       expect(def.description).toContain(
         '{"action":"poll","handle":"<handle>","cursor":0,"wait_ms":300000}',
       )
-      expect(def.description).toContain("returned result's `next_cursor`")
-      expect(def.description).toContain("with state running")
-      expect(def.description).toContain(
-        "Do not re-run the original command just to wait for completion; that starts a second process.",
-      )
-      expect(def.description).toContain(
-        'If a poll returns wait_status:"timeout" with state running, the command is still running; poll again with the returned next_cursor.',
-      )
-      expect(def.description).toContain("Use `stop` only if you intend to terminate it")
+      expect(def.description).toContain("pass the returned next_cursor on subsequent polls")
+      expect(def.description).toContain('wait_status "timeout"')
+      expect(def.description).toContain('info.state "running"')
+      expect(def.description).toContain("stop it only if you intend to terminate it")
       expect(def.description).toContain("wait_status")
       expect(def.description).toContain("next_cursor")
       // Forbidden phrases must not appear in the description.
-      expect(def.description).not.toContain("previous next_cursor")
+      expect(def.description).not.toContain("When the shell returns")
+      expect(def.description).not.toContain("returned result's")
+      expect(def.description).not.toContain("with state running")
+      expect(def.description).not.toContain("Use `stop` only if you intend to terminate it")
       expect(def.description).not.toContain("same cursor")
       expect(def.description).not.toContain("reaped by the manager")
     }),

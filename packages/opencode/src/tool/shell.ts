@@ -926,10 +926,10 @@ export const ShellTool = Tool.define(
               `Command is still running in the background.\n` +
               `Handle: ${info.handle}\n` +
               `State: ${info.state}\n` +
+              `Do not re-run the original command just to wait for completion; that starts a second process.\n` +
               `To wait for it to finish, use the process tool with ${processPollArgs} to read output; ` +
               `wait_ms:300000 waits until new output arrives or the command exits.\n` +
-              `On each subsequent poll, pass the returned result's next_cursor as cursor.\n` +
-              `Do not re-run the original command just to wait for completion; that starts a second process.\n` +
+              `On each subsequent poll, pass the previous result's next_cursor as cursor.\n` +
               `If a poll returns wait_status:"timeout" with state running, the command is still running; poll again with the returned next_cursor.\n` +
               `Use the process tool with ${processStopArgs} only if you want to terminate it.\n` +
               `If unsure, call the process tool with ${processListArgs} first.`

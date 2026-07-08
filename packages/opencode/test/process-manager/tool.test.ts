@@ -49,11 +49,12 @@ describe("process tool action guidance", () => {
       expect(def.description).toContain('{"action":"stop","handle":"proc_..."}')
       expect(def.description).toContain('If you need a handle but do not know it, call {"action":"list"} first.')
       expect(def.description).not.toContain("hard timeout")
-      // New: long-poll guidance must mention the three required contracts.
-      expect(def.description).toContain("Do not re-run the original shell command")
-      expect(def.description).toContain("that starts a second process")
+      // Long-poll guidance must mention the required contracts.
+      expect(def.description).toContain(
+        "Do not re-run the original shell command just to wait for completion; that starts a second process.",
+      )
       expect(def.description).toContain("poll again using that result's next_cursor")
-      expect(def.description).toContain("Use `stop` only if you intend to terminate the process")
+      expect(def.description).toContain("stop it only if you intend to terminate it")
       // Forbidden phrases must not appear in the description.
       expect(def.description).not.toContain("previous next_cursor")
       expect(def.description).not.toContain("same cursor")
