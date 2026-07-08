@@ -27,6 +27,40 @@ import { ProcessError, ProcessInfo } from "@/process-manager/types"
 
 export { Parameters } from "./shell/prompt"
 
+// Stable, codex-compatible shell env overrides. These are the env vars the
+// tool always normalizes for every shell command regardless of caller-supplied
+// plugin overrides, so output is reproducible and tooling-friendly. Keys map to
+// the value that should be applied after caller/plugin overrides (i.e. these
+// take effect last in the merge order). The set is intentionally small and
+// stable; do NOT add CI-detecting variables here, do NOT include
+// caller-controlled values.
+export const STABLE_SHELL_ENV_OVERRIDES = {
+  NO_COLOR: "1",
+  TERM: "dumb",
+  LANG: "C.UTF-8",
+  LC_CTYPE: "C.UTF-8",
+  LC_ALL: "C.UTF-8",
+  COLORTERM: "",
+  PAGER: "cat",
+  GIT_PAGER: "cat",
+  GH_PAGER: "cat",
+  CODEX_CI: "1",
+} as const satisfies Readonly<Record<string, string>>
+
+// Pure merge helper. Order: `base` first, then `overrides` win over base, then
+// the stable overrides win over both. Used by the tool's runtime env builder
+// so the merge contract is testable in isolation.
+export function mergeShellEnv(
+  base: NodeJS.ProcessEnv,
+  overrides: NodeJS.ProcessEnv,
+): NodeJS.ProcessEnv {
+  return {
+    ...base,
+    ...overrides,
+    ...STABLE_SHELL_ENV_OVERRIDES,
+  }
+}
+
 // Windows-only floor for the initial background yield. Codex applies a 2000ms
 // floor to the first exec yield on Windows because process/shell startup is
 // observed more slowly there than on Unix; yielding at e.g. 250ms risks
@@ -455,10 +489,7 @@ export const ShellTool = Tool.define(
         { cwd, sessionID: ctx.sessionID, callID: ctx.callID },
         { env: {} },
       )
-      return {
-        ...process.env,
-        ...extra.env,
-      }
+      return mergeShellEnv(process.env, extra.env)
     })
 
     const run = Effect.fn("ShellTool.run")(function* (
@@ -895,6 +926,8 @@ export const ShellTool = Tool.define(
               `To wait for it to finish, use the process tool with ${processPollArgs} to read output; ` +
               `wait_ms:300000 waits until new output arrives or the command exits.\n` +
               `On each subsequent poll, pass the previous result's next_cursor as cursor.\n` +
+              `Do not re-run this command; the previous run is still running and will be reaped by the manager.\n` +
+              `A "timeout" result with state "running" is not a failure: the command is still running and the wait window elapsed, so poll again with the previous next_cursor to keep waiting.\n` +
               `Use the process tool with ${processStopArgs} only if you want to terminate it.\n` +
               `If unsure, call the process tool with ${processListArgs} first.`
             const metadataOut = prePromoteSnapshot || "(no output yet)"

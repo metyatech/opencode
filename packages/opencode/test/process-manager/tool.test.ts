@@ -49,6 +49,13 @@ describe("process tool action guidance", () => {
       expect(def.description).toContain('{"action":"stop","handle":"proc_..."}')
       expect(def.description).toContain('If you need a handle but do not know it, call {"action":"list"} first.')
       expect(def.description).not.toContain("hard timeout")
+      // New: long-poll guidance must mention the three required contracts.
+      expect(def.description).toContain("Do not re-run the original shell command")
+      expect(def.description).toContain("the previous run is still alive in the manager")
+      expect(def.description).toContain("poll again with the previous next_cursor to keep waiting")
+      expect(def.description).toContain("Use `stop` only if you intend to terminate the process")
+      // No write action must still be advertised as absent.
+      expect(def.description).toContain('There is intentionally no `write` action')
     }),
   )
 

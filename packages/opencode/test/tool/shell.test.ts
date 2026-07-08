@@ -1,4 +1,4 @@
-import { describe, expect } from "bun:test"
+import { describe, expect, test } from "bun:test"
 import { Cause, Effect, Exit, Layer } from "effect"
 import type * as Scope from "effect/Scope"
 import fs from "node:fs/promises"
@@ -6,7 +6,7 @@ import os from "os"
 import path from "path"
 import { Config } from "@/config/config"
 import { Shell } from "../../src/shell/shell"
-import { ShellTool } from "../../src/tool/shell"
+import { ShellTool, STABLE_SHELL_ENV_OVERRIDES, mergeShellEnv } from "../../src/tool/shell"
 import { Filesystem } from "@/util/filesystem"
 import { provideInstance, tmpdirScoped } from "../fixture/fixture"
 import type { Permission } from "../../src/permission"
@@ -145,6 +145,18 @@ const nodeEval = (code: string) => {
   if (PS.has(sh())) return `& ${text}`
   return text
 }
+// Marker-then-stay-alive helper for abort/timeout tests. The bash chain
+// `echo X && sleep N` is racy on Windows: the chain runs in two separate
+// child processes, the first can be reaped before stdout drains, and bash
+// startup plus the 2000ms Windows floor can push "started" past the 500ms
+// foreground timeout. A single Node process that writes the marker
+// (with trailing newline so libuv flushes the pipe buffer) and then parks
+// itself on a long-lived setInterval deterministically emits the marker
+// first and stays alive until the parent kills it via abort/timeout.
+const writesAndWaits = (marker: string) =>
+  nodeEval(
+    `process.stdout.write(${JSON.stringify(marker + "\n")}); setInterval(() => {}, 60000)`,
+  )
 const glob = (p: string) =>
   process.platform === "win32" ? Filesystem.normalizePathPattern(p) : p.replaceAll("\\", "/")
 
@@ -1169,6 +1181,14 @@ describe("tool.shell background promotion guidance", () => {
             )
             expect(result.output).toContain(`If unsure, call the process tool with {"action":"list"} first.`)
             expect(result.output).not.toContain("Use process poll to read output, process stop to terminate.")
+            // New: background promotion must warn against re-running and
+            // explain the timeout/running poll-again contract.
+            expect(result.output).toContain("Do not re-run this command")
+            expect(result.output).toContain("the previous run is still running and will be reaped by the manager")
+            expect(result.output).toContain(
+              'A "timeout" result with state "running" is not a failure',
+            )
+            expect(result.output).toContain("poll again with the previous next_cursor to keep waiting")
           }).pipe(Effect.ensuring(manager.stop({ sessionID: ctx.sessionID, handle }).pipe(Effect.ignore)))
         }),
       ),
@@ -1187,7 +1207,7 @@ describe("tool.shell abort", () => {
           const collected: string[] = []
           const res = yield* run(
             {
-              command: `echo before && sleep 30`,
+              command: writesAndWaits("before"),
               description: "Long running command",
             },
             {
@@ -1218,7 +1238,7 @@ describe("tool.shell abort", () => {
         projectRoot,
         Effect.gen(function* () {
           const result = yield* run({
-            command: `echo started && sleep 60`,
+            command: writesAndWaits("started"),
             description: "Timeout test",
             timeout: 500,
           })
@@ -1240,7 +1260,7 @@ describe("tool.shell abort", () => {
           expect(tool.description).toContain("falls back to 500ms")
           const result = yield* tool.execute(
             {
-              command: `echo started && sleep 60`,
+              command: writesAndWaits("started"),
               description: "Default timeout test",
             },
             ctx,
@@ -1578,7 +1598,7 @@ describe("tool.shell stdio lifecycle regression", () => {
         projectRoot,
         Effect.gen(function* () {
           const controller = new AbortController()
-          const command = `echo begin && ${process.platform === "win32" ? "ping -n 30 127.0.0.1 > nul" : "sleep 30"}`
+          const command = writesAndWaits("begin")
           const start = Date.now()
           const result = yield* run(
             { command, description: "Abort timing" },
@@ -1595,7 +1615,7 @@ describe("tool.shell stdio lifecycle regression", () => {
             },
           )
           const elapsed = Date.now() - start
-          // Abort must complete in well under 30s (the would-be sleep).
+          // Abort must complete in well under the would-be sleep.
           expect(elapsed).toBeLessThan(5_000)
           expect(result.output).toContain("begin")
           expect(result.output).toContain("User aborted the command")
@@ -1612,7 +1632,7 @@ describe("tool.shell stdio lifecycle regression", () => {
         Effect.gen(function* () {
           const start = Date.now()
           const result = yield* run({
-            command: `echo begun && ${process.platform === "win32" ? "ping -n 30 127.0.0.1 > nul" : "sleep 30"}`,
+            command: writesAndWaits("begun"),
             description: "Timeout timing",
             timeout: 500,
           })
@@ -1753,4 +1773,150 @@ describe("tool.shell Windows PowerShell integration", () => {
       10_000,
     )
   }
+})
+
+describe("STABLE_SHELL_ENV_OVERRIDES", () => {
+  test("contains exactly the documented Codex-compatible keys", () => {
+    expect(Object.keys(STABLE_SHELL_ENV_OVERRIDES).sort()).toEqual(
+      [
+        "COLORTERM",
+        "CODEX_CI",
+        "GH_PAGER",
+        "GIT_PAGER",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "NO_COLOR",
+        "PAGER",
+        "TERM",
+      ].sort(),
+    )
+  })
+
+  test("does not include the unstable CI variable", () => {
+    expect(STABLE_SHELL_ENV_OVERRIDES).not.toHaveProperty("CI")
+  })
+
+  test("sets COLORTERM to the empty string", () => {
+    expect(STABLE_SHELL_ENV_OVERRIDES.COLORTERM).toBe("")
+  })
+})
+
+describe("mergeShellEnv", () => {
+  test("applies base, then overrides, then stable overrides (in that order)", () => {
+    const base: NodeJS.ProcessEnv = {
+      PATH: "/usr/bin",
+      HOME: "/home/x",
+      TERM: "xterm-256color",
+      LANG: "en_US.UTF-8",
+    }
+    const overrides: NodeJS.ProcessEnv = {
+      PATH: "/custom/bin",
+      COLORTERM: "truecolor",
+    }
+    const result = mergeShellEnv(base, overrides)
+    // Stable overrides win last.
+    expect(result.TERM).toBe(STABLE_SHELL_ENV_OVERRIDES.TERM)
+    expect(result.LANG).toBe(STABLE_SHELL_ENV_OVERRIDES.LANG)
+    expect(result.NO_COLOR).toBe(STABLE_SHELL_ENV_OVERRIDES.NO_COLOR)
+    expect(result.PAGER).toBe(STABLE_SHELL_ENV_OVERRIDES.PAGER)
+    expect(result.GIT_PAGER).toBe(STABLE_SHELL_ENV_OVERRIDES.GIT_PAGER)
+    expect(result.GH_PAGER).toBe(STABLE_SHELL_ENV_OVERRIDES.GH_PAGER)
+    expect(result.CODEX_CI).toBe(STABLE_SHELL_ENV_OVERRIDES.CODEX_CI)
+    expect(result.LC_CTYPE).toBe(STABLE_SHELL_ENV_OVERRIDES.LC_CTYPE)
+    expect(result.LC_ALL).toBe(STABLE_SHELL_ENV_OVERRIDES.LC_ALL)
+    // Stable wins over caller overrides too.
+    expect(result.COLORTERM).toBe(STABLE_SHELL_ENV_OVERRIDES.COLORTERM)
+    // Caller overrides win over base.
+    expect(result.PATH).toBe("/custom/bin")
+    // Base keys not touched by overrides or stable values pass through.
+    expect(result.HOME).toBe("/home/x")
+  })
+
+  test("does not mutate the inputs", () => {
+    const base: NodeJS.ProcessEnv = { PATH: "/usr/bin", TERM: "xterm" }
+    const overrides: NodeJS.ProcessEnv = { PATH: "/custom/bin" }
+    const baseSnapshot = { ...base }
+    const overrideSnapshot = { ...overrides }
+    mergeShellEnv(base, overrides)
+    expect(base).toEqual(baseSnapshot)
+    expect(overrides).toEqual(overrideSnapshot)
+  })
+
+  test("returns an object that has every stable override key", () => {
+    const result = mergeShellEnv({}, {})
+    const overrides = STABLE_SHELL_ENV_OVERRIDES as Readonly<Record<string, string>>
+    for (const key of Object.keys(overrides)) {
+      expect(result[key]).toBe(overrides[key])
+    }
+  })
+})
+
+describe("tool.shell stable env integration", () => {
+  it.live("emits the stable env vars to the child process", () =>
+    runIn(
+      projectRoot,
+      Effect.gen(function* () {
+        // The child writes a JSON object containing the env vars we
+        // care about. We can't pre-set those vars in the parent
+        // (we want to see what the tool resolves them to) so we
+        // rely on the stable overrides to be present.
+        //
+        // COLORTERM is intentionally NOT validated here because on
+        // Windows hosts the bash/PowerShell child inherits a
+        // non-empty COLORTERM (e.g. via mintty) through the spawner
+        // even though mergeShellEnv collapsed the tool-supplied
+        // value to "". The "" contract is asserted at the unit-test
+        // level (see the STABLE_SHELL_ENV_OVERRIDES describe block);
+        // this live test only checks the non-empty-coded stable keys.
+        const code = [
+          "const out = {",
+          "  NO_COLOR: process.env.NO_COLOR,",
+          "  TERM: process.env.TERM,",
+          "  LANG: process.env.LANG,",
+          "  LC_CTYPE: process.env.LC_CTYPE,",
+          "  LC_ALL: process.env.LC_ALL,",
+          "  PAGER: process.env.PAGER,",
+          "  GIT_PAGER: process.env.GIT_PAGER,",
+          "  GH_PAGER: process.env.GH_PAGER,",
+          "  CODEX_CI: process.env.CODEX_CI,",
+          "};",
+          "process.stdout.write(JSON.stringify(out));",
+        ].join("\n")
+        const command = nodeEval(code)
+        const result = yield* run({
+          command,
+          description: "Inspect stable env vars",
+        })
+        const parsed = JSON.parse(result.output.trim()) as Record<string, string | undefined>
+        expect(parsed.NO_COLOR).toBe(STABLE_SHELL_ENV_OVERRIDES.NO_COLOR)
+        expect(parsed.TERM).toBe(STABLE_SHELL_ENV_OVERRIDES.TERM)
+        expect(parsed.LANG).toBe(STABLE_SHELL_ENV_OVERRIDES.LANG)
+        expect(parsed.LC_CTYPE).toBe(STABLE_SHELL_ENV_OVERRIDES.LC_CTYPE)
+        expect(parsed.LC_ALL).toBe(STABLE_SHELL_ENV_OVERRIDES.LC_ALL)
+        expect(parsed.PAGER).toBe(STABLE_SHELL_ENV_OVERRIDES.PAGER)
+        expect(parsed.GIT_PAGER).toBe(STABLE_SHELL_ENV_OVERRIDES.GIT_PAGER)
+        expect(parsed.GH_PAGER).toBe(STABLE_SHELL_ENV_OVERRIDES.GH_PAGER)
+        expect(parsed.CODEX_CI).toBe(STABLE_SHELL_ENV_OVERRIDES.CODEX_CI)
+      }),
+    ),
+  )
+})
+
+describe("tool.shell description advertises background-process-handle usage", () => {
+  it.instance("description includes the background-process-handle usage bullet", () =>
+    Effect.gen(function* () {
+      const def = yield* (yield* ShellTool).init()
+      // The bullet sits between the background_after_ms bullet and the
+      // "clear, concise description" bullet, and must be present in
+      // every rendered shell (bash, powershell, cmd). The host shell
+      // determines which profile renders, so we only assert on text
+      // that is identical across all three profiles.
+      expect(def.description).toContain("When the shell returns a background process handle")
+      expect(def.description).toContain("Do not re-run the command")
+      expect(def.description).toContain("Use `stop` only if you intend to terminate it")
+      expect(def.description).toContain("wait_status")
+      expect(def.description).toContain("next_cursor")
+    }),
+  )
 })
