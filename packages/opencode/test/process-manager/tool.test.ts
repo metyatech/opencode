@@ -51,9 +51,13 @@ describe("process tool action guidance", () => {
       expect(def.description).not.toContain("hard timeout")
       // New: long-poll guidance must mention the three required contracts.
       expect(def.description).toContain("Do not re-run the original shell command")
-      expect(def.description).toContain("the previous run is still alive in the manager")
-      expect(def.description).toContain("poll again with the previous next_cursor to keep waiting")
+      expect(def.description).toContain("that starts a second process")
+      expect(def.description).toContain("poll again using that result's next_cursor")
       expect(def.description).toContain("Use `stop` only if you intend to terminate the process")
+      // Forbidden phrases must not appear in the description.
+      expect(def.description).not.toContain("previous next_cursor")
+      expect(def.description).not.toContain("same cursor")
+      expect(def.description).not.toContain("reaped by the manager")
       // No write action must still be advertised as absent.
       expect(def.description).toContain('There is intentionally no `write` action')
     }),

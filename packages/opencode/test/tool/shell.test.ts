@@ -1175,20 +1175,25 @@ describe("tool.shell background promotion guidance", () => {
               `{"action":"poll","handle":"${handle}","cursor":0,"wait_ms":300000}`,
             )
             expect(result.output).toContain("wait_ms:300000 waits until new output arrives or the command exits")
-            expect(result.output).toContain("pass the previous result's next_cursor as cursor")
+            expect(result.output).toContain("pass the returned result's next_cursor as cursor")
             expect(result.output).toContain(
               `Use the process tool with {"action":"stop","handle":"${handle}"} only if you want to terminate it.`,
             )
             expect(result.output).toContain(`If unsure, call the process tool with {"action":"list"} first.`)
             expect(result.output).not.toContain("Use process poll to read output, process stop to terminate.")
             // New: background promotion must warn against re-running and
-            // explain the timeout/running poll-again contract.
-            expect(result.output).toContain("Do not re-run this command")
-            expect(result.output).toContain("the previous run is still running and will be reaped by the manager")
+            // explain the timeout/running poll-again contract using the
+            // exact required sentences.
             expect(result.output).toContain(
-              'A "timeout" result with state "running" is not a failure',
+              "Do not re-run the original command just to wait for completion; that starts a second process.",
             )
-            expect(result.output).toContain("poll again with the previous next_cursor to keep waiting")
+            expect(result.output).toContain(
+              'If a poll returns wait_status:"timeout" with state running, the command is still running; poll again with the returned next_cursor.',
+            )
+            // Forbidden phrases must not appear in the background guidance.
+            expect(result.output).not.toContain("previous next_cursor")
+            expect(result.output).not.toContain("same cursor")
+            expect(result.output).not.toContain("reaped by the manager")
           }).pipe(Effect.ensuring(manager.stop({ sessionID: ctx.sessionID, handle }).pipe(Effect.ignore)))
         }),
       ),
@@ -1803,7 +1808,7 @@ describe("STABLE_SHELL_ENV_OVERRIDES", () => {
 })
 
 describe("mergeShellEnv", () => {
-  test("applies base, then overrides, then stable overrides (in that order)", () => {
+  test("applies base, then stable overrides, then caller overrides (in that order)", () => {
     const base: NodeJS.ProcessEnv = {
       PATH: "/usr/bin",
       HOME: "/home/x",
@@ -1815,7 +1820,7 @@ describe("mergeShellEnv", () => {
       COLORTERM: "truecolor",
     }
     const result = mergeShellEnv(base, overrides)
-    // Stable overrides win last.
+    // Stable overrides win over base.
     expect(result.TERM).toBe(STABLE_SHELL_ENV_OVERRIDES.TERM)
     expect(result.LANG).toBe(STABLE_SHELL_ENV_OVERRIDES.LANG)
     expect(result.NO_COLOR).toBe(STABLE_SHELL_ENV_OVERRIDES.NO_COLOR)
@@ -1825,8 +1830,8 @@ describe("mergeShellEnv", () => {
     expect(result.CODEX_CI).toBe(STABLE_SHELL_ENV_OVERRIDES.CODEX_CI)
     expect(result.LC_CTYPE).toBe(STABLE_SHELL_ENV_OVERRIDES.LC_CTYPE)
     expect(result.LC_ALL).toBe(STABLE_SHELL_ENV_OVERRIDES.LC_ALL)
-    // Stable wins over caller overrides too.
-    expect(result.COLORTERM).toBe(STABLE_SHELL_ENV_OVERRIDES.COLORTERM)
+    // Caller overrides win last, including over stable overrides.
+    expect(result.COLORTERM).toBe("truecolor")
     // Caller overrides win over base.
     expect(result.PATH).toBe("/custom/bin")
     // Base keys not touched by overrides or stable values pass through.
@@ -1913,10 +1918,24 @@ describe("tool.shell description advertises background-process-handle usage", ()
       // determines which profile renders, so we only assert on text
       // that is identical across all three profiles.
       expect(def.description).toContain("When the shell returns a background process handle")
-      expect(def.description).toContain("Do not re-run the command")
+      expect(def.description).toContain(
+        '{"action":"poll","handle":"<handle>","cursor":0,"wait_ms":300000}',
+      )
+      expect(def.description).toContain("returned result's `next_cursor`")
+      expect(def.description).toContain("with state running")
+      expect(def.description).toContain(
+        "Do not re-run the original command just to wait for completion; that starts a second process.",
+      )
+      expect(def.description).toContain(
+        'If a poll returns wait_status:"timeout" with state running, the command is still running; poll again with the returned next_cursor.',
+      )
       expect(def.description).toContain("Use `stop` only if you intend to terminate it")
       expect(def.description).toContain("wait_status")
       expect(def.description).toContain("next_cursor")
+      // Forbidden phrases must not appear in the description.
+      expect(def.description).not.toContain("previous next_cursor")
+      expect(def.description).not.toContain("same cursor")
+      expect(def.description).not.toContain("reaped by the manager")
     }),
   )
 })
