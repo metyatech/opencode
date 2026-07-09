@@ -1253,6 +1253,65 @@ describe("tool.shell background promotion guidance", () => {
       ),
     45_000,
   )
+
+  it.live(
+    "long poll waits for post-terminal output drain before reporting terminal",
+    () =>
+      runIn(
+        projectRoot,
+        Effect.gen(function* () {
+          const manager = yield* ProcessManager.Service
+          const terminalDrainCtx = {
+            ...ctx,
+            sessionID: SessionID.make("ses_background_terminal_drain_poll"),
+          }
+          const early = "BG-PARENT-START"
+          const late = "BG-LATE-AFTER-EXIT"
+          const parentExitDelay = process.platform === "win32" ? 2_300 : 350
+          const childDelay = 300
+          const jsString = (text: string) =>
+            `String.fromCharCode(${Array.from(text)
+              .map((char) => char.charCodeAt(0))
+              .join(",")})`
+          const childCode = `setTimeout(() => { process.stdout.write(${jsString(late + "\n")}) }, ${childDelay})`
+          const command = nodeEval(
+            `process.stdout.write(${jsString(early + "\n")}); const { spawn } = require(${jsString("node:child_process")}); setTimeout(() => { const child = spawn(process.execPath, [${jsString("-e")}, ${jsString(childCode)}], { detached: true, stdio: [${jsString("ignore")}, ${jsString("inherit")}, ${jsString("inherit")}], windowsHide: true }); child.unref(); process.exit(0) }, ${parentExitDelay})`,
+          )
+          const result = yield* run(
+            {
+              command,
+              description: "post-terminal output drain",
+              timeout: 10_000,
+              background_after_ms: 250,
+            },
+            terminalDrainCtx,
+          )
+          expect(result.metadata.background).toBe(true)
+          const handle = result.metadata.processHandle as ProcessHandle
+          expect(handle).toBeTruthy()
+          yield* Effect.gen(function* () {
+            const first = yield* manager.poll({
+              sessionID: terminalDrainCtx.sessionID,
+              handle,
+              cursor: 0,
+              waitMs: 5_000,
+            })
+            const firstText = first?.events.map((e) => e.text).join("") ?? ""
+            expect(firstText).toContain(early)
+            const second = yield* manager.poll({
+              sessionID: terminalDrainCtx.sessionID,
+              handle,
+              cursor: first!.nextCursor,
+              waitMs: 5_000,
+            })
+            expect(second?.waitStatus).toBe("output")
+            const secondText = second?.events.map((e) => e.text).join("") ?? ""
+            expect(secondText).toContain(late)
+          }).pipe(Effect.ensuring(manager.stop({ sessionID: terminalDrainCtx.sessionID, handle }).pipe(Effect.ignore)))
+        }),
+      ),
+    20_000,
+  )
 })
 
 describe("tool.shell abort", () => {

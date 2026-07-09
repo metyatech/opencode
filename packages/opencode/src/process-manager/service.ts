@@ -851,7 +851,9 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
       const observe = Effect.fnUntraced(function* () {
         const latest = (yield* lookup(input.handle, input.sessionID)) ?? rec
         const hasOutput = latest.buffer.since(cursor).events.length > 0
-        return { latest, hasOutput, terminal: isTerminal(latest) } as const
+        const terminal = isTerminal(latest)
+        const outputClosed = latest.outputClosed === true
+        return { latest, hasOutput, terminal, outputClosed } as const
       })
 
       // Immediate poll: never block, just report the current view. `wait_ms`
@@ -861,9 +863,10 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
         return build(latest, "immediate")
       }
 
-      // Long poll: return as soon as new output arrives, the process reaches a
-      // terminal state, or the wait window elapses. We park on the notifier's
-      // deferred rather than sleeping, so output/terminal wakes return early.
+      // Long poll: return as soon as new output arrives, terminal state and
+      // output drain closure are both observed, or the wait window elapses. We
+      // park on the notifier's deferred rather than sleeping, so output,
+      // terminal, or output-close events wake return early.
       const deadline = now + waitMs
       while (true) {
         // Capture the wake channel before re-reading so a concurrent
@@ -871,7 +874,7 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
         const waiter = notifier.deferred
         const first = yield* observe()
         if (first.hasOutput) return build(first.latest, "output")
-        if (first.terminal) return build(first.latest, "terminal")
+        if (first.terminal && first.outputClosed) return build(first.latest, "terminal")
 
         const remaining = deadline - (yield* Clock.currentTimeMillis)
         if (remaining <= 0) return build(first.latest, "timeout")
@@ -882,7 +885,7 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
           // that landed exactly at the boundary still wins over "timeout".
           const final = yield* observe()
           if (final.hasOutput) return build(final.latest, "output")
-          if (final.terminal) return build(final.latest, "terminal")
+          if (final.terminal && final.outputClosed) return build(final.latest, "terminal")
           return build(final.latest, "timeout")
         }
         // Woke on output/terminal — loop to re-read and classify.
