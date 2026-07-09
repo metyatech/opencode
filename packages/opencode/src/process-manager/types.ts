@@ -35,6 +35,8 @@ export class ProcessInfo extends Schema.Class<ProcessInfo>("ProcessInfo")({
   ownerSessionID: Schema.String,
   pid: Schema.NullOr(Schema.Number),
   inputClosed: Schema.Boolean,
+  outputClosed: Schema.optional(Schema.Boolean),
+  closedAt: Schema.optional(Schema.NullOr(Schema.Number)),
   // Caller-supplied hard deadline (in ms) captured at promote time. `null`
   // when the caller had no timeout in mind (e.g. tests, ad-hoc CLI use).
   // Optional so existing call sites that predate the field can omit it;

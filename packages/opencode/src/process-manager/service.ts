@@ -33,6 +33,7 @@ export type OwnedScopeRelease = Effect.Effect<void, never, never>
 // recently used live record be stopped and removed.
 export const MAX_GLOBAL = 64
 export const RECENT_PROCESS_PROTECT_COUNT = 8
+export const OUTPUT_DRAIN_TIMEOUT_MS = 2_000
 
 // 30 minutes. The manager purges a record this long after `endedAt`; live
 // records are kept indefinitely (until InstanceState teardown).
@@ -66,6 +67,10 @@ type Record = {
   // Active timeout-watcher fiber. Held so `killAll*`/finalizers can interrupt
   // it cleanly when they decide to terminate the record themselves.
   timeoutWatcher: Fiber.Fiber<void, unknown> | null
+  outputDrainTimeoutWatcher: Fiber.Fiber<void, unknown> | null
+  openStreams: number
+  outputClosed: boolean
+  closedAt: number | null
   // Active stdio capture fibers. The capture finalizer attached to the
   // record's lifetime interrupts these so the bounded ring buffer stops
   // accepting new chunks once the record is purged.
@@ -180,6 +185,8 @@ function snapshot(rec: Record): ProcessInfo {
     ownerSessionID: rec.ownerSessionID,
     pid: rec.pid,
     inputClosed: !rec.stdinAvailable,
+    outputClosed: rec.outputClosed,
+    closedAt: rec.closedAt,
     timeoutMs: rec.timeoutMs,
     terminationReason: rec.terminationReason,
   })
@@ -221,6 +228,7 @@ function drainStream(
   buffer: RingBuffer,
   kind: "stdout" | "stderr",
   notify: Effect.Effect<void, never, never>,
+  onClosed: Effect.Effect<void, never, never>,
 ): Effect.Effect<void, never, Scope.Scope> {
   // One decoder for the entire stream lifetime. Reused on every chunk so
   // split UTF-8 sequences are reassembled before we append text to the
@@ -235,6 +243,15 @@ function drainStream(
     buffer.append(kind, text, Date.now())
     return true
   }
+  let closed = false
+  const closeOnce = Effect.fnUntraced(function* () {
+    if (closed) return
+    closed = true
+    yield* onClosed
+  })
+  const flushTail = Effect.fnUntraced(function* () {
+    if (append(decoder.decode())) yield* notify
+  })
 
   // Path 1: Web ReadableStream. Iterate chunks via reader.read().
   if (stream instanceof ReadableStream) {
@@ -258,11 +275,17 @@ function drainStream(
         // already gone (child exit, OS reset). Buffer already accepts chunks
         // synchronously so nothing to roll back here.
       }
+    }).pipe(
       // Always flush at end-of-stream / on interruption so any partial
       // multi-byte sequences surface as text (or the U+FFFD replacement)
-      // rather than being silently dropped.
-      if (append(decoder.decode())) yield* notify
-    }).pipe(Effect.ignore)
+      // rather than being silently dropped. Then report the stream closed;
+      // `closeOnce` makes natural completion and interruption race-safe.
+      Effect.ensuring(Effect.gen(function* () {
+        yield* flushTail()
+        yield* closeOnce()
+      })),
+      Effect.ignore,
+    )
   }
 
   // Path 2: Effect Stream. Use the typed runner for Stream<Uint8Array>.
@@ -281,7 +304,8 @@ function drainStream(
     ).pipe(
       Effect.ensuring(
         Effect.gen(function* () {
-          if (append(decoder.decode())) yield* notify
+          yield* flushTail()
+          yield* closeOnce()
         }),
       ),
       Effect.ignore,
@@ -289,8 +313,9 @@ function drainStream(
   }
 
   // Unknown shape — skip capture silently. The caller can still drive the
-  // buffer via `feed(...)`.
-  return Effect.void
+  // buffer via `feed(...)`, but the stream slot is closed for lifecycle
+  // accounting so output drain never waits forever on an unsupported value.
+  return closeOnce()
 }
 
 export function fromSpawnerChild(
@@ -352,6 +377,9 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
               }
               if (rec.watcher) yield* Fiber.interrupt(rec.watcher).pipe(Effect.ignore)
               if (rec.timeoutWatcher) yield* Fiber.interrupt(rec.timeoutWatcher).pipe(Effect.ignore)
+              if (rec.outputDrainTimeoutWatcher) {
+                yield* Fiber.interrupt(rec.outputDrainTimeoutWatcher).pipe(Effect.ignore)
+              }
               for (const f of rec.captureFibers) yield* Fiber.interrupt(f).pipe(Effect.ignore)
               yield* closeOwnedScope(rec)
             }
@@ -413,6 +441,60 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
       yield* Deferred.succeed(current, reason).pipe(Effect.ignore)
     })
 
+    const markStreamClosed = Effect.fn("ProcessManager.markStreamClosed")(function* (handle: ProcessHandle) {
+      const closedAt = yield* Clock.currentTimeMillis
+      const next = yield* mutate(handle, (cur) => {
+        if (cur.outputClosed) return cur
+        const openStreams = Math.max(0, cur.openStreams - 1)
+        if (openStreams > 0) return { ...cur, openStreams }
+        return { ...cur, openStreams, outputClosed: true, closedAt }
+      })
+      if (!next?.outputClosed) return
+      if (next.outputDrainTimeoutWatcher) yield* Fiber.interrupt(next.outputDrainTimeoutWatcher).pipe(Effect.ignore)
+      yield* wakeNotifier(next.pollNotifier, "terminal")
+      if (isTerminal(next)) yield* closeOwnedScope(next)
+    })
+
+    const forceOutputClosed = Effect.fn("ProcessManager.forceOutputClosed")(function* (handle: ProcessHandle) {
+      const closedAt = yield* Clock.currentTimeMillis
+      const next = yield* mutate(handle, (cur) => {
+        if (cur.outputClosed) return cur
+        return { ...cur, openStreams: 0, outputClosed: true, closedAt }
+      })
+      if (!next?.outputClosed) return
+      for (const fiber of next.captureFibers) yield* Fiber.interrupt(fiber).pipe(Effect.ignore)
+      yield* wakeNotifier(next.pollNotifier, "terminal")
+      if (isTerminal(next)) yield* closeOwnedScope(next)
+    })
+
+    const beginOutputDrainTimeout = Effect.fn("ProcessManager.beginOutputDrainTimeout")(function* (rec: Record) {
+      if (rec.outputClosed) {
+        yield* closeOwnedScope(rec)
+        return
+      }
+      if (rec.outputDrainTimeoutWatcher) return
+      const { scope } = yield* InstanceState.get(state)
+      const watcher: Fiber.Fiber<void, unknown> = yield* Effect.forkIn(
+        Effect.gen(function* () {
+          yield* Effect.sleep(`${OUTPUT_DRAIN_TIMEOUT_MS} millis`)
+          yield* forceOutputClosed(rec.handle)
+        }).pipe(
+          Effect.catchCause(() => Effect.void),
+          Effect.asVoid,
+        ),
+        scope,
+      )
+      const next = yield* mutate(rec.handle, (cur) => {
+        if (cur.outputClosed || cur.outputDrainTimeoutWatcher) return cur
+        return { ...cur, outputDrainTimeoutWatcher: watcher }
+      })
+      if (!next || next.outputDrainTimeoutWatcher !== watcher) {
+        yield* Fiber.interrupt(watcher).pipe(Effect.ignore)
+        const latest = (yield* lookup(rec.handle, rec.ownerSessionID)) ?? rec
+        if (latest.outputClosed) yield* closeOwnedScope(latest)
+      }
+    })
+
     const removeRecord = Effect.fn("ProcessManager.removeRecord")(function* (
       rec: Record,
       options?: { readonly stopLive?: boolean },
@@ -440,16 +522,18 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
         if (rec.pid !== null) {
           yield* adapter.stop({ pid: rec.pid, graceMs: 200 }).pipe(Effect.ignore)
         }
-        void Deferred.succeed(rec.onExit, { exitCode: rec.exitCode, signal: rec.signal })
         // Wake any poller parked on this record's notifier. The pruner is
         // the only terminal path that does not already wake pollers (the
         // other terminal paths route through `mutate` + their own wake).
         // Without this, a long poll would sleep out the full wait window
         // and return a "timeout" against a record that no longer exists.
         yield* wakeNotifier(rec.pollNotifier, "terminal")
+        yield* Deferred.succeed(rec.onExit, { exitCode: rec.exitCode, signal: rec.signal }).pipe(Effect.ignore)
+        yield* beginOutputDrainTimeout(rec)
       }
       if (rec.watcher) yield* Fiber.interrupt(rec.watcher).pipe(Effect.ignore)
       if (rec.timeoutWatcher) yield* Fiber.interrupt(rec.timeoutWatcher).pipe(Effect.ignore)
+      if (rec.outputDrainTimeoutWatcher) yield* Fiber.interrupt(rec.outputDrainTimeoutWatcher).pipe(Effect.ignore)
       for (const f of rec.captureFibers) yield* Fiber.interrupt(f).pipe(Effect.ignore)
       yield* closeOwnedScope(rec)
       const ref = yield* recordsRef()
@@ -528,6 +612,7 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
       // `exited`/`failed` once the child terminates.
       const startedAt = yield* Clock.currentTimeMillis
       const onExit = yield* Deferred.make<{ exitCode: number | null; signal: string | null }, never>()
+      const openStreams = [input.stdout, input.stderr].filter(Boolean).length
       const record: Record = {
         handle,
         ownerSessionID: input.sessionID,
@@ -549,13 +634,17 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
         stopping: false,
         watcher: null,
         timeoutWatcher: null,
+        outputDrainTimeoutWatcher: null,
+        openStreams,
+        outputClosed: openStreams === 0,
+        closedAt: openStreams === 0 ? startedAt : null,
         captureFibers: [],
         // Take ownership of the caller-supplied scope release (cast at
         // the manager boundary; the schema accepts `unknown` so the LLM
         // surface stays narrow). On the first terminal transition the
-        // watcher / stop / killAll paths close this exactly once via
-        // `closeOwnedScope`. On promote failure the caller closes its
-        // own scope.
+        // watcher / stop / killAll paths start the output drain deadline;
+        // `closeOwnedScope` runs once output is closed or forced closed. On
+        // promote failure the caller closes its own scope.
         ownedRelease: (input.release ?? null) as OwnedScopeRelease | null,
         ownedScopeClosed: false,
         pollNotifier: { deferred: yield* Deferred.make<PollWakeReason, never>() },
@@ -563,11 +652,19 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
 
       const { scope } = yield* InstanceState.get(state)
 
+      const pre = input.prePromoteOutput ?? null
+      if (pre?.stdout) record.buffer.append("stdout", pre.stdout, startedAt)
+      if (pre?.stderr) record.buffer.append("stderr", pre.stderr, startedAt)
+
+      yield* SynchronizedRef.modify(ref, (m) => {
+        return [undefined, new Map(m).set(key, { ...record, state: "running" })] as const
+      })
+
       // 4. Fork the long-lived exit watcher. It owns the state transition
       // from `running` to `exited` / `failed` and resolves `onExit` once.
-      // On every transition we close the caller-owned scope (idempotent)
-      // so the spawner's acquireRelease finalizers fire and the OS file
-      // descriptors are released.
+      // On every transition we start the output-drain deadline instead of
+      // immediately closing the caller-owned scope; stdio can still contain
+      // short post-exit output.
       const watcher: Fiber.Fiber<void, unknown> = yield* Effect.forkIn(
         Effect.gen(function* () {
           const exitCode = yield* child.exitCode
@@ -586,9 +683,9 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
             }
           })
           if (next) {
-            yield* closeOwnedScope(next)
             yield* wakeNotifier(next.pollNotifier, "terminal")
-            void Deferred.succeed(onExit, { exitCode, signal: null })
+            yield* Deferred.succeed(onExit, { exitCode, signal: null }).pipe(Effect.ignore)
+            yield* beginOutputDrainTimeout(next)
           }
         }).pipe(
           Effect.catchCause(() => Effect.void),
@@ -627,9 +724,9 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
                   yield* adapter.stop({ pid: next.pid, graceMs: 200 }).pipe(Effect.ignore)
                 }
                 if (next) {
-                  yield* closeOwnedScope(next)
                   yield* wakeNotifier(next.pollNotifier, "terminal")
-                  void Deferred.succeed(next.onExit, { exitCode: null, signal: "TIMEOUT" })
+                  yield* Deferred.succeed(next.onExit, { exitCode: null, signal: "TIMEOUT" }).pipe(Effect.ignore)
+                  yield* beginOutputDrainTimeout(next)
                 }
               }).pipe(
                 Effect.catchCause(() => Effect.void),
@@ -652,6 +749,7 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
             record.buffer,
             "stdout",
             wakeNotifier(record.pollNotifier, "output"),
+            markStreamClosed(handle),
           ).pipe(Effect.asVoid),
           scope,
         )
@@ -664,48 +762,23 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
             record.buffer,
             "stderr",
             wakeNotifier(record.pollNotifier, "output"),
+            markStreamClosed(handle),
           ).pipe(Effect.asVoid),
           scope,
         )
         captureFibers.push(f)
       }
 
-      // 7. Seed optional pre-registration output into the ring buffer.
-      // Current shell registration happens immediately after spawn and passes
-      // `null`; this path remains for tests/adapters that already have an
-      // output snapshot before handing a child to the manager. Appending the
-      // snapshot BEFORE the record is inserted guarantees two invariants:
-      //
-      //   a) The first `process poll` after promote returns the
-      //      pre-promote snapshot rather than only post-promote chunks
-      //      from the manager's drainStream fibers. This is the contract
-      //      documented on `PromoteInput.prePromoteOutput` (see
-      //      schema.ts).
-      //   b) The pre-promote events get strictly LOWER seq numbers than
-      //      any post-promote chunk the manager drains, because the
-      //      ring buffer is single-writer and capture fibers append
-      //      only after this point. Cursors issued before any
-      //      post-promote output remains cursor=0 plus however many
-      //      seed events we wrote.
-      //
-      // We append stdout first, then stderr, to match the foreground
-      // ordering the shell tool already produced (list joined in
-      // arrival order; both streams are independently UTF-8-decoded
-      // before this point so there is no byte-boundary concern).
-      const pre = input.prePromoteOutput ?? null
-      if (pre?.stdout) record.buffer.append("stdout", pre.stdout, startedAt)
-      if (pre?.stderr) record.buffer.append("stderr", pre.stderr, startedAt)
-
-      const promoted: Record = {
-        ...record,
-        state: "running",
-        watcher,
-        timeoutWatcher,
-        captureFibers,
-      }
-      yield* SynchronizedRef.modify(ref, (m) => {
-        return [undefined, new Map(m).set(key, promoted)] as const
-      })
+      // 7. Store the watcher/capture fibers after forking them. The record is
+      // inserted before forking so immediate stream completion can update the
+      // authoritative map instead of racing pre-registration state.
+      const promoted =
+        (yield* mutate(handle, (cur) => ({
+          ...cur,
+          watcher,
+          timeoutWatcher,
+          captureFibers,
+        }))) ?? { ...record, state: "running" as const, watcher, timeoutWatcher, captureFibers }
 
       return snapshot(promoted)
     })
@@ -859,9 +932,9 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
           stopping: true,
         }))
         if (next) {
-          yield* closeOwnedScope(next)
           yield* wakeNotifier(next.pollNotifier, "terminal")
-          void Deferred.succeed(updated.onExit, { exitCode: null, signal: null })
+          yield* Deferred.succeed(updated.onExit, { exitCode: null, signal: null }).pipe(Effect.ignore)
+          yield* beginOutputDrainTimeout(next)
         }
         return snapshot(next ?? { ...updated, state: "stopped", endedAt, exitCode: null, signal: null, terminationReason: "stopped" })
       }
@@ -878,9 +951,9 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
         stopping: true,
       }))
       if (final) {
-        yield* closeOwnedScope(final)
         yield* wakeNotifier(final.pollNotifier, "terminal")
-        void Deferred.succeed(updated.onExit, { exitCode: final.exitCode, signal: final.signal })
+        yield* Deferred.succeed(updated.onExit, { exitCode: final.exitCode, signal: final.signal }).pipe(Effect.ignore)
+        yield* beginOutputDrainTimeout(final)
       }
       return snapshot(final ?? { ...updated, state: "stopped", endedAt, exitCode: updated.exitCode, signal: updated.signal, terminationReason: "stopped", stopping: true })
     })
@@ -919,9 +992,9 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
           terminationReason: "stopped",
         }))
         if (next) {
-          yield* closeOwnedScope(next)
           yield* wakeNotifier(next.pollNotifier, "terminal")
-          void Deferred.succeed(next.onExit, { exitCode: next.exitCode, signal: next.signal })
+          yield* Deferred.succeed(next.onExit, { exitCode: next.exitCode, signal: next.signal }).pipe(Effect.ignore)
+          yield* beginOutputDrainTimeout(next)
         }
       }
     })
@@ -948,9 +1021,9 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
           terminationReason: "stopped",
         }))
         if (next) {
-          yield* closeOwnedScope(next)
           yield* wakeNotifier(next.pollNotifier, "terminal")
-          void Deferred.succeed(next.onExit, { exitCode: next.exitCode, signal: next.signal })
+          yield* Deferred.succeed(next.onExit, { exitCode: next.exitCode, signal: next.signal }).pipe(Effect.ignore)
+          yield* beginOutputDrainTimeout(next)
         }
       }
     })
@@ -969,7 +1042,7 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
             // against future code that decouples the two states.
             const isTerminal = rec.endedAt !== null
             const scopeIsClosed = !rec.ownedRelease || rec.ownedScopeClosed
-            if (isTerminal && scopeIsClosed && now - rec.endedAt! >= TTL_MS) {
+            if (isTerminal && rec.outputClosed && scopeIsClosed && now - rec.endedAt! >= TTL_MS) {
               next.delete(key)
               changed = true
             }

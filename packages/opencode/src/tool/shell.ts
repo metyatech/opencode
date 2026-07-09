@@ -47,6 +47,10 @@ export const STABLE_SHELL_ENV_OVERRIDES = {
   CODEX_CI: "1",
 } as const satisfies Readonly<Record<string, string>>
 
+export const FOREGROUND_OUTPUT_DRAIN_TIMEOUT_MS = 2_000
+export const FOREGROUND_POLL_MS = 25
+export const CAPTURE_DRAIN_POLL_MS = 50
+
 // Pure merge helper. Order: `base` first, then the stable overrides win
 // over base, then `overrides` win over both. Caller-supplied overrides
 // (typically plugin-supplied env) intentionally take precedence over the
@@ -723,9 +727,6 @@ export const ShellTool = Tool.define(
             return response
           })
 
-          const CAPTURE_DRAIN_GRACE_MS = 500
-          const FOREGROUND_POLL_MS = 25
-          const CAPTURE_DRAIN_POLL_MS = 50
           const isTerminal = (state: ProcessInfo["state"]) =>
             state === "exited" || state === "failed" || state === "stopped"
           const isLive = (state: ProcessInfo["state"]) => state === "starting" || state === "running"
@@ -736,7 +737,6 @@ export const ShellTool = Tool.define(
 
           const completion: Completion = yield* Effect.gen(function* () {
             let terminalObservedAt: number | undefined
-            let terminalQuietPolls = 0
             let forcedCompletion: "Aborted" | "TimedOut" | undefined
 
             while (true) {
@@ -760,8 +760,8 @@ export const ShellTool = Tool.define(
               }
 
               if (terminalObservedAt !== undefined) {
-                terminalQuietPolls = response.events.length === 0 ? terminalQuietPolls + 1 : 0
-                if (terminalQuietPolls >= 2 || now - terminalObservedAt >= CAPTURE_DRAIN_GRACE_MS) break
+                if (latestInfo.outputClosed === true) break
+                if (now - terminalObservedAt >= FOREGROUND_OUTPUT_DRAIN_TIMEOUT_MS) break
                 yield* Effect.sleep(`${CAPTURE_DRAIN_POLL_MS} millis`)
                 continue
               }

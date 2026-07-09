@@ -129,7 +129,7 @@ const fillMarkers = (count: number) => {
   return text
 }
 const parseLineMarkers = (text: string) => text.split(/\r?\n/).filter((line) => /^LINE-\d{6}$/.test(line))
-const stripAnsi = (text: string) => text.replace(/\u001B\[[0-9;]*m/g, "")
+const stripAnsi = (text: string) => text.replace(new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`, "g"), "")
 const expectExactMarkers = (text: string, count: number) => {
   const expected = markerLines(count)
   const actual = parseLineMarkers(text)
@@ -1226,6 +1226,14 @@ describe("tool.shell background promotion guidance", () => {
             )
             expect(result.output).toContain(`If unsure, call the process tool with {"action":"list"} first.`)
             expect(result.output).not.toContain("Use process poll to read output, process stop to terminate.")
+            return handle
+          })
+          const polled = yield* manager.poll({ sessionID: ctx.sessionID, handle, cursor: 0 })
+          expect(polled?.info.state).toBe("running")
+          expect(polled?.info.outputClosed).toBe(false)
+          expect(polled?.info.closedAt).toBeNull()
+          yield* manager.stop({ sessionID: ctx.sessionID, handle }).pipe(Effect.ignore)
+          yield* Effect.sync(() => {
             // Background promotion must warn against re-running and
             // explain the timeout/running poll-again contract using the
             // exact required sentences.
@@ -1529,9 +1537,9 @@ describe("tool.shell truncation", () => {
 
 describe("tool.shell stdio lifecycle regression", () => {
   // Regression for anomalyco/opencode#20902, #24731, #24784, #22012:
-  // the shell tool must finalize output when the foreground process exits,
-  // not when stdio is finally closed. Descendants may keep stdio open
-  // indefinitely; the shell result must not be held hostage.
+  // the shell tool must distinguish process exit from output drain. Short
+  // post-exit inherited-stdio output should be captured, but descendants may
+  // keep stdio open indefinitely and must not hold the shell result hostage.
   it.live(
     "returns in bounded time when detached child holds stdio open",
     () =>
@@ -1553,8 +1561,8 @@ describe("tool.shell stdio lifecycle regression", () => {
           const started = Date.now()
           const result = yield* run({ command, description: "Detached child holds stdio" })
           const elapsed = Date.now() - started
-          // Foreground exits in well under 5s even though detached child
-          // holds stdio for 10s.
+          // Foreground exits in bounded time even though detached child
+          // holds stdio for 10s; the drain watchdog forces closure.
           expect(elapsed).toBeLessThan(5_000)
           expect(result.output).toContain("fg-output")
         }),
@@ -1588,18 +1596,43 @@ describe("tool.shell stdio lifecycle regression", () => {
           const started = Date.now()
           const result = yield* run({ command, description: "Descendant writes noise" })
           const elapsed = Date.now() - started
-          // Foreground exits promptly. We tolerate up to 5s for the capture
-          // drain grace window; the detached noise-writer would otherwise
-          // hold stdio for much longer.
+          // Foreground exits promptly. We tolerate up to 5s for the output
+          // drain timeout; the detached noise-writer would otherwise hold
+          // stdio for much longer.
           expect(elapsed).toBeLessThan(5_000)
           expect(result.output).toContain(marker)
           // We assert that the result did not accumulate an unbounded
-          // amount of noise. The capture boundary is the foreground exit,
-          // so we expect at most a small amount of noise (the drain grace
-          // window). 200 lines of noise is a generous bound; the actual
-          // amount is normally a handful.
+          // amount of noise. The capture boundary is the output drain
+          // timeout after foreground exit. 200 lines of noise is a generous
+          // bound; the actual amount is normally a handful.
           const noiseCount = (result.output.match(/noise-line/g) ?? []).length
           expect(noiseCount).toBeLessThan(200)
+        }),
+      ),
+    15_000,
+  )
+
+  it.live(
+    "captures short post-exit inherited-stdio output before drain timeout",
+    () =>
+      runIn(
+        projectRoot,
+        Effect.gen(function* () {
+          const marker = "FG-BEFORE-EXIT"
+          const late = "LATE-AFTER-EXIT"
+          const inner = `setTimeout(() => { console.log(${JSON.stringify(late)}); process.exit(0) }, 200)`
+          const nodeScript = `console.log(${JSON.stringify(
+            marker,
+          )});const c=require("node:child_process").spawn(${JSON.stringify(process.execPath)},["-e",${JSON.stringify(
+            inner,
+          )}],{detached:true,stdio:"inherit",shell:false,windowsHide:true});c.unref();process.exit(0)`
+          const command = nodeEval(nodeScript)
+          const started = Date.now()
+          const result = yield* run({ command, description: "Short post-exit inherited stdio" })
+          const elapsed = Date.now() - started
+          expect(elapsed).toBeLessThan(5_000)
+          expect(result.output).toContain(marker)
+          expect(result.output).toContain(late)
         }),
       ),
     15_000,
