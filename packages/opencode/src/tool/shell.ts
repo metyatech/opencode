@@ -1,4 +1,4 @@
-import { Effect, Exit, Fiber, Queue, Ref, Scope, Stream } from "effect"
+import { Effect, Exit, Scope } from "effect"
 import os from "os"
 import { createWriteStream } from "node:fs"
 import * as Tool from "./tool"
@@ -543,15 +543,41 @@ export const ShellTool = Tool.define(
         ).pipe(Effect.catch(() => Effect.void))
       })
 
-      // Promoted flag. When the background timer wins the race, we flip this
-      // to true before stopping the local capture/persist/metadata fibers and
-      // returning the background result. Every foreground-side cleanup path
-      // (closeSink finalizer, captureFiber finalizer, Aborted/TimedOut kill,
-      // capture drain, persist sentinel) checks this and becomes a no-op
-      // once the manager has taken ownership of the live child.
-      const promoted = yield* Ref.make(false)
-      const isPromoted = Effect.fnUntraced(function* () {
-        return yield* Ref.get(promoted)
+      const appendManagedOutput = Effect.fnUntraced(function* (chunk: string) {
+        if (chunk.length === 0) return
+        const size = Buffer.byteLength(chunk, "utf-8")
+        list.push({ text: chunk, size })
+        used += size
+        while (used > keep && list.length > 1) {
+          const first = list.shift()
+          if (!first) break
+          used -= first.size
+          cut = true
+        }
+
+        last = preview(last + chunk)
+
+        if (file) {
+          sink?.write(chunk)
+        } else {
+          full += chunk
+          if (Buffer.byteLength(full, "utf-8") > limits.maxBytes) {
+            const next = yield* trunc.write(full)
+            file = next
+            cut = true
+            sink = createWriteStream(next, { flags: "a" })
+            full = ""
+          }
+        }
+
+        yield* ctx
+          .metadata({
+            metadata: {
+              output: last,
+              description: input.description,
+            },
+          })
+          .pipe(Effect.ignore)
       })
 
       yield* ctx.metadata({
@@ -577,41 +603,31 @@ export const ShellTool = Tool.define(
         }
       } = yield* Effect.scoped(
         Effect.gen(function* () {
-          yield* Effect.addFinalizer((_exit) =>
-            Effect.gen(function* () {
-              if (yield* isPromoted()) return
-              yield* closeSink()
-            }),
-          )
-          // Spawn the child in a long-lived scope we own until promote
-          // (success or failure). The spawner's `Effect.acquireRelease`
+          yield* Effect.addFinalizer(() => closeSink())
+          // Spawn the child in a long-lived scope and immediately register
+          // it with the process manager. The spawner's `Effect.acquireRelease`
           // finalizer is registered in the scope provided via
           // `Effect.provideService(Scope, longScope)`. We must NOT use
           // `Effect.scoped` here: it would close the scope when the
           // body returns, firing the spawner's finalizer and killing the
-          // child. Instead we keep the scope alive across the foreground
-          // race so the Backgrounded arm's `manager.promote(...)` can
-          // hand the child over to the manager before the scope tears
-          // down.
+          // child. Instead, registration hands the scope release to the
+          // manager before any foreground/background decision is made.
           //
-          // Ownership transfer (was: leak the scope; is: hand the scope
-          // to the manager):
+          // Ownership transfer: hand the scope to the manager immediately
+          // after spawn so it owns stdout/stderr capture for both foreground
+          // and background shell runs.
           //
-          // - On successful promote, we pass `release` derived from
+          // - On successful registration, we pass `release` derived from
           //   `Scope.close(longScope, Exit.void)` to the manager. The
           //   manager calls it exactly once on the first terminal
-          //   transition via `finalizeRecord` (natural exit, hard
-          //   timeout, stop, killAll*, InstanceState teardown).
-          // - On promote failure (LimitReached, etc.), we close the
+          //   transition (natural exit, hard timeout, stop, killAll*,
+          //   InstanceState teardown).
+          // - On registration failure (LimitReached, etc.), we close the
           //   scope HERE before returning, so the spawner's finalizer
-          //   runs and the child is killed cleanly. The `promoted` ref
-          //   is left false so the run's normal foreground finalizers
-          //   still fire (closeSink).
-          // - On the non-backgrounded (foreground / Aborted / TimedOut)
-          //   arms, the scope stays in scope-local ownership and is
-          //   closed by the Effect.scoped that wraps this whole block
-          //   when the body returns. That's fine: the foreground path
-          //   is fully done and killing the child is correct.
+          //   runs and the child is killed cleanly.
+          // - On foreground / Aborted / TimedOut arms, the manager reaches a
+          //   terminal transition naturally or through `manager.stop`, then
+          //   closes the scope exactly once.
           const longScope = yield* Scope.make()
           // Scope.close returns an Effect that runs all acquireRelease
           // finalizers attached to `longScope`. The manager invokes the
@@ -621,311 +637,161 @@ export const ShellTool = Tool.define(
             .spawn(cmd(input.shell, input.command, input.cwd, input.env))
             .pipe(Effect.provideService(Scope.Scope, longScope))
 
-          // Output pipeline:
-          //
-          // 1. Capture: a producer fiber reads `handle.all` (decoded as text)
-          //    and offers chunks into a bounded queue. The capture stage
-          //    MUST NOT block on stdio EOF; on Windows or when detached
-          //    descendants inherit the stdio handles, `close` can lag the
-          //    foreground `exit` event indefinitely.
-          //
-          // 2. Persistence: a consumer fiber drains the queue, applies
-          //    truncation/file/output rules. The consumer ends only when it
-          //    receives a sentinel "done" chunk. Metadata is published on a
-          //    separate queue so a slow metadata callback cannot back-pressure
-          //    persistence.
-          //
-          // 3. Metadata: a third fiber drains the metadata queue and calls
-          //    `ctx.metadata`. It is decoupled from capture and persistence.
-          //
-          // 4. Foreground exit (or Aborted / TimedOut) is the capture
-          //    boundary: we interrupt the capture fiber and offer a "done"
-          //    sentinel so the persistence consumer drains already-accepted
-          //    chunks and stops. Output produced by detached descendants
-          //    after the foreground process has exited is NOT pulled into
-          //    this Shell result.
-          const CAPACITY = 256
-          type ChunkEnvelope = { readonly _tag: "chunk"; readonly text: string } | { readonly _tag: "done" }
-          const chunks = yield* Queue.bounded<ChunkEnvelope>(CAPACITY)
-          const meta = yield* Queue.bounded<{ output: string }>(CAPACITY)
-          let captureOpen = true
-          const closeCapture = Effect.sync(() => {
-            captureOpen = false
-          })
-          const offerCaptured = (text: string) =>
-            Effect.gen(function* () {
-              while (true) {
-                const offered = yield* Effect.sync(() => {
-                  if (!captureOpen) return true
-                  return Queue.offerUnsafe(chunks, { _tag: "chunk", text })
-                })
-                if (offered) return
-                yield* Effect.yieldNow
-              }
-            })
-          const offerDone = Effect.gen(function* () {
-            while (true) {
-              if (yield* Effect.sync(() => Queue.offerUnsafe(chunks, { _tag: "done" }))) return
-              yield* Effect.yieldNow
-            }
-          })
-
-          // Persistence fiber: read from chunks queue, write to disk / list.
-          const persist = yield* Effect.forkScoped(
-            Effect.gen(function* () {
-              while (true) {
-                const item = yield* Queue.take(chunks)
-                if (item._tag === "done") {
-                  return
-                }
-                const chunk = item.text
-                const size = Buffer.byteLength(chunk, "utf-8")
-                list.push({ text: chunk, size })
-                used += size
-                while (used > keep && list.length > 1) {
-                  const first = list.shift()
-                  if (!first) break
-                  used -= first.size
-                  cut = true
-                }
-
-                last = preview(last + chunk)
-
-                if (file) {
-                  sink?.write(chunk)
-                } else {
-                  full += chunk
-                  if (Buffer.byteLength(full, "utf-8") > limits.maxBytes) {
-                    const next = yield* trunc.write(full)
-                    file = next
-                    cut = true
-                    sink = createWriteStream(next, { flags: "a" })
-                    full = ""
-                  }
-                }
-                // Publish a metadata update. We do NOT block on the metadata
-                // queue; if it is saturated, we drop the update. `last`
-                // remains the source of truth for the latest preview.
-                Queue.offerUnsafe(meta, { output: last })
-              }
-            }),
-          )
-
-          // Metadata fiber: take metadata updates and call `ctx.metadata`.
-          // We bound how many metadata updates we will issue to avoid
-          // producing an unbounded stream of events for fast producers.
-          yield* Effect.forkScoped(
-            Effect.gen(function* () {
-              while (true) {
-                const item = yield* Queue.take(meta)
-                yield* ctx.metadata({
-                  metadata: {
-                    output: item.output,
-                    description: input.description,
-                  },
-                })
-              }
-            }),
-          )
-
-          // Capture fiber: read `handle.all`, offer chunks. We fork and then
-          // interrupt this fiber once the foreground process exits (or abort/
-          // timeout fires), so we do not keep reading from a stdio handle
-          // held open by a detached descendant.
-          const captureFiber = Effect.runFork(
-            Stream.runForEach(Stream.decodeText(handle.all), offerCaptured).pipe(Effect.ignore),
-          )
-          yield* Effect.addFinalizer((_exit) =>
-            Effect.gen(function* () {
-              if (yield* isPromoted()) return
-              yield* closeCapture
-              yield* Effect.sync(() => captureFiber.interruptUnsafe())
-            }),
-          )
-
-          const abort = Effect.callback<void>((resume) => {
-            if (ctx.abort.aborted) return resume(Effect.void)
-            const handler = () => resume(Effect.void)
-            ctx.abort.addEventListener("abort", handler, { once: true })
-            return Effect.sync(() => ctx.abort.removeEventListener("abort", handler))
-          })
-
-          const timeout = Effect.sleep(`${input.timeout + 100} millis`)
-
-          // Background promotion timer. Fires after `input.backgroundAfterMs`
-          // (0 disables). When it wins the race AND the foreground process
-          // is still alive, we promote the live child to the process manager
-          // and return a background handle. The captured `handle` is closed
-          // over so the manager takes ownership of the spawner's streams.
-          const backgroundTimer =
-            input.backgroundAfterMs > 0
-              ? Effect.as(Effect.sleep(`${input.backgroundAfterMs} millis`), {
-                  _tag: "Backgrounded" as const,
-                })
-              : Effect.never
-
-          // Race foreground exit, abort, timeout, and (optionally) background
-          // promotion. The capture boundary is whichever of these resolves
-          // first. We use `Effect.exit` to convert a spawn failure (e.g.
-          // ENOENT) into a value so the race resolves immediately instead of
-          // waiting for the timeout — a failed spawn IS an exit, and we
-          // should not wait the full timeout just because the process could
-          // not start.
-          const completion: Completion = yield* Effect.raceAll([
-            Effect.map(Effect.exit(handle.exitCode), (exit) => ({ _tag: "Exited" as const, exit })),
-            Effect.map(abort, () => ({ _tag: "Aborted" as const })),
-            Effect.map(timeout, () => ({ _tag: "TimedOut" as const })),
-            backgroundTimer,
-          ])
-
-          // Foreground exit (or abort/timeout) reached. Abort/timeout kill
-          // the process group with a bounded wait. A normal foreground exit
-          // deliberately does not kill descendants, so we race the capture
-          // fiber's natural completion against a short grace window in case
-          // stdio is still held open by a detached descendant.
-          if (completion._tag === "Aborted") {
-            yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
-          }
-          if (completion._tag === "TimedOut") {
-            yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
-          }
-
-          // Backgrounded: the foreground command is still alive when the
-          // background timer fired. Hand ownership to the process manager,
-          // stop the local capture/persist fibers, and return a background
-          // handle so the model can poll/stop it. The `promoted` ref is
-          // flipped BEFORE we close the local pipeline so finalizers and
-          // kill paths become no-ops for this run.
-          if (completion._tag === "Backgrounded") {
-            // Stop the local capture pipeline deterministically BEFORE
-            // we compute the pre-promote snapshot:
-            //
-            // 1. Close the capture gate so no new chunks get offered into
-            //    the bounded queue.
-            // 2. Interrupt the capture fiber so it stops pulling more
-            //    chunks from the spawner's merged stream. Any chunks it
-            //    has already pushed into the queue are safe.
-            // 3. Send the "done" sentinel and join persistence so the
-            //    queue drains through to `list` BEFORE we snapshot.
-            //
-            // We deliberately do NOT race `offerDone` vs `Fiber.join(persist)`;
-            // we always wait for persistence to finish so the pre-promote
-            // snapshot is the complete foreground view.
-            yield* closeCapture
-            yield* Effect.sync(() => captureFiber.interruptUnsafe())
-            yield* offerDone
-            yield* Fiber.join(persist)
-
-            // Pre-promote output snapshot. With persistence fully drained,
-            // `list` is the canonical pre-promote text in arrival order.
-            // We pass it to the manager via `prePromoteOutput` so the
-            // ring buffer reflects what the foreground saw BEFORE the
-            // manager takes over stdout/stderr drains. The first `process
-            // poll` after promote returns this snapshot as events with
-            // seq starting at 1; subsequent post-promote chunks append at
-            // higher seqs.
-            const prePromoteStdout = list.map((item) => item.text).join("")
-            const prePromoteSnapshot = last || (full ? preview(full) : "")
-
-            // Promote may fail with LimitReached (global cap) or another
-            // domain error. On failure we close
-            // `longScope` ourselves (the manager has already killed the
-            // child via `adapter.stop` in the failed promote() call) so
-            // the spawner's acquireRelease finalizers run and the child
-            // is fully cleaned up. The `promoted` ref is left false so
-            // the run's normal foreground finalizers still fire.
-            const promotedResult: ProcessInfo | ProcessError = yield* Effect.gen(function* () {
-              const exit = yield* Effect.exit(
-                manager.promote({
-                  sessionID: input.sessionID,
-                  command: input.command,
-                  cwd: input.cwd,
+          const promotedResult: ProcessInfo | ProcessError = yield* Effect.gen(function* () {
+            const exit = yield* Effect.exit(
+              manager.promote({
+                sessionID: input.sessionID,
+                command: input.command,
+                cwd: input.cwd,
+                pid: handle.pid,
+                stdinAvailable: false,
+                child: {
                   pid: handle.pid,
-                  stdinAvailable: false,
-                  child: {
-                    pid: handle.pid,
-                    exitCode: Effect.exit(handle.exitCode).pipe(Effect.map(Number), Effect.orElseSucceed(() => -1)),
-                    kill: (sig?: NodeJS.Signals) => {
-                      Effect.runFork(
-                        handle.kill(sig ? { killSignal: sig } : {}).pipe(Effect.ignore),
-                      )
-                    },
-                  },
-                  // `background_after_ms` is opencode's compatibility name
-                  // for a Codex-style yield threshold. Once the command has
-                  // yielded into the process manager, elapsed time alone must
-                  // not become a hard kill deadline.
-                  timeoutMs: null,
-                  stdout: handle.stdout,
-                  stderr: handle.stderr,
-                  release: longScopeRelease,
-                  prePromoteOutput:
-                    prePromoteStdout.length > 0
-                      ? { stdout: prePromoteStdout, stderr: "" }
-                      : null,
-                }),
-              )
-              if (Exit.isSuccess(exit)) return exit.value
-              const cause = exit.cause as unknown as {
-                reasons?: ReadonlyArray<{ _tag?: string; error?: unknown }>
-              }
-              const firstFail = cause.reasons?.find((r) => r._tag === "Fail")
-              const err = firstFail?.error as ProcessError | undefined
-              if (err && "reason" in err) return err
-              return {
-                reason: "Internal",
-                message: "promote failed",
-              } as ProcessError
-            })
-
-            const promotedInfo = "state" in promotedResult ? promotedResult : undefined
-            const promotedError = "reason" in promotedResult ? promotedResult : undefined
-
-            // Promote failure path: close `longScope` ourselves so the
-            // spawner's acquireRelease finalizers run.
-            if (promotedError) {
-              yield* longScopeRelease.pipe(Effect.ignore)
-              const reason = promotedError.reason
-              const failureOutput =
-                `Command exceeded the background promotion guard (${reason}). ` +
-                `The child was terminated. Try a shorter timeout or ` +
-                `a smaller ` +
-                `background_after_ms. ` +
-                `Partial output captured: ${prePromoteSnapshot || "(none)"}`
-              return {
-                code: null,
-                completion,
-                override: {
-                  title: input.description,
-                  output: failureOutput,
-                  metadata: {
-                    output: prePromoteSnapshot || "(no output)",
-                    description: input.description,
-                    background: false,
-                    error: reason,
-                    command: input.command,
-                    cwd: input.cwd,
-                    captured: Buffer.byteLength(prePromoteSnapshot, "utf-8"),
+                  exitCode: handle.exitCode.pipe(Effect.map(Number), Effect.orElseSucceed(() => -1)),
+                  kill: (sig?: NodeJS.Signals) => {
+                    Effect.runFork(
+                      handle.kill(sig ? { killSignal: sig } : {}).pipe(Effect.ignore),
+                    )
                   },
                 },
-              } as const
+                timeoutMs: null,
+                stdout: handle.stdout,
+                stderr: handle.stderr,
+                release: longScopeRelease,
+                prePromoteOutput: null,
+              }),
+            )
+            if (Exit.isSuccess(exit)) return exit.value
+            const cause = exit.cause as unknown as {
+              reasons?: ReadonlyArray<{ _tag?: string; error?: unknown }>
+            }
+            const firstFail = cause.reasons?.find((r) => r._tag === "Fail")
+            const err = firstFail?.error as ProcessError | undefined
+            if (err && "reason" in err) return err
+            return {
+              reason: "Internal",
+              message: "promote failed",
+            } as ProcessError
+          })
+
+          const promotedInfo = "state" in promotedResult ? promotedResult : undefined
+          const promotedError = "reason" in promotedResult ? promotedResult : undefined
+          if (promotedError) {
+            yield* longScopeRelease.pipe(Effect.ignore)
+            return {
+              code: null,
+              completion: { _tag: "TimedOut" as const },
+              override: {
+                title: input.description,
+                output:
+                  `Command could not be registered with the process manager (${promotedError.reason}). ` +
+                  `The child was terminated. ` +
+                  `Partial output captured: (none)`,
+                metadata: {
+                  output: "(no output)",
+                  description: input.description,
+                  background: false,
+                  error: promotedError.reason,
+                  command: input.command,
+                  cwd: input.cwd,
+                  captured: 0,
+                },
+              },
+            } as const
+          }
+          if (!promotedInfo) {
+            yield* longScopeRelease.pipe(Effect.ignore)
+            return yield* Effect.die(new Error("promote returned neither info nor error"))
+          }
+
+          const info = promotedInfo
+          let latestInfo = info
+          let cursor = 0
+          const pollManaged = Effect.fnUntraced(function* () {
+            const response = yield* manager.poll({
+              sessionID: input.sessionID,
+              handle: info.handle,
+              cursor,
+            })
+            if (!response) return yield* Effect.die(new Error(`registered shell process ${info.handle} was not found`))
+            cursor = response.nextCursor
+            latestInfo = response.info
+            if (response.truncatedBeforeCursor) cut = true
+            for (const event of response.events) {
+              yield* appendManagedOutput(event.text)
+            }
+            return response
+          })
+
+          const CAPTURE_DRAIN_GRACE_MS = 500
+          const FOREGROUND_POLL_MS = 25
+          const CAPTURE_DRAIN_POLL_MS = 50
+          const isTerminal = (state: ProcessInfo["state"]) =>
+            state === "exited" || state === "failed" || state === "stopped"
+          const isLive = (state: ProcessInfo["state"]) => state === "starting" || state === "running"
+
+          const startedAt = Date.now()
+          const timeoutAt = startedAt + input.timeout + 100
+          const backgroundAt = input.backgroundAfterMs > 0 ? startedAt + input.backgroundAfterMs : null
+
+          const completion: Completion = yield* Effect.gen(function* () {
+            let terminalObservedAt: number | undefined
+            let terminalQuietPolls = 0
+            let forcedCompletion: "Aborted" | "TimedOut" | undefined
+
+            while (true) {
+              const response = yield* pollManaged()
+              const now = Date.now()
+
+              if (!forcedCompletion && ctx.abort.aborted) {
+                yield* manager.stop({ sessionID: input.sessionID, handle: info.handle }).pipe(Effect.ignore)
+                forcedCompletion = "Aborted"
+                terminalObservedAt = now
+              }
+
+              if (!forcedCompletion && now >= timeoutAt) {
+                yield* manager.stop({ sessionID: input.sessionID, handle: info.handle }).pipe(Effect.ignore)
+                forcedCompletion = "TimedOut"
+                terminalObservedAt = now
+              }
+
+              if (terminalObservedAt === undefined && isTerminal(latestInfo.state)) {
+                terminalObservedAt = now
+              }
+
+              if (terminalObservedAt !== undefined) {
+                terminalQuietPolls = response.events.length === 0 ? terminalQuietPolls + 1 : 0
+                if (terminalQuietPolls >= 2 || now - terminalObservedAt >= CAPTURE_DRAIN_GRACE_MS) break
+                yield* Effect.sleep(`${CAPTURE_DRAIN_POLL_MS} millis`)
+                continue
+              }
+
+              if (backgroundAt !== null && now >= backgroundAt && isLive(latestInfo.state)) {
+                return { _tag: "Backgrounded" as const }
+              }
+
+              yield* Effect.sleep(`${FOREGROUND_POLL_MS} millis`)
             }
 
-            if (!promotedInfo) {
-              yield* longScopeRelease.pipe(Effect.ignore)
-              return yield* Effect.die(new Error("promote returned neither info nor error"))
-            }
+            if (forcedCompletion === "Aborted") return { _tag: "Aborted" as const }
+            if (forcedCompletion === "TimedOut") return { _tag: "TimedOut" as const }
 
-            yield* Ref.set(promoted, true)
+            const exit = yield* Effect.exit(handle.exitCode)
+            return { _tag: "Exited" as const, exit }
+          })
 
-            const info = promotedInfo
+          // Backgrounded: the foreground command is still alive when the
+          // background timer fired. The child is already registered with the
+          // process manager, so return the existing handle without promoting
+          // again. The manager continues to own stdout/stderr capture.
+          if (completion._tag === "Backgrounded") {
             const processPollArgs = JSON.stringify({ action: "poll", handle: info.handle, cursor: 0, wait_ms: 300000 })
             const processStopArgs = JSON.stringify({ action: "stop", handle: info.handle })
             const processListArgs = JSON.stringify({ action: "list" })
             const outputText =
               `Command is still running in the background.\n` +
               `Handle: ${info.handle}\n` +
-              `State: ${info.state}\n` +
+              `State: ${latestInfo.state}\n` +
               `Do not re-run the original command just to wait for completion; that starts a second process.\n` +
               `To wait for it to finish, use the process tool with ${processPollArgs} to read output; ` +
               `wait_ms:300000 waits until new output arrives or the command exits.\n` +
@@ -933,7 +799,8 @@ export const ShellTool = Tool.define(
               `If a poll returns wait_status:"timeout" with state running, the command is still running; poll again with the returned next_cursor.\n` +
               `Use the process tool with ${processStopArgs} only if you want to terminate it.\n` +
               `If unsure, call the process tool with ${processListArgs} first.`
-            const metadataOut = prePromoteSnapshot || "(no output yet)"
+            const metadataOut = last || (full ? preview(full) : "(no output yet)")
+            yield* closeSink()
             yield* ctx
               .metadata({
                 metadata: {
@@ -941,7 +808,7 @@ export const ShellTool = Tool.define(
                   description: input.description,
                   background: true,
                   processHandle: info.handle,
-                  state: info.state,
+                  state: latestInfo.state,
                   command: input.command,
                   cwd: input.cwd,
                   captured: Buffer.byteLength(metadataOut, "utf-8"),
@@ -963,7 +830,7 @@ export const ShellTool = Tool.define(
                   description: input.description,
                   background: true,
                   processHandle: info.handle,
-                  state: info.state,
+                  state: latestInfo.state,
                   command: input.command,
                   cwd: input.cwd,
                   captured: Buffer.byteLength(metadataOut, "utf-8"),
@@ -974,27 +841,6 @@ export const ShellTool = Tool.define(
               },
             } as const
           }
-
-          // Drain the capture fiber when possible, then stop waiting at the
-          // foreground boundary. `interruptUnsafe()` is intentionally
-          // fire-and-forget: awaiting interruption can itself wait for stdio
-          // close in Node stream finalizers.
-          const CAPTURE_DRAIN_GRACE_MS = 500
-          const captured = yield* Effect.race(
-            Fiber.join(captureFiber).pipe(Effect.as(true)),
-            Effect.as(Effect.sleep(`${CAPTURE_DRAIN_GRACE_MS} millis`), false),
-          )
-          yield* closeCapture
-          if (!captured) yield* Effect.sync(() => captureFiber.interruptUnsafe())
-          // Offer the done sentinel only after the capture gate is closed,
-          // so no producer can enqueue after it. Race the offer with
-          // persistence failure so a dead consumer cannot deadlock finalization
-          // when the bounded queue is full.
-          yield* Effect.race(offerDone, Fiber.join(persist))
-
-          // Wait for persistence to finish draining. Bounded by the queue
-          // size: persistence ends as soon as it observes the done sentinel.
-          yield* Fiber.join(persist)
 
           // Resolve exit code: the public `handle.exitCode` is now safe to
           // read because foreground process has exited (or we killed it).

@@ -111,9 +111,9 @@ export const PromoteInput = Schema.Struct({
   // `ReadableStream<Uint8Array>`. The manager does the right thing
   // internally based on the value's shape. Pass `null` (or omit) to skip
   // manager-owned capture — the spawner can still drive the buffer via
-  // `feed(...)` for tests and adapters that prefer that path. Phase 3 wiring
-  // (shell tool) passes the live `handle.stdout` and `handle.stderr` streams
-  // from the spawner so the manager owns capture after promote.
+  // `feed(...)` for tests and adapters that prefer that path. The shell tool
+  // passes the live `handle.stdout` and `handle.stderr` streams immediately
+  // after spawn so the manager owns capture from registration time.
   stdout: Schema.optional(Schema.NullOr(Schema.Unknown)),
   stderr: Schema.optional(Schema.NullOr(Schema.Unknown)),
   // Caller-owned scope release. The shell tool creates a long-lived
@@ -125,14 +125,10 @@ export const PromoteInput = Schema.Struct({
   // casts to its `OwnedScopeRelease` type at the boundary. Omit when no
   // caller-owned scope exists.
   release: Schema.optional(Schema.NullOr(Schema.Unknown)),
-  // Pre-promote output snapshot. The shell tool's local capture fiber
-  // stops BEFORE calling promote; the chunks it has already drained
-  // into its bounded queue are joined here so the manager's ring buffer
-  // reflects what the foreground saw before ownership transferred.
-  // This is what guarantees the first `process poll` after promote
-  // returns the pre-promote snapshot rather than only post-promote
-  // chunks from the manager's drain. Omit when no pre-promote output
-  // exists (e.g. promote from a fresh child with no foreground output).
+  // Historical pre-promote output snapshot. Current shell execution registers
+  // each child immediately after spawn and passes `null`; retained only for
+  // older in-process callers that may have already captured bytes before
+  // registration.
   prePromoteOutput: Schema.optional(
     Schema.NullOr(
       Schema.Struct({

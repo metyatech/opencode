@@ -72,7 +72,8 @@ type Record = {
   captureFibers: ReadonlyArray<Fiber.Fiber<void, unknown>>
   // Caller-supplied scope release. The shell tool creates a long-lived
   // `Scope.make()` to host the spawner's acquireRelease finalizers and
-  // hands ownership to the manager on successful promote. Every
+  // hands ownership to the manager when the spawned process is registered.
+  // Every
   // terminal path closes the scope at most once (idempotent) so we
   // never leak the spawner's finalizers. Absent for internal-only
   // records (e.g. tests that don't transfer scope ownership).
@@ -320,9 +321,9 @@ export function fromSpawnerChild(
 
 // Core manager layer: covers `promote`, `list`, `info`, `poll`, `feed`,
 // `stop`, `killAll*`, `purgeExpired`. There is intentionally no public
-// `write` action (stdin is spawned as "ignore"). The shell tool passes
-// the live `ChildProcessHandle` it already owns to `promote`; the
-// manager tracks the child but does not own the spawner scope.
+// `write` action (stdin is spawned as "ignore"). The shell tool registers
+// the live `ChildProcessHandle` immediately after spawn; the manager owns
+// capture and the caller-supplied spawner scope release from that point.
 export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
   Service,
   Effect.gen(function* () {
@@ -669,12 +670,11 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
         captureFibers.push(f)
       }
 
-      // 7. Seed pre-promote output into the ring buffer. The shell tool
-      // stops its local capture/persist fibers BEFORE calling `promote`,
-      // drains them into a single `prePromoteStdout` (and future
-      // `prePromoteStderr`) string, and hands those strings to the
-      // manager here. Appending them to the buffer BEFORE the record is
-      // inserted guarantees two invariants:
+      // 7. Seed optional pre-registration output into the ring buffer.
+      // Current shell registration happens immediately after spawn and passes
+      // `null`; this path remains for tests/adapters that already have an
+      // output snapshot before handing a child to the manager. Appending the
+      // snapshot BEFORE the record is inserted guarantees two invariants:
       //
       //   a) The first `process poll` after promote returns the
       //      pre-promote snapshot rather than only post-promote chunks
@@ -741,8 +741,9 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
 
       // Build the LLM-facing response from the freshest record + buffer state.
       // Applies the per-call maxBytes cap (cumulative cap on the wire, separate
-      // from the buffer's internal cap): walk newest→oldest, dropping events
-      // older than the overflow point while always keeping the last event.
+      // from the buffer's internal cap): return the oldest contiguous events
+      // after the cursor until the cap is reached. Advancing only to the last
+      // returned event lets callers repeatedly poll without skipping output.
       //
       // Terminal records are NOT removed here. The exit watcher and the
       // stdout/stderr capture fibers complete independently, so the child's
@@ -754,25 +755,20 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
       // until the 30-minute TTL purge removes them.
       const build = (latest: Record, waitStatus: PollWaitStatus): PollResponse => {
         const { events, nextCursor, truncatedBeforeCursor } = latest.buffer.since(cursor)
-        let start = 0
-        if (events.length > 0) {
-          let total = 0
-          for (let i = events.length - 1; i >= 0; i--) {
-            const cost = byteLength(events[i]!.text)
-            if (total + cost > maxBytes) {
-              start = i + 1
-              break
-            }
-            total += cost
-            if (i === 0) start = 0
-          }
+        const limited: typeof events = []
+        let total = 0
+        for (const event of events) {
+          const cost = byteLength(event.text)
+          if (limited.length > 0 && total + cost > maxBytes) break
+          limited.push(event)
+          total += cost
+          if (total >= maxBytes) break
         }
-        const trimmed = events.slice(start)
         return {
           info: snapshot(latest),
-          events: trimmed,
-          nextCursor: trimmed.length === 0 ? nextCursor : trimmed[trimmed.length - 1]!.seq,
-          truncatedBeforeCursor: truncatedBeforeCursor || start > 0,
+          events: limited,
+          nextCursor: limited.length === 0 ? nextCursor : limited[limited.length - 1]!.seq,
+          truncatedBeforeCursor,
           waitStatus,
         }
       }

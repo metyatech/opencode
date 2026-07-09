@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { Cause, Effect, Exit, Layer } from "effect"
+import { Cause, Effect, Exit, Fiber, Layer } from "effect"
 import type * as Scope from "effect/Scope"
 import fs from "node:fs/promises"
 import os from "os"
@@ -16,7 +16,7 @@ import { SessionID, MessageID } from "../../src/session/schema"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { AppFileSystem } from "@opencode-ai/core/filesystem"
 import { Plugin } from "../../src/plugin"
-import { testEffect } from "../lib/effect"
+import { pollWithTimeout, testEffect } from "../lib/effect"
 import { Tool } from "@/tool/tool"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProcessManager } from "@/process-manager"
@@ -1139,6 +1139,49 @@ describe("tool.shell permissions", () => {
 
 describe("tool.shell background promotion guidance", () => {
   it.live(
+    "foreground command is managed before background threshold",
+    () =>
+      runIn(
+        projectRoot,
+        Effect.gen(function* () {
+          const manager = yield* ProcessManager.Service
+          const foregroundCtx = {
+            ...ctx,
+            sessionID: SessionID.make("ses_foreground_managed_before_threshold"),
+          }
+          const command = nodeEval(
+            `setTimeout(() => { process.stdout.write("managed foreground\\n"); process.exit(0) }, 1_000)`,
+          )
+          const fiber = yield* run(
+            {
+              command,
+              description: "foreground manager visibility",
+              timeout: 10_000,
+              background_after_ms: 30_000,
+            },
+            foregroundCtx,
+          ).pipe(Effect.forkScoped)
+          const observedManaged = yield* pollWithTimeout(
+            Effect.gen(function* () {
+              const processes = yield* manager.list({ sessionID: foregroundCtx.sessionID })
+              return processes.length > 0 ? true : undefined
+            }),
+            "foreground command was not visible in ProcessManager before background_after_ms",
+            "5 seconds",
+          )
+          const result = yield* Fiber.join(fiber)
+          const remaining = yield* manager.list({ sessionID: foregroundCtx.sessionID })
+          expect(observedManaged).toBe(true)
+          expect(result.metadata.background).not.toBe(true)
+          expect(result.metadata.exit).toBe(0)
+          expect(result.output).toContain("managed foreground")
+          expect(remaining).toEqual([])
+        }),
+      ),
+    15_000,
+  )
+
+  it.live(
     "background-promoted result advertises process tool JSON args",
     () =>
       runIn(
@@ -1451,6 +1494,26 @@ describe("tool.shell truncation", () => {
         const result = yield* run({
           command: fill("bytes", byteCount),
           description: "Generate bytes for file check",
+        })
+        mustTruncate(result)
+
+        const filepath = (result.metadata as { outputPath?: string }).outputPath
+        expect(filepath).toBeTruthy()
+
+        const saved = yield* (yield* AppFileSystem.Service).readFileString(filepath!)
+        expect(saved).toBe("a".repeat(byteCount))
+      }),
+    ),
+  )
+
+  it.live("foreground manager drain saves output larger than process poll cap", () =>
+    runIn(
+      projectRoot,
+      Effect.gen(function* () {
+        const byteCount = 80 * 1024
+        const result = yield* run({
+          command: fill("bytes", byteCount),
+          description: "Generate burst larger than process poll cap",
         })
         mustTruncate(result)
 
