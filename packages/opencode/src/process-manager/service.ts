@@ -18,13 +18,16 @@ import { InstanceState } from "@/effect/instance-state"
 
 // An effect that closes the caller-supplied scope. The shell tool
 // produces this from `Scope.close(longScope, Exit.void)` and hands it
-// to the manager on successful promote. The manager runs it exactly
-// once per record on the first terminal transition so the spawner's
-// acquireRelease finalizers fire and the stdin/stdout/stderr file
-// descriptors are released. We type it as `Effect<void, never, never>`
-// for documentation; the actual value carries whatever R channel the
-// shell tool produced (typically Scope) and the manager just calls it
-// inside the layer's environment so the dependency is satisfied.
+// to the manager on successful promote. Terminal transitions start the
+// output-drain lifecycle but do not immediately close this scope; it is
+// released exactly once when stdout/stderr naturally close or the
+// OUTPUT_DRAIN_TIMEOUT_MS fallback forces output closed. Cleanup paths
+// that remove or tear down a record still close it immediately to avoid
+// leaking the spawner's acquireRelease finalizers. We type it as
+// `Effect<void, never, never>` for documentation; the actual value carries
+// whatever R channel the shell tool produced (typically Scope) and the
+// manager just calls it inside the layer's environment so the dependency is
+// satisfied.
 export type OwnedScopeRelease = Effect.Effect<void, never, never>
 
 // Codex-like process store cap. A full store prunes old records instead of
@@ -68,6 +71,9 @@ type Record = {
   // it cleanly when they decide to terminate the record themselves.
   timeoutWatcher: Fiber.Fiber<void, unknown> | null
   outputDrainTimeoutWatcher: Fiber.Fiber<void, unknown> | null
+  // Number of capture streams that have not naturally closed yet.
+  // outputClosed/closedAt are set when the last stream closes or the drain
+  // timeout forces closure; terminal process state alone does not set them.
   openStreams: number
   outputClosed: boolean
   closedAt: number | null
@@ -78,18 +84,21 @@ type Record = {
   // Caller-supplied scope release. The shell tool creates a long-lived
   // `Scope.make()` to host the spawner's acquireRelease finalizers and
   // hands ownership to the manager when the spawned process is registered.
-  // Every
-  // terminal path closes the scope at most once (idempotent) so we
-  // never leak the spawner's finalizers. Absent for internal-only
-  // records (e.g. tests that don't transfer scope ownership).
+  // Terminal transitions start the output-drain deadline but do not close the
+  // scope immediately. The release runs after outputClosed becomes true,
+  // after a forced close, or from cleanup before the record is removed.
+  // Absent for internal-only records (e.g. tests that don't transfer scope
+  // ownership).
   ownedRelease: OwnedScopeRelease | null
-  // Guard so we close the caller-owned scope at most once. Set on the
-  // first terminal transition; further transitions see it as already
-  // closed and skip the release call.
+  // Guard so we close the caller-owned scope at most once. Set when output
+  // closure (natural or forced) or a cleanup path actually runs the release;
+  // later terminal, output-close, or cleanup races skip the release call.
   ownedScopeClosed: boolean
-  // Long-poll wake channel. Output appends and terminal transitions complete
-  // the current deferred so any fiber parked inside `poll` returns before its
-  // deadline. Shared by reference across immutable record copies.
+  // Long-poll wake channel. Output appends, terminal transitions, and natural
+  // or forced output close events complete the current deferred so any fiber
+  // parked inside `poll` returns before its deadline. Output close uses the
+  // terminal wake reason because poll must re-read both terminal and
+  // outputClosed state. Shared by reference across immutable record copies.
   readonly pollNotifier: PollNotifier
 }
 
@@ -114,8 +123,9 @@ export type PollResponse = {
   readonly waitStatus: PollWaitStatus
 }
 
-// Why a long-poll waiter was woken. Output appends and terminal transitions
-// both wake any fiber parked inside `poll`.
+// Why a long-poll waiter was woken. Output appends wake with `output`;
+// terminal transitions and output-close events wake with `terminal`, so poll
+// re-reads the record and only returns terminal once outputClosed is visible.
 type PollWakeReason = "output" | "terminal"
 
 // Shared, mutable notifier carried on each record. We hold a plain object with
@@ -204,11 +214,12 @@ function byteLength(text: string): number {
 // is whatever the shell tool produced from `Scope.close(longScope, Exit.void)`
 // at promote time — running it closes the long-lived scope the spawner
 // lives in, which fires the spawner's acquireRelease finalizers
-// (closing stdin/stdout/stderr fds). Subsequent calls are no-ops so a
-// natural exit, timeout, and explicit stop that race on the same record
-// do not double-release. Failures are best-effort: we ignore the error
-// channel because the manager's record state is already terminal and a
-// half-closed scope does not corrupt it.
+// (closing stdin/stdout/stderr fds). Normal terminal paths call this only
+// after outputClosed/closedAt is set; cleanup paths call it immediately while
+// removing the record. Subsequent calls are no-ops so natural output closure,
+// forced output closure, and cleanup races do not double-release. Failures are
+// best-effort: we ignore the error channel because a failed scope release does
+// not corrupt the manager's record state.
 const closeOwnedScope = (rec: Record): Effect.Effect<void, never, never> => {
   if (rec.ownedScopeClosed) return Effect.void
   if (!rec.ownedRelease) return Effect.void
@@ -1038,11 +1049,12 @@ export const layer: Layer.Layer<Service, never, ProcessAdapter> = Layer.effect(
           let changed = false
           const next = new Map(m)
           for (const [key, rec] of m) {
-            // Only purge records that are terminal AND whose caller-owned
-            // scope (if any) has been released. This is currently the same
-            // condition as `endedAt !== null` because every terminal
-            // transition closes the scope, but the explicit check guards
-            // against future code that decouples the two states.
+            // Only purge records after the full lifecycle is complete:
+            // terminal state recorded, outputClosed/closedAt observed, and
+            // the caller-owned scope (if any) released. Terminal transitions
+            // intentionally do not imply scope closure; output natural close
+            // or the OUTPUT_DRAIN_TIMEOUT_MS forced close performs that
+            // release, while cleanup paths remove records immediately.
             const isTerminal = rec.endedAt !== null
             const scopeIsClosed = !rec.ownedRelease || rec.ownedScopeClosed
             if (isTerminal && rec.outputClosed && scopeIsClosed && now - rec.endedAt! >= TTL_MS) {
