@@ -16,7 +16,6 @@ import { NonNegativeInt } from "@opencode-ai/core/schema"
 
 const log = Log.create({ service: "ripgrep" })
 const VERSION = "15.1.0"
-const EXECUTABLE = process.platform === "win32" ? "rg.exe" : "rg"
 const PLATFORM = {
   "arm64-darwin": { platform: "aarch64-apple-darwin", extension: "tar.gz" },
   "arm64-linux": { platform: "aarch64-unknown-linux-gnu", extension: "tar.gz" },
@@ -151,20 +150,6 @@ function env() {
   return env
 }
 
-function pathCandidates() {
-  const seen = new Set<string>()
-  return (process.env.PATH ?? process.env.Path ?? "")
-    .split(path.delimiter)
-    .filter(Boolean)
-    .map((entry) => path.join(entry, EXECUTABLE))
-    .filter((candidate) => {
-      const key = process.platform === "win32" ? candidate.toLowerCase() : candidate
-      if (seen.has(key)) return false
-      seen.add(key)
-      return true
-    })
-}
-
 function aborted(signal?: AbortSignal) {
   const err = signal?.reason
   if (err instanceof Error) return err
@@ -220,6 +205,7 @@ function filesArgs(input: FilesInput) {
   if (input.glob) {
     for (const glob of input.glob) args.push(`--glob=${glob}`)
   }
+  args.push(".")
   return args
 }
 
@@ -260,17 +246,6 @@ export const layer: Layer.Layer<Service, never, AppFileSystem.Service | ChildPro
         )
         return { stdout, stderr, code }
       }, Effect.scoped)
-
-      const smoke = (binary: string) =>
-        Effect.gen(function* () {
-          const version = yield* run(binary, ["--version"])
-          if (version.code !== 0) return false
-
-          const dir = yield* fs.makeTempDirectoryScoped({ prefix: "ripgrep-smoke-" })
-          yield* fs.writeFileString(path.join(dir, "a.txt"), "hello")
-          const files = yield* run(binary, ["--no-config", "--files", "--glob=!.git/*", "--hidden"], { cwd: dir })
-          return files.code === 0 && files.stdout.split(/\r?\n/).includes("a.txt")
-        }).pipe(Effect.catch(() => Effect.succeed(false)))
 
       const extract = Effect.fnUntraced(function* (
         archive: string,
@@ -315,12 +290,11 @@ export const layer: Layer.Layer<Service, never, AppFileSystem.Service | ChildPro
 
       const filepath = yield* Effect.cached(
         Effect.gen(function* () {
-          for (const system of pathCandidates()) {
-            if ((yield* fs.isFile(system).pipe(Effect.orDie)) && (yield* smoke(system))) return system
-          }
+          const system = yield* Effect.sync(() => which(process.platform === "win32" ? "rg.exe" : "rg"))
+          if (system && (yield* fs.isFile(system).pipe(Effect.orDie))) return system
 
-          const target = path.join(Global.Path.bin, EXECUTABLE)
-          if ((yield* fs.isFile(target).pipe(Effect.orDie)) && (yield* smoke(target))) return target
+          const target = path.join(Global.Path.bin, `rg${process.platform === "win32" ? ".exe" : ""}`)
+          if (yield* fs.isFile(target).pipe(Effect.orDie)) return target
 
           const platformKey = `${process.arch}-${process.platform}` as keyof typeof PLATFORM
           const config = PLATFORM[platformKey]
