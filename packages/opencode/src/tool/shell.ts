@@ -622,16 +622,18 @@ export const ShellTool = Tool.define(
           // and background shell runs.
           //
           // - On successful registration, we pass `release` derived from
-          //   `Scope.close(longScope, Exit.void)` to the manager. The
-          //   manager calls it exactly once on the first terminal
-          //   transition (natural exit, hard timeout, stop, killAll*,
-          //   InstanceState teardown).
+          //   `Scope.close(longScope, Exit.void)` to the manager. Terminal
+          //   transitions start the bounded output-drain lifecycle; the
+          //   manager releases the scope exactly once after stdout/stderr
+          //   close naturally, after the drain timeout forces output closed,
+          //   or when cleanup removes the record.
           // - On registration failure (LimitReached, etc.), we close the
           //   scope HERE before returning, so the spawner's finalizer
           //   runs and the child is killed cleanly.
           // - On foreground / Aborted / TimedOut arms, the manager reaches a
           //   terminal transition naturally or through `manager.stop`, then
-          //   closes the scope exactly once.
+          //   waits for natural or forced output closure before releasing the
+          //   scope exactly once.
           const longScope = yield* Scope.make()
           // Scope.close returns an Effect that runs all acquireRelease
           // finalizers attached to `longScope`. The manager invokes the

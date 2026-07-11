@@ -71,9 +71,11 @@ type Record = {
   // it cleanly when they decide to terminate the record themselves.
   timeoutWatcher: Fiber.Fiber<void, unknown> | null
   outputDrainTimeoutWatcher: Fiber.Fiber<void, unknown> | null
-  // Number of capture streams that have not naturally closed yet.
-  // outputClosed/closedAt are set when the last stream closes or the drain
-  // timeout forces closure; terminal process state alone does not set them.
+  // Number of capture streams that have not naturally closed yet. When no
+  // capture streams exist, outputClosed starts true and closedAt starts at
+  // startedAt; otherwise outputClosed/closedAt are set when the last stream
+  // closes or the bounded drain timeout forces closure. Terminal process
+  // state alone does not set them.
   openStreams: number
   outputClosed: boolean
   closedAt: number | null

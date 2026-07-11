@@ -62,18 +62,17 @@ test("production can await done only and still receives mount failures", async (
 })
 
 test("exit destroys the renderer, resolves done, and runs cleanup once", async () => {
-  const beforeSighup = process.listenerCount("SIGHUP")
   const app = await startTui()
 
   app.theme.resolve("dark")
   await app.handle.ready
-  expect(process.listenerCount("SIGHUP")).toBeGreaterThan(beforeSighup)
+  expect(process.listeners("SIGHUP")).toContain(app.sighup)
 
   await Promise.all([app.handle.exit(), app.handle.exit()])
   await app.handle.done
 
   expect(app.setup.renderer.isDestroyed).toBe(true)
-  expect(process.listenerCount("SIGHUP")).toBe(beforeSighup)
+  expect(process.listeners("SIGHUP")).not.toContain(app.sighup)
 })
 
 test("exit preserves reason formatting and exit messages", async () => {
@@ -116,39 +115,40 @@ test("exit before ready cancels mount and resolves done", async () => {
 })
 
 test("direct renderer destruction still cleans up and resolves done", async () => {
-  const beforeSighup = process.listenerCount("SIGHUP")
   const app = await startTui()
 
   app.theme.resolve("dark")
   await app.handle.ready
+  expect(process.listeners("SIGHUP")).toContain(app.sighup)
   app.setup.renderer.destroy()
   await app.handle.done
 
-  expect(process.listenerCount("SIGHUP")).toBe(beforeSighup)
+  expect(process.listeners("SIGHUP")).not.toContain(app.sighup)
 })
 
 test("SIGHUP exits before ready and removes its listener", async () => {
-  const beforeSighup = process.listenerCount("SIGHUP")
   const app = await startTui()
 
-  process.emit("SIGHUP")
+  expect(process.listeners("SIGHUP")).toContain(app.sighup)
+  app.sighup("SIGHUP")
   await app.handle.done
 
   expect(app.setup.renderer.isDestroyed).toBe(true)
-  expect(process.listenerCount("SIGHUP")).toBe(beforeSighup)
+  await expect(app.handle.ready).resolves.toBeUndefined()
+  expect(process.listeners("SIGHUP")).not.toContain(app.sighup)
 })
 
 test("SIGHUP exits after ready and removes its listener", async () => {
-  const beforeSighup = process.listenerCount("SIGHUP")
   const app = await startTui()
 
   app.theme.resolve("dark")
   await app.handle.ready
-  process.emit("SIGHUP")
+  expect(process.listeners("SIGHUP")).toContain(app.sighup)
+  app.sighup("SIGHUP")
   await app.handle.done
 
   expect(app.setup.renderer.isDestroyed).toBe(true)
-  expect(process.listenerCount("SIGHUP")).toBe(beforeSighup)
+  expect(process.listeners("SIGHUP")).not.toContain(app.sighup)
 })
 
 test("plugin, audio, and keymap cleanup run exactly once", async () => {
@@ -197,6 +197,7 @@ async function startTui(options: { rejectTheme?: Error } = {}) {
 
   const calls = createFetch()
   const events = createEventSource()
+  const sighupBefore = new Set(process.listeners("SIGHUP"))
   const handle = tui({
     url: "http://test",
     renderer: setup.renderer,
@@ -215,8 +216,10 @@ async function startTui(options: { rejectTheme?: Error } = {}) {
       restore()
     },
   }
+  const addedSighup = process.listeners("SIGHUP").filter((listener) => !sighupBefore.has(listener))
+  if (addedSighup.length !== 1) throw new Error(`expected tui() to add exactly one sighup listener, got ${addedSighup.length}`)
 
-  return { handle, setup, theme }
+  return { handle, setup, theme, sighup: addedSighup[0]! }
 }
 
 async function isolateGlobalPaths(root: string) {
