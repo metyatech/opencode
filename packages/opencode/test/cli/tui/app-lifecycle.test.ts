@@ -130,7 +130,7 @@ test("SIGHUP exits before ready and removes its listener", async () => {
   const app = await startTui()
 
   expect(process.listeners("SIGHUP")).toContain(app.sighup)
-  app.sighup("SIGHUP")
+  app.sighup()
   await app.handle.done
 
   expect(app.setup.renderer.isDestroyed).toBe(true)
@@ -144,7 +144,7 @@ test("SIGHUP exits after ready and removes its listener", async () => {
   app.theme.resolve("dark")
   await app.handle.ready
   expect(process.listeners("SIGHUP")).toContain(app.sighup)
-  app.sighup("SIGHUP")
+  app.sighup()
   await app.handle.done
 
   expect(app.setup.renderer.isDestroyed).toBe(true)
@@ -219,7 +219,7 @@ async function startTui(options: { rejectTheme?: Error } = {}) {
   const addedSighup = process.listeners("SIGHUP").filter((listener) => !sighupBefore.has(listener))
   if (addedSighup.length !== 1) throw new Error(`expected tui() to add exactly one sighup listener, got ${addedSighup.length}`)
 
-  return { handle, setup, theme, sighup: addedSighup[0]! }
+  return { handle, setup, theme, sighup: addedSighup[0]! as () => void }
 }
 
 async function isolateGlobalPaths(root: string) {
